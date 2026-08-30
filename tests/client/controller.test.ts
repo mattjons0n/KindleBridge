@@ -295,11 +295,45 @@ describe("AppController local conversion flow", () => {
     const app = harness();
     await app.controller.connect();
     expect(app.requestDevice).toHaveBeenCalledOnce();
-    expect(app.connection.prepareAfterConnect).toHaveBeenCalledOnce();
+    expect(app.connection.runSelfTest).toHaveBeenCalledOnce();
+    expect(app.connection.refreshInventory).toHaveBeenCalledOnce();
     expect(app.controller.state).toMatchObject({
       device: { kind: "ready" },
       selfTest: { kind: "passed", byteLength: 1037 },
     });
+  });
+
+  it("reports each automatic post-connect phase without calling inventory work a safe-write check", async () => {
+    const app = harness();
+    let finishSelfTest!: () => void;
+    let finishInventory!: () => void;
+    vi.mocked(app.connection.runSelfTest).mockImplementationOnce(async () => {
+      await new Promise<void>((resolve) => { finishSelfTest = resolve; });
+      return {
+        filename: "kindle-poc-byte-test.txt",
+        handle: 101,
+        bytesVerified: 1037,
+        cleanedUp: true as const,
+      };
+    });
+    vi.mocked(app.connection.refreshInventory).mockImplementationOnce(async () => {
+      await new Promise<void>((resolve) => { finishInventory = resolve; });
+      return app.connection.latestInventory!;
+    });
+
+    const connecting = app.controller.connect();
+    await vi.waitFor(() => expect(app.controller.state.postConnectStage).toBe("safe-write"));
+    expect(app.root.querySelector(".library-device-button")?.textContent).toContain("Checking safe writes");
+
+    finishSelfTest();
+    await vi.waitFor(() => expect(app.controller.state.postConnectStage).toBe("inventory"));
+    const inventoryCopy = app.root.querySelector(".library-device-button")?.textContent ?? "";
+    expect(inventoryCopy).toContain("Reading Kindle Documents");
+    expect(inventoryCopy).not.toContain("Checking safe writes");
+
+    finishInventory();
+    await connecting;
+    expect(app.controller.state.postConnectStage).toBe("idle");
   });
 
   it("bounds USB open and Documents discovery even when an adapter ignores abort", async () => {
@@ -484,7 +518,7 @@ describe("AppController local conversion flow", () => {
     expect(acknowledge).not.toBeNull();
 
     acknowledge!.click();
-    await vi.waitFor(() => expect(app.controller.state.selfTest.kind).toBe("passed"));
+    await vi.waitFor(() => expect(app.controller.state.catalogInventoryState).toBe("ready"));
 
     expect(readPendingObjectCleanup()).toBeUndefined();
     expect(app.controller.state).toMatchObject({
@@ -494,8 +528,9 @@ describe("AppController local conversion flow", () => {
       pendingObjectCleanup: undefined,
       activeError: undefined,
     });
-    expect(app.connection.prepareAfterConnect).toHaveBeenCalledOnce();
+    expect(app.connection.prepareAfterConnect).not.toHaveBeenCalled();
     expect(app.connection.runSelfTest).toHaveBeenCalledOnce();
+    expect(app.connection.refreshInventory).toHaveBeenCalledTimes(2);
     expect(app.requestDevice).toHaveBeenCalledOnce();
     expect(app.root.querySelector('.recovery-notice')).toBeNull();
     expect(app.root.querySelector<HTMLButtonElement>(
@@ -540,15 +575,15 @@ describe("AppController local conversion flow", () => {
 
   it("keeps the durable recovery journal across reload when exact-handle deletion cannot be verified", async () => {
     const app = harness();
-    vi.mocked(app.connection.prepareAfterConnect).mockImplementationOnce(async (options) => {
+    vi.mocked(app.connection.runSelfTest).mockImplementationOnce(async (options) => {
       const metadata = {
         storageId: 0x10001,
         parentHandle: 0x37,
         filename: "kindle-poc-byte-test-unverified.txt",
         size: 1037,
       };
-      options?.selfTest?.onObjectState?.({ stage: "send-object-info-intent", ...metadata });
-      options?.selfTest?.onObjectState?.({ stage: "handle-assigned", handle: 0x505, ...metadata });
+      options?.onObjectState?.({ stage: "send-object-info-intent", ...metadata });
+      options?.onObjectState?.({ stage: "handle-assigned", handle: 0x505, ...metadata });
       throw Object.assign(new Error("DeleteObject returned OK, but the exact handle remained"), {
         code: "MTP_PARTIAL_OBJECT_CLEANUP_FAILED",
         details: {
@@ -611,11 +646,9 @@ describe("AppController local conversion flow", () => {
 
   it("keeps Send blocked when the byte test passes but automatic inventory fails", async () => {
     const app = harness(true);
-    vi.mocked(app.connection.prepareAfterConnect).mockImplementationOnce(async (options) => ({
-      selfTest: await app.connection.runSelfTest(options?.selfTest),
-      inventoryRefresh: "failed",
-      inventoryErrorCode: "MTP_TIMEOUT",
-    }));
+    vi.mocked(app.connection.refreshInventory).mockRejectedValueOnce(
+      Object.assign(new Error("inventory unavailable"), { code: "MTP_TIMEOUT" }),
+    );
     await vi.waitFor(() => expect(app.root.querySelector('[data-book-id="book-1"]')).not.toBeNull());
 
     await app.controller.connect();
@@ -640,11 +673,33 @@ describe("AppController local conversion flow", () => {
     expect(app.connection.sendAzW3AndRefreshInventory).not.toHaveBeenCalled();
   });
 
+  it("keeps the safe-write proof distinct when a fatal inventory fault retires the session", async () => {
+    const app = harness();
+    vi.mocked(app.connection.refreshInventory).mockRejectedValueOnce(
+      Object.assign(new Error("The MTP transport lost synchronization."), {
+        code: "MTP_TRANSPORT_ERROR",
+      }),
+    );
+
+    await app.controller.connect();
+
+    expect(app.controller.state).toMatchObject({
+      device: { kind: "error" },
+      selfTest: { kind: "passed", byteLength: 1037 },
+      postConnectStage: "idle",
+      catalogInventoryState: "idle",
+      activeError: {
+        code: "MTP_TRANSPORT_ERROR",
+        message: expect.stringContaining("inventory/comparison failed after the safe-write check passed"),
+      },
+    });
+    expect(app.controller.state.activeError?.message).not.toContain("Safe-write check failed");
+    expect(app.connection.disconnect).toHaveBeenCalledOnce();
+  });
+
   it("rejects a direct Send call unless the current comparison proves the book absent", async () => {
     const app = harness();
-    vi.mocked(app.connection.prepareAfterConnect).mockImplementationOnce(async (options) => ({
-      selfTest: await app.connection.runSelfTest(options?.selfTest),
-      inventory: {
+    vi.mocked(app.connection.refreshInventory).mockResolvedValueOnce({
         status: "complete",
         storageId: 0x10001,
         documentsHandle: 0x37,
@@ -666,9 +721,7 @@ describe("AppController local conversion flow", () => {
           truncated: false,
           truncationReasons: [],
         },
-      },
-      inventoryRefresh: "complete",
-    }));
+      });
 
     await app.controller.connect();
     expect(app.controller.state.catalogInventoryState).toBe("ready");
@@ -694,8 +747,9 @@ describe("AppController local conversion flow", () => {
     });
 
     const connecting = app.controller.connect();
-    await vi.waitFor(() => expect(app.controller.state.catalogInventoryState).toBe("loading"));
-    expect(app.controller.state.selfTest.kind).toBe("running");
+    await vi.waitFor(() => expect(app.controller.state.postConnectStage).toBe("reconciliation"));
+    expect(app.controller.state.selfTest.kind).toBe("passed");
+    expect(app.root.querySelector(".library-device-button")?.textContent).toContain("Comparing Kindle with library");
     await expect(
       app.controller.sendCatalogBook({ profileId: "profile-1", book: app.book }),
     ).rejects.toMatchObject({ code: "INVALID_STATE" });
@@ -975,11 +1029,7 @@ describe("AppController local conversion flow", () => {
         truncationReasons: [],
       },
     };
-    vi.mocked(app.connection.prepareAfterConnect).mockImplementationOnce(async (options) => ({
-      selfTest: await app.connection.runSelfTest(options?.selfTest),
-      inventory,
-      inventoryRefresh: "complete",
-    }));
+    vi.mocked(app.connection.refreshInventory).mockResolvedValueOnce(inventory);
     await vi.waitFor(() => expect(app.root.querySelector('[data-book-id="book-managed"]')).not.toBeNull());
 
     await app.controller.connect();
@@ -1119,7 +1169,7 @@ describe("AppController local conversion flow", () => {
 
   it("reports the exact safe-write failure and never reaches either book-transfer path", async () => {
     const app = harness();
-    vi.mocked(app.connection.prepareAfterConnect).mockRejectedValueOnce(
+    vi.mocked(app.connection.runSelfTest).mockRejectedValueOnce(
       new Error("Exact-byte comparison failed."),
     );
 
@@ -1843,11 +1893,7 @@ describe("AppController local conversion flow", () => {
       get closed() { return app.connection.closed; },
       get readyForSend() { return app.connection.readyForSend; },
       latestInventory: partialInventory,
-      prepareAfterConnect: vi.fn(async (options) => ({
-        selfTest: await app.connection.runSelfTest(options?.selfTest),
-        inventory: partialInventory,
-        inventoryRefresh: "partial" as const,
-      })),
+      refreshInventory: vi.fn(async () => partialInventory),
       sendAzW3AndRefreshInventory: vi.fn(app.connection.sendAzW3AndRefreshInventory),
     };
     vi.mocked(app.openDevice).mockResolvedValueOnce(guardedConnection);
@@ -1887,11 +1933,7 @@ describe("AppController local conversion flow", () => {
       issueCount: 0,
       scannedObjectCount: 1,
     };
-    vi.mocked(app.connection.prepareAfterConnect).mockImplementationOnce(async (options) => ({
-      selfTest: await app.connection.runSelfTest(options?.selfTest),
-      inventory: kindleAInventory,
-      inventoryRefresh: "complete",
-    }));
+    vi.mocked(app.connection.refreshInventory).mockResolvedValueOnce(kindleAInventory);
     vi.mocked(app.catalogApi.getMatchIndex).mockResolvedValue({
       profileId: "profile-1",
       generatedAt: "2026-08-30T00:00:00.000Z",

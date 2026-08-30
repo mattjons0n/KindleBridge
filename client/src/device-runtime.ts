@@ -2,6 +2,7 @@ import {
   KindleDevice,
   KindleDeviceError,
   acquireKindleDeviceLease,
+  createKindleMetadataCache,
   derivePseudonymousKindleIdentity,
   type KindleBookTransferResult,
   type KindleDeviceLease,
@@ -11,6 +12,7 @@ import {
   type KindleIdentityStability,
   type KindleInventoryOptions,
   type KindleInventorySnapshot,
+  type KindleMetadataCache,
   type KindleSelfTestResult,
   type KindleTransferProgress,
 } from "./kindle";
@@ -74,7 +76,11 @@ export interface OpenKindleOptions extends MtpOperationOptions {
   readonly leaseProvider?: KindleDeviceLeaseProvider;
   readonly identitySecretProvider?: KindleIdentitySecretProvider;
   readonly kindleOptions?: KindleDeviceOptions;
+  /** Injectable browser-local acceleration; raw Kindle inventory never leaves the browser. */
+  readonly metadataCache?: KindleMetadataCache;
 }
+
+const defaultKindleMetadataCache = createKindleMetadataCache();
 
 export class KindleRuntimeBusyError extends Error {
   readonly code = "KINDLE_OPERATION_BUSY" as const;
@@ -426,6 +432,7 @@ export async function openKindle(
     leaseProvider,
     identitySecretProvider,
     kindleOptions,
+    metadataCache = defaultKindleMetadataCache,
     ...operationOptions
   } = options;
   let details = initialDetails(device);
@@ -473,7 +480,11 @@ export async function openKindle(
     hooks.onMtpReading(details);
 
     const store = new MtpObjectStore(session);
-    const kindle = new KindleDevice(store, kindleOptions);
+    const kindle = new KindleDevice(
+      store,
+      kindleOptions,
+      identity === undefined ? undefined : { cache: metadataCache, identity },
+    );
     const target = await kindle.inspect(0, operationOptions);
     details = {
       ...details,

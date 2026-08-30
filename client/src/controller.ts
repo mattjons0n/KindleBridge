@@ -336,6 +336,16 @@ function errorContext(error: AppError): Readonly<Record<string, unknown>> {
   return { code: error.code, ...(error.details ?? {}) };
 }
 
+function isFatalInventoryError(error: unknown): boolean {
+  if (error && typeof error === "object" && Reflect.get(error, "fatal") === true) return true;
+  const code = error && typeof error === "object" ? Reflect.get(error, "code") : undefined;
+  return code === "MTP_INVALID_STATE"
+    || code === "MTP_TRANSPORT_ERROR"
+    || code === "MTP_COMMAND_TIMEOUT"
+    || code === "MTP_INACTIVITY_TIMEOUT"
+    || (typeof code === "string" && code.startsWith("USB_"));
+}
+
 function bookTransferCommandTimeoutMs(bytes: number): number {
   // Allow one minute of fixed overhead plus transfer time at a deliberately
   // conservative 32 KiB/s. Per-I/O inactivity timeouts still catch a hang.
@@ -463,6 +473,7 @@ export class AppController {
       selfTest: this.#state.selfTest.kind === "running"
         ? { kind: "failed", error, cleanupRequired }
         : { kind: "not-run" },
+      postConnectStage: "idle",
       catalogInventoryState: "idle",
       integratedTransfer: failInterruptedTransfer(
         this.#state.integratedTransfer,
@@ -576,6 +587,7 @@ export class AppController {
       usbAccessProven: changed ? false : this.#state.usbAccessProven,
       mtpReadProven: changed ? false : this.#state.mtpReadProven,
       selfTest: changed ? { kind: "not-run" } : this.#state.selfTest,
+      postConnectStage: changed ? "idle" : this.#state.postConnectStage,
       integratedTransfer: changed ? { kind: "idle" } : this.#state.integratedTransfer,
       conversion: this.#state.conversion,
       activeError: undefined,
@@ -637,6 +649,7 @@ export class AppController {
     this.#commit({
       ...this.#state,
       device: { kind: "requesting-permission" },
+      postConnectStage: "idle",
       catalogInventoryState: "idle",
       activeError: undefined,
     });
@@ -718,6 +731,7 @@ export class AppController {
         selfTest: this.#state.pendingObjectCleanup
           ? this.#state.selfTest
           : { kind: "running" },
+        postConnectStage: this.#state.pendingObjectCleanup ? "inventory" : "safe-write",
         catalogInventoryState: "loading",
         activeError: undefined,
       });
@@ -738,6 +752,7 @@ export class AppController {
               this.#dependencies.connectInventoryTimeoutMs ?? DEFAULT_CONNECT_INVENTORY_TIMEOUT_MS,
           });
           if (this.#isActiveConnection(epoch, connection)) {
+            this.#commit({ ...this.#state, postConnectStage: "reconciliation" });
             await this.#withCatalogDeadline(
               (catalogSignal) => this.#reconcileCatalogInventory(inventory, connection, catalogSignal),
               this.#dependencies.connectCatalogTimeoutMs ?? DEFAULT_CONNECT_CATALOG_TIMEOUT_MS,
@@ -748,12 +763,23 @@ export class AppController {
         } catch (inventoryError) {
           if (this.#isActiveConnection(epoch, connection)) {
             this.#catalogInventoryEpoch = undefined;
-            this.#commit({ ...this.#state, catalogInventoryState: "failed" });
+            this.#commit({
+              ...this.#state,
+              postConnectStage: "idle",
+              catalogInventoryState: "failed",
+            });
           }
           this.log.warn("Read-only Kindle inventory was unavailable while recovery is pending", {
             code: errorContext(toAppError(inventoryError)).code,
           });
         } finally {
+          if (
+            epoch === this.#deviceEpoch
+            && this.#connection === connection
+            && this.#state.postConnectStage !== "idle"
+          ) {
+            this.#commit({ ...this.#state, postConnectStage: "idle" });
+          }
           this.#finishHardwareOperation();
         }
         return;
@@ -777,6 +803,7 @@ export class AppController {
         usbAccessProven: false,
         mtpReadProven: false,
         selfTest: { kind: "not-run" },
+        postConnectStage: "idle",
         device: { kind: "error", details: lastDetails, error },
         catalogInventoryState: "idle",
         activeError: error,
@@ -815,6 +842,7 @@ export class AppController {
         usbAccessProven: false,
         mtpReadProven: false,
         selfTest: { kind: "not-run" },
+        postConnectStage: "idle",
         catalogInventoryState: "idle",
         device: { kind: "disconnected" },
         activeError: undefined,
@@ -826,6 +854,7 @@ export class AppController {
     this.#commit({
       ...this.#state,
       device: { kind: "recovering", details: connection.details },
+      postConnectStage: "idle",
       catalogInventoryState: "idle",
     });
     try {
@@ -836,6 +865,7 @@ export class AppController {
         usbAccessProven: false,
         mtpReadProven: false,
         selfTest: { kind: "not-run" },
+        postConnectStage: "idle",
         catalogInventoryState: "idle",
         device: { kind: "disconnected" },
         activeError: undefined,
@@ -852,6 +882,7 @@ export class AppController {
         usbAccessProven: false,
         mtpReadProven: false,
         selfTest: { kind: "not-run" },
+        postConnectStage: "idle",
         catalogInventoryState: "idle",
         device: { kind: "error", details: connection.details, error },
         activeError: error,
@@ -882,6 +913,7 @@ export class AppController {
     this.#commit({
       ...this.#state,
       selfTest: { kind: "running" },
+      postConnectStage: "safe-write",
       integratedTransfer: { kind: "idle" },
       activeError: undefined,
     });
@@ -897,6 +929,7 @@ export class AppController {
       this.#commit({
         ...this.#state,
         selfTest: { kind: "passed", byteLength: result.bytesVerified },
+        postConnectStage: "idle",
         activeError: undefined,
       });
       this.log.info("Gate 3 exact-byte round trip and cleanup passed", {
@@ -912,11 +945,19 @@ export class AppController {
       this.#commit({
         ...this.#state,
         selfTest: { kind: "failed", error, cleanupRequired },
+        postConnectStage: "idle",
         activeError: error,
       });
       this.log.error(error.message, errorContext(error));
       await this.#retireFaultedConnection(connection, error);
     } finally {
+      if (
+        epoch === this.#deviceEpoch
+        && this.#connection === connection
+        && this.#state.postConnectStage !== "idle"
+      ) {
+        this.#commit({ ...this.#state, postConnectStage: "idle" });
+      }
       this.#finishHardwareOperation();
     }
   }
@@ -1564,6 +1605,7 @@ export class AppController {
       this.#commit(this.#stateAfterDisconnect({
         ...this.#state,
         device: { kind: "disconnected" },
+        postConnectStage: "idle",
         catalogInventoryState: "idle",
         [transferKey]: {
           kind: "verified",
@@ -1623,6 +1665,7 @@ export class AppController {
       this.#commit(this.#stateAfterDisconnect({
         ...this.#state,
         device: deviceState,
+        postConnectStage: "idle",
         catalogInventoryState: "idle",
         [transferKey]: {
           kind: "failed",
@@ -1657,34 +1700,50 @@ export class AppController {
     this.#commit({
       ...this.#state,
       selfTest: { kind: "running" },
+      postConnectStage: "safe-write",
       device: { kind: "ready", details: connection.details },
       catalogInventoryState: "loading",
       activeError: undefined,
     });
     try {
-      const prepared = await connection.prepareAfterConnect({
-        selfTest: {
-          signal,
-          aggregateTimeoutMs:
-            this.#dependencies.selfTestOperationTimeoutMs ?? DEFAULT_SELF_TEST_OPERATION_TIMEOUT_MS,
-          onObjectState: this.#objectStateHandler("self-test", undefined, connection.details),
-        },
-        inventory: {
-          signal,
-          aggregateTimeoutMs:
-            this.#dependencies.connectInventoryTimeoutMs ?? DEFAULT_CONNECT_INVENTORY_TIMEOUT_MS,
-        },
+      const selfTest = await connection.runSelfTest({
+        signal,
+        aggregateTimeoutMs:
+          this.#dependencies.selfTestOperationTimeoutMs ?? DEFAULT_SELF_TEST_OPERATION_TIMEOUT_MS,
+        onObjectState: this.#objectStateHandler("self-test", undefined, connection.details),
       });
       if (!this.#isActiveConnection(epoch, connection)) return;
       this.log.info("Automatic exact-byte round trip and cleanup passed", {
-        filename: prepared.selfTest.filename,
-        handle: prepared.selfTest.handle,
-        bytesVerified: prepared.selfTest.bytesVerified,
+        filename: selfTest.filename,
+        handle: selfTest.handle,
+        bytesVerified: selfTest.bytesVerified,
       });
-      if (prepared.inventory) {
+      this.#commit({
+        ...this.#state,
+        selfTest: { kind: "passed", byteLength: selfTest.bytesVerified },
+        postConnectStage: "inventory",
+      });
+
+      let inventory: KindleInventorySnapshot | undefined;
+      try {
+        inventory = await connection.refreshInventory({
+          signal,
+          aggregateTimeoutMs:
+            this.#dependencies.connectInventoryTimeoutMs ?? DEFAULT_CONNECT_INVENTORY_TIMEOUT_MS,
+        });
+      } catch (inventoryError) {
+        if (isFatalInventoryError(inventoryError)) throw inventoryError;
+        this.#catalogInventoryEpoch = undefined;
+        this.log.warn("Kindle inventory refresh failed after the safe-write test", {
+          code: errorContext(toAppError(inventoryError)).code,
+        });
+      }
+      if (!this.#isActiveConnection(epoch, connection)) return;
+      if (inventory) {
+        this.#commit({ ...this.#state, postConnectStage: "reconciliation" });
         try {
           await this.#withCatalogDeadline(
-            (catalogSignal) => this.#reconcileCatalogInventory(prepared.inventory!, connection, catalogSignal),
+            (catalogSignal) => this.#reconcileCatalogInventory(inventory!, connection, catalogSignal),
             this.#dependencies.connectCatalogTimeoutMs ?? DEFAULT_CONNECT_CATALOG_TIMEOUT_MS,
             "connect-reconciliation",
             signal,
@@ -1695,38 +1754,55 @@ export class AppController {
             code: errorContext(toAppError(inventoryError)).code,
           });
         }
-      } else {
-        this.#catalogInventoryEpoch = undefined;
-        this.log.warn("Kindle inventory refresh failed after the safe-write test", {
-          code: prepared.inventoryErrorCode,
-        });
       }
       if (!this.#isActiveConnection(epoch, connection)) return;
       this.#commit({
         ...this.#state,
-        selfTest: { kind: "passed", byteLength: prepared.selfTest.bytesVerified },
+        selfTest: { kind: "passed", byteLength: selfTest.bytesVerified },
+        postConnectStage: "idle",
         device: { kind: "ready", details: connection.details },
         catalogInventoryState: this.#catalogInventoryEpoch === epoch ? "ready" : "failed",
         activeError: undefined,
       });
     } catch (rawPostConnectError) {
       if (!this.#isActiveConnection(epoch, connection)) return;
-      const underlying = toAppError(rawPostConnectError, "The automatic exact-byte self-test failed");
+      const safeWritePassed = this.#state.selfTest.kind === "passed";
+      const underlying = toAppError(
+        rawPostConnectError,
+        safeWritePassed
+          ? "The Kindle inventory or catalog comparison failed"
+          : "The automatic exact-byte self-test failed",
+      );
       const error = new AppError(
         underlying.code,
-        `Safe-write check failed. No book has been sent. ${underlying.message}`,
+        safeWritePassed
+          ? `Kindle inventory/comparison failed after the safe-write check passed. No book has been sent. ${underlying.message}`
+          : `Safe-write check failed. No book has been sent. ${underlying.message}`,
         { cause: underlying, details: underlying.details },
       );
-      const cleanupRequired = manualCleanupInstruction(underlying)
-        ?? pendingCleanupInstruction(this.#state.pendingObjectCleanup);
+      const cleanupRequired = safeWritePassed
+        ? undefined
+        : manualCleanupInstruction(underlying)
+          ?? pendingCleanupInstruction(this.#state.pendingObjectCleanup);
       this.#commit({
         ...this.#state,
-        selfTest: { kind: "failed", error, cleanupRequired },
+        selfTest: safeWritePassed
+          ? this.#state.selfTest
+          : { kind: "failed", error, cleanupRequired },
+        postConnectStage: "idle",
         catalogInventoryState: "failed",
         activeError: error,
       });
       this.log.error(error.message, errorContext(error));
       await this.#retireFaultedConnection(connection, error);
+    } finally {
+      if (
+        epoch === this.#deviceEpoch
+        && this.#connection === connection
+        && this.#state.postConnectStage !== "idle"
+      ) {
+        this.#commit({ ...this.#state, postConnectStage: "idle" });
+      }
     }
   }
 
@@ -1867,6 +1943,11 @@ export class AppController {
       objects: inventory.objects.length,
       issues: inventory.issueCount,
       profiles: indexes.length,
+      metadataStatus: inventory.bookMetadata?.status,
+      metadataReads: inventory.bookMetadata?.attemptedObjectCount,
+      metadataCacheHits: inventory.bookMetadata?.cacheHitObjectCount ?? 0,
+      managedMetadataSkips: inventory.bookMetadata?.managedObjectCount ?? 0,
+      metadataReadBytes: inventory.bookMetadata?.readByteCount,
     });
     return {
       complete: activeProfileComplete,
@@ -2302,6 +2383,7 @@ export class AppController {
         : this.#state.conversion,
       device: { kind: "error", ...(deviceDetails === undefined ? {} : { details: deviceDetails }), error },
       selfTest: { kind: "not-run" },
+      postConnectStage: "idle",
       catalogInventoryState: "idle",
       integratedTransfer: failInterruptedTransfer(this.#state.integratedTransfer, error, cleanupRequired),
       activeError: error,
@@ -2520,6 +2602,7 @@ export class AppController {
     this.#commit(this.#stateAfterDisconnect({
       ...this.#state,
       device: { kind: "error", details: connection.details, error },
+      postConnectStage: "idle",
       catalogInventoryState: "idle",
       activeError: error,
     }, connection));

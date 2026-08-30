@@ -618,6 +618,47 @@ describe("catalog/Kindle reconciliation", () => {
     expect(result.inventory.truncated).toBe(false);
   });
 
+  it("keeps absence unknown when an unmanaged KFX object has no supported metadata parser", async () => {
+    const snapshot = await inventory("some-other-book");
+    const opaqueKfx = {
+      ...snapshot.objects[1]!,
+      filename: "opaque-amazon-book.KFX",
+      relativePath: "opaque-amazon-book.KFX",
+      title: undefined,
+      authors: undefined,
+      identifiers: undefined,
+      bookMetadataState: "skipped-unsupported-format" as const,
+    };
+    const metadataPartial: KindleInventorySnapshot = {
+      ...snapshot,
+      objects: [opaqueKfx],
+      scannedObjectCount: 1,
+      bookMetadata: {
+        ...snapshot.bookMetadata!,
+        status: "partial",
+        eligibleObjectCount: 1,
+        attemptedObjectCount: 0,
+        parsedObjectCount: 0,
+        enrichedObjectCount: 0,
+        skippedObjectCount: 1,
+        readByteCount: 0,
+        budgetedByteCount: 0,
+        truncated: true,
+        truncationReasons: ["unsupported-format"],
+      },
+    };
+
+    const result = await reconcileCatalogIndexes([index("book-unknown")], metadataPartial, {
+      deviceLabel: "Kindle",
+    });
+
+    expect(result.statuses.get("book-unknown")).toBe("unknown");
+    expect(result.inventory.items[0]).toMatchObject({
+      filename: "opaque-amazon-book.KFX",
+      match: "unmatched",
+    });
+  });
+
   it.each([
     {
       label: "empty",

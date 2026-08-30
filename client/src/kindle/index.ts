@@ -7,4 +7,5 @@ export * from "./filenames";
 export * from "./inventory";
 export * from "./kindle-device";
 export * from "./matching";
+export * from "./metadata-cache";
 export * from "./self-test-payload";

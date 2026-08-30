@@ -48,6 +48,9 @@ export type SelfTestState =
 
 export type CatalogInventoryState = "idle" | "loading" | "ready" | "failed";
 
+/** The user-visible phase of the automatic work that follows an MTP connection. */
+export type PostConnectStage = "idle" | "safe-write" | "inventory" | "reconciliation";
+
 export type TransferPurpose = "integrated";
 
 export interface TargetProfile {
@@ -100,6 +103,7 @@ export interface AppState {
   readonly conversion: ConversionState;
   readonly device: DeviceState;
   readonly selfTest: SelfTestState;
+  readonly postConnectStage: PostConnectStage;
   /** Current-connection Kindle inventory and catalog matching readiness. */
   readonly catalogInventoryState: CatalogInventoryState;
   readonly integratedTransfer: TransferState;
@@ -293,6 +297,7 @@ export function initialAppState(): AppState {
     conversion: { kind: "empty" },
     device: { kind: "disconnected" },
     selfTest: { kind: "not-run" },
+    postConnectStage: "idle",
     catalogInventoryState: "idle",
     integratedTransfer: { kind: "idle" },
     pendingObjectCleanup: readPendingObjectCleanup(),

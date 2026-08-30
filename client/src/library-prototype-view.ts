@@ -521,22 +521,30 @@ export function renderLibraryPrototype(
   const deviceDetail = disconnecting
     ? "Closing the MTP session…"
     : connected
-      ? !safeWritePassed
+      ? state.postConnectStage === "safe-write"
         ? "Checking safe writes…"
-        : state.catalogInventoryState === "loading"
-          ? "Checking Kindle inventory…"
-          : ready ? "Safe-write and inventory checks passed" : "Kindle inventory unavailable"
+        : state.postConnectStage === "inventory"
+          ? "Reading Kindle Documents…"
+          : state.postConnectStage === "reconciliation"
+            ? "Comparing Kindle with library…"
+            : state.pendingObjectCleanup
+              ? "Recovery inspection required"
+              : ready ? "Safe-write and inventory checks passed" : "Kindle inventory unavailable"
       : "Plug in over USB";
   const kindleSummaryDetail = disconnecting
     ? "Closing the MTP session and releasing USB"
     : connected
-      ? !safeWritePassed
+      ? state.postConnectStage === "safe-write"
         ? "Checking safe writes…"
-        : state.catalogInventoryState === "loading"
-          ? "Safe-write passed; checking Documents inventory…"
-          : ready ? "Exact-byte safe-write and inventory checks passed" : "Inventory unavailable; disconnect and reconnect to retry"
+        : state.postConnectStage === "inventory"
+          ? safeWritePassed ? "Safe-write passed; reading Documents inventory…" : "Reading Documents for recovery…"
+          : state.postConnectStage === "reconciliation"
+            ? "Kindle inventory read; comparing it with this library…"
+            : state.pendingObjectCleanup
+              ? "Inspect and acknowledge the recorded object before safe writes resume"
+              : ready ? "Exact-byte safe-write and inventory checks passed" : "Inventory unavailable; disconnect and reconnect to retry"
       : "Connect to build a current Documents inventory";
-  const disconnectBlocked = disconnecting || snapshot.sendBusy || state.selfTest.kind === "running";
+  const disconnectBlocked = disconnecting || snapshot.sendBusy || state.postConnectStage !== "idle" || state.selfTest.kind === "running";
   const kindleConnectionButton = connected
     ? `<button type="button" data-ui-action="disconnect-catalog-device"${disconnectBlocked ? " disabled" : ""}>${disconnecting ? "Disconnecting…" : snapshot.sendBusy ? "Transfer in progress…" : "Disconnect"}</button>`
     : '<button type="button" data-ui-action="connect-catalog-device">Connect Kindle</button>';

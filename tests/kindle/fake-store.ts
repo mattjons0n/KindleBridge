@@ -42,6 +42,7 @@ export function objectInfo(
     parentHandle: 0,
     associationType: 0,
     filename: `object-${handle}`,
+    modificationDate: "20260829T120000Z",
     ...overrides,
   };
 }
@@ -55,6 +56,7 @@ export class FakeKindleObjectStore implements KindleObjectStore {
   readonly createRequests: KindleCreateObjectRequest[] = [];
   readonly childListFailures = new Map<number, unknown>();
   readonly metadataFailures = new Map<number, unknown>();
+  readonly metadataRequests: number[] = [];
   readonly readFailures = new Map<number, unknown>();
   readonly readRequests: Array<{ handle: number; maxBytes?: number }> = [];
   nextHandle = 100;
@@ -131,6 +133,7 @@ export class FakeKindleObjectStore implements KindleObjectStore {
     handle: number,
     _options?: KindleOperationOptions,
   ): Promise<KindleStoredObjectInfo> {
+    this.metadataRequests.push(handle);
     const failure = this.metadataFailures.get(handle);
     if (failure) throw failure;
     const info = this.objects.get(handle);

@@ -33,6 +33,8 @@ export interface KindleStoredObjectInfo {
   parentHandle: number;
   associationType: number;
   filename: string;
+  /** Raw MTP modification timestamp; consumers must validate before trusting it. */
+  modificationDate: string;
 }
 
 export interface KindleCreateObjectRequest {

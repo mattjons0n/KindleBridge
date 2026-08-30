@@ -7,6 +7,10 @@ import {
   kindleInventoryObjectToMatchInput,
   matchCatalogBookToKindle,
 } from "../../client/src/kindle/matching";
+import {
+  createKindleMetadataCache,
+  type KindleMetadataCache,
+} from "../../client/src/kindle/metadata-cache";
 import { makeKindleBookFixture } from "./book-fixture";
 import { FakeKindleObjectStore, objectInfo } from "./fake-store";
 
@@ -15,6 +19,25 @@ function device(store: FakeKindleObjectStore): KindleDevice {
     now: () => new Date("2026-08-29T12:00:00Z"),
     random: () => 0,
   });
+}
+
+const cacheIdentity = Object.freeze({
+  key: "a".repeat(64),
+  stability: "installation" as const,
+});
+
+function cacheEnabledDevice(
+  store: FakeKindleObjectStore,
+  cache: KindleMetadataCache,
+): KindleDevice {
+  return new KindleDevice(
+    store,
+    {
+      now: () => new Date("2026-08-29T12:00:00Z"),
+      random: () => 0,
+    },
+    { cache, identity: cacheIdentity },
+  );
 }
 
 describe("recursive Kindle Documents inventory", () => {
@@ -64,6 +87,91 @@ describe("recursive Kindle Documents inventory", () => {
     ]);
     expect(store.deletedHandles).toEqual([]);
     expect(store.createRequests).toEqual([]);
+  });
+
+  it("retains Kindle .sdr folders but prunes their descendants case-insensitively", async () => {
+    const store = new FakeKindleObjectStore();
+    store.objects.set(20, objectInfo(20, {
+      parentHandle: 10,
+      objectFormat: MTP_OBJECT_FORMAT_ASSOCIATION,
+      associationType: 1,
+      filename: "Top-level.SDR",
+    }));
+    store.objects.set(21, objectInfo(21, {
+      parentHandle: 10,
+      objectFormat: MTP_OBJECT_FORMAT_ASSOCIATION,
+      associationType: 1,
+      filename: "Fiction",
+    }));
+    store.objects.set(22, objectInfo(22, {
+      parentHandle: 21,
+      objectFormat: MTP_OBJECT_FORMAT_ASSOCIATION,
+      associationType: 1,
+      filename: "Nested.sDr",
+    }));
+    store.objects.set(30, objectInfo(30, {
+      parentHandle: 20,
+      filename: "metadata.kfx",
+    }));
+    store.objects.set(31, objectInfo(31, {
+      parentHandle: 22,
+      filename: "sidecar-content.azw3",
+    }));
+    const unexpectedTraversal = Object.assign(new Error("must not traverse sidecars"), {
+      code: "MTP_TRANSPORT_ERROR",
+    });
+    store.childListFailures.set(20, unexpectedTraversal);
+    store.childListFailures.set(22, unexpectedTraversal);
+
+    const snapshot = await device(store).inventory({ bookMetadata: false });
+
+    expect(snapshot).toMatchObject({
+      status: "complete",
+      issueCount: 0,
+      scannedObjectCount: 3,
+      bookMetadata: {
+        status: "disabled",
+        eligibleObjectCount: 0,
+      },
+    });
+    expect(snapshot.objects).toEqual([
+      expect.objectContaining({
+        handle: 20,
+        kind: "folder",
+        relativePath: "Top-level.SDR",
+      }),
+      expect.objectContaining({
+        handle: 21,
+        kind: "folder",
+        relativePath: "Fiction",
+      }),
+      expect.objectContaining({
+        handle: 22,
+        kind: "folder",
+        relativePath: "Fiction/Nested.sDr",
+      }),
+    ]);
+    expect(store.readRequests).toEqual([]);
+  });
+
+  it("continues through ordinary folders whose names merely contain .sdr", async () => {
+    const store = new FakeKindleObjectStore();
+    store.objects.set(20, objectInfo(20, {
+      parentHandle: 10,
+      objectFormat: MTP_OBJECT_FORMAT_ASSOCIATION,
+      associationType: 1,
+      filename: "not-sidecar.sdr-backup",
+    }));
+    store.objects.set(21, objectInfo(21, {
+      parentHandle: 20,
+      filename: "nested.azw3",
+    }));
+
+    const snapshot = await device(store).inventory({ bookMetadata: false });
+
+    expect(snapshot.status).toBe("complete");
+    expect(snapshot.objects.map(({ handle }) => handle)).toEqual([20, 21]);
+    expect(snapshot.bookMetadata).toMatchObject({ eligibleObjectCount: 1 });
   });
 
   it("keeps useful objects but marks the snapshot partial when one metadata read fails", async () => {
@@ -215,6 +323,301 @@ describe("recursive Kindle Documents inventory", () => {
     expect(store.deletedHandles).toEqual([]);
   });
 
+  it("reuses cached parsed metadata only after the unchanged object is enumerated live", async () => {
+    const store = new FakeKindleObjectStore();
+    const book = makeKindleBookFixture({
+      exthTitle: "Cached after a live scan",
+      authors: ["Known Author"],
+      asin504: "B0CACHEHIT1",
+    });
+    store.objects.set(11, objectInfo(11, {
+      parentHandle: 10,
+      filename: "unmanaged-cache-hit.azw3",
+      compressedSize: book.byteLength,
+      modificationDate: "20260829T120000Z",
+    }));
+    store.objectData.set(11, book);
+    const cache = createKindleMetadataCache({ persistence: null, now: () => 1_000 });
+
+    const first = await cacheEnabledDevice(store, cache).inventory();
+    expect(first.bookMetadata).toMatchObject({
+      attemptedObjectCount: 1,
+      parsedObjectCount: 1,
+      readByteCount: book.byteLength,
+    });
+    expect(store.readRequests).toHaveLength(1);
+
+    store.readRequests.length = 0;
+    // A new KindleDevice models a new MTP connection; only the browser-local
+    // cache and privacy-safe device identity carry across the boundary.
+    const second = await cacheEnabledDevice(store, cache).inventory();
+
+    expect(second.status).toBe("complete");
+    expect(second.objects).toEqual([
+      expect.objectContaining({
+        handle: 11,
+        title: "Cached after a live scan",
+        authors: ["Known Author"],
+        identifiers: ["asin:B0CACHEHIT1"],
+      }),
+    ]);
+    expect(second.bookMetadata).toMatchObject({
+      status: "complete",
+      eligibleObjectCount: 1,
+      attemptedObjectCount: 0,
+      parsedObjectCount: 0,
+      enrichedObjectCount: 1,
+      cacheHitObjectCount: 1,
+      readByteCount: 0,
+      budgetedByteCount: 0,
+    });
+    expect(store.readRequests).toEqual([]);
+  });
+
+  it("counts cache hits against the bounded metadata-object envelope", async () => {
+    const store = new FakeKindleObjectStore();
+    const cachedBook = makeKindleBookFixture({
+      exthTitle: "Already cached",
+      authors: ["Known Author"],
+    });
+    const newBook = makeKindleBookFixture({
+      exthTitle: "Needs a live read",
+      authors: ["Known Author"],
+    });
+    store.objects.set(11, objectInfo(11, {
+      parentHandle: 10,
+      filename: "first-cached.azw3",
+      compressedSize: cachedBook.byteLength,
+    }));
+    store.objectData.set(11, cachedBook);
+    const cache = createKindleMetadataCache({ persistence: null, now: () => 1_500 });
+    const kindle = cacheEnabledDevice(store, cache);
+    await kindle.inventory({ bookMetadata: { maxObjects: 1 } });
+
+    store.objects.set(12, objectInfo(12, {
+      parentHandle: 10,
+      filename: "second-new.azw3",
+      compressedSize: newBook.byteLength,
+    }));
+    store.objectData.set(12, newBook);
+    store.readRequests.length = 0;
+    const bounded = await kindle.inventory({ bookMetadata: { maxObjects: 1 } });
+
+    expect(bounded.bookMetadata).toMatchObject({
+      status: "partial",
+      eligibleObjectCount: 2,
+      attemptedObjectCount: 0,
+      cacheHitObjectCount: 1,
+      skippedObjectCount: 1,
+      truncationReasons: ["object-count"],
+    });
+    expect(bounded.objects.find(({ handle }) => handle === 12)).toMatchObject({
+      bookMetadataState: "skipped-object-count",
+    });
+    expect(store.readRequests).toEqual([]);
+  });
+
+  it("does not let unsupported KFX objects consume supported cache lookup slots", async () => {
+    const store = new FakeKindleObjectStore();
+    const azw3 = makeKindleBookFixture({
+      exthTitle: "Cached behind KFX",
+      authors: ["Known Author"],
+    });
+    store.objects.set(12, objectInfo(12, {
+      parentHandle: 10,
+      filename: "supported.azw3",
+      compressedSize: azw3.byteLength,
+    }));
+    store.objectData.set(12, azw3);
+    const cache = createKindleMetadataCache({ persistence: null, now: () => 1_600 });
+    const kindle = cacheEnabledDevice(store, cache);
+    await kindle.inventory({ bookMetadata: { maxObjects: 1 } });
+
+    // Reinsert the supported object after KFX so the unsupported entry appears
+    // first in the live device order and would otherwise take the sole lookup.
+    const supportedInfo = store.objects.get(12)!;
+    store.objects.delete(12);
+    store.objects.set(11, objectInfo(11, {
+      parentHandle: 10,
+      filename: "opaque.kFx",
+      compressedSize: 150_000_000,
+    }));
+    store.objects.set(12, supportedInfo);
+    store.readRequests.length = 0;
+
+    const snapshot = await kindle.inventory({ bookMetadata: { maxObjects: 1 } });
+
+    expect(snapshot.bookMetadata).toMatchObject({
+      status: "partial",
+      eligibleObjectCount: 2,
+      attemptedObjectCount: 0,
+      cacheHitObjectCount: 1,
+      skippedObjectCount: 1,
+      readByteCount: 0,
+      truncationReasons: ["unsupported-format"],
+    });
+    expect(snapshot.objects.find(({ handle }) => handle === 11)).toMatchObject({
+      bookMetadataState: "skipped-unsupported-format",
+    });
+    expect(snapshot.objects.find(({ handle }) => handle === 12)).toMatchObject({
+      title: "Cached behind KFX",
+    });
+    expect(store.readRequests).toEqual([]);
+  });
+
+  it("keeps bounded cache progress when a later live read loses the transport", async () => {
+    const store = new FakeKindleObjectStore();
+    const book = makeKindleBookFixture({
+      exthTitle: "Incrementally cached",
+      authors: ["Known Author"],
+    });
+    for (let index = 0; index < 257; index += 1) {
+      const handle = 11 + index;
+      store.objects.set(handle, objectInfo(handle, {
+        parentHandle: 10,
+        filename: `incremental-${index}.azw3`,
+        compressedSize: book.byteLength,
+      }));
+      store.objectData.set(handle, book);
+    }
+    const finalHandle = 11 + 256;
+    store.readFailures.set(finalHandle, Object.assign(new Error("late transport loss"), {
+      code: "MTP_TRANSPORT_ERROR",
+    }));
+    const cache = createKindleMetadataCache({ persistence: null, now: () => 1_750 });
+    const kindle = cacheEnabledDevice(store, cache);
+
+    await expect(kindle.inventory()).rejects.toMatchObject({ code: "MTP_TRANSPORT_ERROR" });
+
+    store.readFailures.delete(finalHandle);
+    store.readRequests.length = 0;
+    const retry = await kindle.inventory();
+
+    expect(retry.bookMetadata).toMatchObject({
+      status: "complete",
+      eligibleObjectCount: 257,
+      attemptedObjectCount: 1,
+      parsedObjectCount: 1,
+      cacheHitObjectCount: 256,
+    });
+    expect(store.readRequests).toEqual([{ handle: finalHandle, maxBytes: book.byteLength }]);
+  });
+
+  it.each([
+    {
+      evidence: "size",
+      mutate: (store: FakeKindleObjectStore, book: Uint8Array) => {
+        store.objects.set(11, {
+          ...store.objects.get(11)!,
+          compressedSize: book.byteLength + 1,
+        });
+      },
+    },
+    {
+      evidence: "modification date",
+      mutate: (store: FakeKindleObjectStore) => {
+        store.objects.set(11, {
+          ...store.objects.get(11)!,
+          modificationDate: "20260829T120001Z",
+        });
+      },
+    },
+  ])("forces a live metadata read when the observed $evidence changes", async ({ mutate }) => {
+    const store = new FakeKindleObjectStore();
+    const book = makeKindleBookFixture({
+      exthTitle: "Changed cache evidence",
+      authors: ["Known Author"],
+    });
+    store.objects.set(11, objectInfo(11, {
+      parentHandle: 10,
+      filename: "unmanaged-changed.azw3",
+      compressedSize: book.byteLength,
+      modificationDate: "20260829T120000Z",
+    }));
+    store.objectData.set(11, book);
+    const cache = createKindleMetadataCache({ persistence: null, now: () => 2_000 });
+    await cacheEnabledDevice(store, cache).inventory();
+    store.readRequests.length = 0;
+
+    mutate(store, book);
+    const changed = await cacheEnabledDevice(store, cache).inventory();
+
+    expect(changed.bookMetadata).toMatchObject({
+      attemptedObjectCount: 1,
+      parsedObjectCount: 1,
+    });
+    expect(changed.bookMetadata).not.toHaveProperty("cacheHitObjectCount");
+    expect(store.readRequests).toEqual([
+      {
+        handle: 11,
+        maxBytes: store.objects.get(11)!.compressedSize,
+      },
+    ]);
+  });
+
+  it("never resurrects a cached book that is absent from the current live hierarchy", async () => {
+    const store = new FakeKindleObjectStore();
+    const book = makeKindleBookFixture({
+      exthTitle: "Removed after caching",
+      authors: ["Known Author"],
+    });
+    store.objects.set(11, objectInfo(11, {
+      parentHandle: 10,
+      filename: "removed-after-cache.azw3",
+      compressedSize: book.byteLength,
+      modificationDate: "20260829T120000Z",
+    }));
+    store.objectData.set(11, book);
+    const cache = createKindleMetadataCache({ persistence: null, now: () => 3_000 });
+    await cacheEnabledDevice(store, cache).inventory();
+
+    store.objects.delete(11);
+    store.objectData.delete(11);
+    store.readRequests.length = 0;
+    const afterRemoval = await cacheEnabledDevice(store, cache).inventory();
+
+    expect(afterRemoval).toMatchObject({
+      status: "complete",
+      scannedObjectCount: 0,
+      objects: [],
+      bookMetadata: {
+        status: "complete",
+        eligibleObjectCount: 0,
+        attemptedObjectCount: 0,
+        parsedObjectCount: 0,
+        readByteCount: 0,
+      },
+    });
+    expect(store.readRequests).toEqual([]);
+  });
+
+  it("does not download a managed Kindle Bridge derivative for weaker embedded metadata", async () => {
+    const store = new FakeKindleObjectStore();
+    store.objects.set(11, objectInfo(11, {
+      parentHandle: 10,
+      filename: "Managed-kb-0123456789abcdefabcd-20260829T120000Z-000000.KFX",
+      compressedSize: 180_000_000,
+    }));
+
+    const snapshot = await device(store).inventory();
+
+    expect(snapshot.bookMetadata).toMatchObject({
+      status: "complete",
+      eligibleObjectCount: 1,
+      attemptedObjectCount: 0,
+      parsedObjectCount: 0,
+      managedObjectCount: 1,
+      readByteCount: 0,
+      budgetedByteCount: 0,
+      truncated: false,
+    });
+    expect(snapshot.objects[0]).toMatchObject({
+      managedToken: "kb-0123456789abcdefabcd",
+      bookMetadataState: "managed-token",
+    });
+    expect(store.readRequests).toEqual([]);
+  });
+
   it("makes parsed empty unmanaged books conservatively incomplete for absence", async () => {
     const store = new FakeKindleObjectStore();
     const empty = makeKindleBookFixture({ databaseTitle: "", mobiTitle: "" });
@@ -287,7 +690,7 @@ describe("recursive Kindle Documents inventory", () => {
     });
   });
 
-  it("recognizes KFX, AZW, AZW8, and PRC book objects while ignoring TXT metadata", async () => {
+  it("recognizes KFX/AZW8 without downloading unsupported containers and still parses AZW/PRC", async () => {
     const store = new FakeKindleObjectStore();
     const book = makeKindleBookFixture({
       exthTitle: "Extension coverage",
@@ -313,13 +716,22 @@ describe("recursive Kindle Documents inventory", () => {
     const snapshot = await device(store).inventory();
 
     expect(snapshot.bookMetadata).toMatchObject({
-      status: "complete",
+      status: "partial",
       eligibleObjectCount: 4,
-      attemptedObjectCount: 4,
-      parsedObjectCount: 4,
-      enrichedObjectCount: 4,
+      attemptedObjectCount: 2,
+      parsedObjectCount: 2,
+      enrichedObjectCount: 2,
+      skippedObjectCount: 2,
+      readByteCount: book.byteLength * 2,
+      truncationReasons: ["unsupported-format"],
     });
-    expect(store.readRequests.map(({ handle }) => handle)).toEqual([11, 12, 13, 14]);
+    expect(store.readRequests.map(({ handle }) => handle)).toEqual([12, 14]);
+    expect(snapshot.objects.find(({ handle }) => handle === 11)).toMatchObject({
+      bookMetadataState: "skipped-unsupported-format",
+    });
+    expect(snapshot.objects.find(({ handle }) => handle === 13)).toMatchObject({
+      bookMetadataState: "skipped-unsupported-format",
+    });
     expect(snapshot.objects.find(({ handle }) => handle === 15)?.bookMetadataState).toBeUndefined();
   });
 

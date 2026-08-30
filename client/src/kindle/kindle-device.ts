@@ -15,6 +15,8 @@ import {
 } from "./filenames";
 import {
   buildKindleInventory,
+  type KindleInventoryFolderSeed,
+  type KindleInventoryMetadataCacheContext,
   type KindleInventoryOptions,
   type KindleInventorySnapshot,
 } from "./inventory";
@@ -71,6 +73,11 @@ interface ObjectExpectation {
   parentHandle: number;
   filename: string;
   size: number;
+}
+
+interface GeneratedFilenamePreflight {
+  readonly filename: string;
+  readonly children: readonly KindleStoredObjectInfo[];
 }
 
 function bigintSize(value: number): bigint {
@@ -148,11 +155,18 @@ export class KindleDevice {
   private readonly now: () => Date;
   private readonly random: () => number;
   private readonly createdHandles = new Map<number, string>();
+  private inventoryFolderSeed?: KindleInventoryFolderSeed;
+  private readonly inventoryMetadataCacheContext?: KindleInventoryMetadataCacheContext;
 
-  constructor(store: KindleObjectStore, options: KindleDeviceOptions = {}) {
+  constructor(
+    store: KindleObjectStore,
+    options: KindleDeviceOptions = {},
+    inventoryMetadataCacheContext?: KindleInventoryMetadataCacheContext,
+  ) {
     this.store = store;
     this.now = options.now ?? (() => new Date());
     this.random = options.random ?? Math.random;
+    this.inventoryMetadataCacheContext = inventoryMetadataCacheContext;
   }
 
   get currentTarget(): Readonly<KindleTarget> | undefined {
@@ -231,11 +245,12 @@ export class KindleDevice {
   ): Promise<KindleSelfTestResult> {
     const payload = KINDLE_SELF_TEST_PAYLOAD.slice();
     const target = await this.ensureTarget(payload.byteLength, options);
-    const filename = await this.unusedGeneratedFilename(
+    const preflight = await this.unusedGeneratedFilename(
       () => createSelfTestFilename(this.now(), this.random),
       target,
       options,
     );
+    const { filename } = preflight;
 
     let handle: number | undefined;
     let primaryFailure: unknown;
@@ -316,6 +331,11 @@ export class KindleDevice {
       );
     }
 
+    this.inventoryFolderSeed = {
+      parentHandle: target.documentsHandle,
+      children: preflight.children,
+    };
+
     return {
       filename,
       handle,
@@ -328,7 +348,15 @@ export class KindleDevice {
     options: KindleInventoryOptions = {},
   ): Promise<KindleInventorySnapshot> {
     const target = await this.ensureTarget(0, options);
-    return buildKindleInventory(this.store, target, options);
+    const folderSeed = this.inventoryFolderSeed;
+    this.inventoryFolderSeed = undefined;
+    return buildKindleInventory(
+      this.store,
+      target,
+      options,
+      folderSeed,
+      this.inventoryMetadataCacheContext,
+    );
   }
 
   async sendAzW3(
@@ -347,7 +375,7 @@ export class KindleDevice {
     const managedToken = options.managedToken === undefined
       ? undefined
       : normalizeManagedFilenameToken(options.managedToken);
-    const filename = await this.unusedGeneratedFilename(
+    const preflight = await this.unusedGeneratedFilename(
       () => managedToken === undefined
         ? createCollisionResistantFilename(originalFilename, "azw3", {
             now: this.now(),
@@ -360,6 +388,7 @@ export class KindleDevice {
       target,
       options,
     );
+    const { filename } = preflight;
 
     let created: KindleCreatedObject | undefined;
     try {
@@ -378,7 +407,7 @@ export class KindleDevice {
         options,
       );
       this.recordCreated(created);
-      await this.verifyObject(
+      const verifiedInfo = await this.verifyObject(
         {
           handle: created.handle,
           storageId: target.storageId,
@@ -388,6 +417,10 @@ export class KindleDevice {
         },
         options,
       );
+      this.inventoryFolderSeed = {
+        parentHandle: target.documentsHandle,
+        children: Object.freeze([...preflight.children, verifiedInfo]),
+      };
       options.onObjectState?.({
         stage: "verified",
         handle: created.handle,
@@ -485,12 +518,13 @@ export class KindleDevice {
     generate: () => string,
     target: KindleTarget,
     options: KindleOperationOptions,
-  ): Promise<string> {
-    const existingNames = await this.childFilenames(target, options);
+  ): Promise<GeneratedFilenamePreflight> {
+    const children = await this.childObjects(target, options);
+    const existingNames = new Set(children.map(({ filename }) => filename));
     for (let attempt = 0; attempt < 8; attempt += 1) {
       const candidate = generate();
       if (![...existingNames].some((name) => filenamesEqual(name, candidate))) {
-        return candidate;
+        return { filename: candidate, children: Object.freeze(children) };
       }
     }
     throw new KindleDeviceError(
@@ -500,10 +534,10 @@ export class KindleDevice {
     );
   }
 
-  private async childFilenames(
+  private async childObjects(
     target: KindleTarget,
     options: KindleOperationOptions,
-  ): Promise<Set<string>> {
+  ): Promise<KindleStoredObjectInfo[]> {
     const handles = await this.store.listObjectHandles(
       {
         storageId: target.storageId,
@@ -512,11 +546,11 @@ export class KindleDevice {
       },
       options,
     );
-    const names = new Set<string>();
+    const children: KindleStoredObjectInfo[] = [];
     for (const handle of handles) {
-      names.add((await this.store.getObjectInfo(handle, options)).filename);
+      children.push(await this.store.getObjectInfo(handle, options));
     }
-    return names;
+    return children;
   }
 
   private recordCreated(created: KindleCreatedObject): void {
@@ -526,7 +560,7 @@ export class KindleDevice {
   private async verifyObject(
     expected: ObjectExpectation,
     options: KindleOperationOptions,
-  ): Promise<void> {
+  ): Promise<KindleStoredObjectInfo> {
     const actual = await this.store.getObjectInfo(expected.handle, options);
     const mismatches: Record<string, { expected: unknown; actual: unknown }> = {};
     if (actual.storageId !== expected.storageId) {
@@ -560,6 +594,7 @@ export class KindleDevice {
         { handle: expected.handle, mismatches },
       );
     }
+    return actual;
   }
 
   private async deleteCreatedAndVerify(

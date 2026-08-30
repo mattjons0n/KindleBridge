@@ -105,6 +105,53 @@ describe("KindleDevice policy", () => {
     expect(store.objects.has(10)).toBe(true);
   });
 
+  it("reuses the collision scan for unchanged direct Documents children", async () => {
+    const store = new FakeKindleObjectStore();
+    store.objects.set(11, objectInfo(11, {
+      parentHandle: 10,
+      filename: "direct.azw3",
+    }));
+    store.objects.set(20, objectInfo(20, {
+      parentHandle: 10,
+      objectFormat: MTP_OBJECT_FORMAT_ASSOCIATION,
+      associationType: 1,
+      filename: "Nested",
+    }));
+    store.objects.set(21, objectInfo(21, {
+      parentHandle: 20,
+      filename: "nested.azw3",
+    }));
+    const device = kindle(store);
+
+    await device.runSelfTest();
+    const requestCountAfterSelfTest = store.metadataRequests.length;
+    const inventory = await device.inventory({ bookMetadata: false });
+
+    expect(inventory.status).toBe("complete");
+    expect(inventory.objects.map(({ handle }) => handle)).toEqual([11, 20, 21]);
+    expect(store.metadataRequests.slice(requestCountAfterSelfTest)).toEqual([21]);
+  });
+
+  it("discards the collision-scan seed when the live child handle set changed", async () => {
+    const store = new FakeKindleObjectStore();
+    store.objects.set(11, objectInfo(11, {
+      parentHandle: 10,
+      filename: "before.azw3",
+    }));
+    const device = kindle(store);
+
+    await device.runSelfTest();
+    store.objects.set(12, objectInfo(12, {
+      parentHandle: 10,
+      filename: "added-after-test.azw3",
+    }));
+    const requestCountAfterSelfTest = store.metadataRequests.length;
+    const inventory = await device.inventory({ bookMetadata: false });
+
+    expect(inventory.status).toBe("complete");
+    expect(store.metadataRequests.slice(requestCountAfterSelfTest)).toEqual([11, 12]);
+  });
+
   it("cleans up the exact created handle after a readback mismatch", async () => {
     const store = new FakeKindleObjectStore();
     store.corruptReadback = true;
