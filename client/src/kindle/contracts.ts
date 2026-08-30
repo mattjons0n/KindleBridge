@@ -1,4 +1,5 @@
 import type { MtpObjectCreationState } from "../mtp/object-store";
+import type { KindleBridgeDeviceMetadataCache } from "./device-metadata-cache-codec";
 
 export interface KindleOperationOptions {
   signal?: AbortSignal;
@@ -62,6 +63,17 @@ export interface KindleCreatedObject {
 }
 
 /**
+ * Exact, read-before-delete authority for a small application-owned object
+ * discovered in an earlier MTP session. The caller must supply the complete
+ * metadata snapshot and exact bytes it already validated.
+ */
+export interface KindleBridgeMetadataCacheObjectSnapshot {
+  readonly info: KindleStoredObjectInfo;
+  readonly data: Uint8Array;
+  readonly cache: KindleBridgeDeviceMetadataCache;
+}
+
+/**
  * Adapter-friendly subset of MtpObjectStore used by Kindle-specific policy.
  * MtpObjectStore is assignable to this interface without a runtime wrapper.
  */
@@ -95,6 +107,19 @@ export interface KindleObjectStore {
   ): Promise<Uint8Array>;
   /** The concrete store must reject handles it did not create this session. */
   deleteObject(handle: number, options?: KindleOperationOptions): Promise<void>;
+  /** Reads and validates a bounded, root-level Kindle Bridge cache candidate. */
+  inspectKindleBridgeMetadataCacheObject(
+    handle: number,
+    options?: KindleOperationOptions,
+  ): Promise<KindleBridgeMetadataCacheObjectSnapshot>;
+  /**
+   * Consumes a session-bound snapshot and deletes only that still-identical,
+   * strictly validated Kindle Bridge cache object.
+   */
+  deleteKindleBridgeMetadataCacheObject(
+    snapshot: KindleBridgeMetadataCacheObjectSnapshot,
+    options?: KindleOperationOptions,
+  ): Promise<void>;
 }
 
 export interface KindleTarget {

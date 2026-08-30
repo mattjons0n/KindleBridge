@@ -271,6 +271,54 @@ describe("openKindle cross-layer orchestration", () => {
     await connection.disconnect();
   });
 
+  it("refuses a writable Kindle metadata-cache refresh until this connection passes self-test", async () => {
+    const device = new FakeUsbDevice();
+    const session = { isOpen: true, close: vi.fn(async () => undefined) };
+    const transport = { close: vi.fn(async () => undefined) };
+    const lease = { release: vi.fn(async () => undefined) };
+    const inventory = {
+      status: "complete" as const,
+      storageId: STORAGE_ID,
+      documentsHandle: DOCUMENTS_HANDLE,
+      objects: [],
+      issues: [],
+      issueCount: 0,
+      scannedObjectCount: 0,
+    };
+    const kindle = {
+      runSelfTest: vi.fn(async () => ({
+        filename: "kindle-poc-byte-test.txt",
+        handle: 70,
+        bytesVerified: KINDLE_SELF_TEST_PAYLOAD.byteLength,
+        cleanedUp: true as const,
+      })),
+      inventory: vi.fn(async () => inventory),
+    };
+    const connection = new ConnectedKindle(
+      device,
+      { vendorId: device.vendorId, productId: device.productId, documentsHandle: DOCUMENTS_HANDLE },
+      transport as never,
+      session as never,
+      kindle as never,
+      lease as never,
+    );
+
+    await expect(connection.refreshInventory({
+      deviceMetadataCache: "read-write",
+    })).rejects.toMatchObject({ code: "MTP_SELF_TEST_REQUIRED" });
+    expect(kindle.inventory).not.toHaveBeenCalled();
+
+    await expect(connection.refreshInventory({
+      deviceMetadataCache: "read-only",
+    })).resolves.toEqual(inventory);
+    await connection.runSelfTest();
+    await expect(connection.refreshInventory({
+      deviceMetadataCache: "read-write",
+    })).resolves.toEqual(inventory);
+
+    await connection.disconnect();
+  });
+
   it("bounds the complete book transaction before an unbounded collision scan can upload", async () => {
     const device = new FakeUsbDevice();
     const session = { isOpen: true, close: vi.fn(async () => undefined) };
@@ -629,9 +677,12 @@ describe("openKindle cross-layer orchestration", () => {
       data(MtpOperationCode.GetObjectHandles, 13, encodeObjectHandles([])), ok(13),
       // Inventory starts only after byte verification and exact-handle cleanup.
       data(MtpOperationCode.GetStorageInfo, 14, encodeStorageInfo(STORAGE_INFO)), ok(14),
-      data(MtpOperationCode.GetObjectHandles, 15, encodeObjectHandles([bookHandle])), ok(15),
-      data(MtpOperationCode.GetObjectInfo, 16, encodeObjectInfo(bookInfo)), ok(16),
-      ok(17),
+      // Root cache discovery revalidates the inspection seed without rereading
+      // root ObjectInfo when the live handle set is unchanged.
+      data(MtpOperationCode.GetObjectHandles, 15, encodeObjectHandles([DOCUMENTS_HANDLE])), ok(15),
+      data(MtpOperationCode.GetObjectHandles, 16, encodeObjectHandles([bookHandle])), ok(16),
+      data(MtpOperationCode.GetObjectInfo, 17, encodeObjectInfo(bookInfo)), ok(17),
+      ok(18),
     );
 
     const connection = await openKindle(device, {
@@ -708,7 +759,7 @@ describe("openKindle cross-layer orchestration", () => {
       data(MtpOperationCode.GetObject, 11, KINDLE_SELF_TEST_PAYLOAD), ok(11),
       ok(12),
       data(MtpOperationCode.GetObjectHandles, 13, encodeObjectHandles([])), ok(13),
-      // The next inventory command has started, but its response is not a
+      // The next root-cache discovery command has started, but its response is not a
       // decodable MTP container. The session must fault rather than return a
       // misleading partial inventory.
       Uint8Array.of(0),

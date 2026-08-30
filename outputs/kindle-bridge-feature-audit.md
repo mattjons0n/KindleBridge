@@ -9,7 +9,7 @@ container evidence passed. `[ ]` deliberately identifies release-host,
 household-data, browser-memory, secure-origin, or physical-device evidence that
 cannot be inferred from mocks or localhost.
 
-The authoritative root gate passed 50/50 test files and 563/563 tests, followed
+The authoritative root gate passed 53/53 test files and 628/628 tests, followed
 by successful client typechecking, server build, and production Vite build. The
 generic operator template in `deploy/docker/RELEASE_CHECKLIST.md` remains
 unchecked until a concrete release image, host, origin, and Kindle are accepted.
@@ -94,8 +94,10 @@ unchecked until a concrete release image, host, origin, and Kindle are accepted.
 - [x] Complete versus partial inventory state is explicit.
 - [x] Safe-write, Documents reading, and catalog comparison are shown as distinct post-connect phases without relaxing the Send readiness gate.
 - [x] Kindle `.sdr` descendants and redundant managed-derivative byte reads are skipped; KFX/AZW8 whole-book downloads are also skipped because the current parser cannot consume those containers, leaving metadata absence uncertain.
-- [x] Parsed unmanaged metadata has a bounded, expiring, same-origin browser cache keyed by pseudonymous device plus exact live storage/path/size/modification evidence; raw paths/serials are not stored and no cache data reaches the backend.
-- [x] Cache hits require current live enumeration, count against the 2,000-object enrichment ceiling, invalidate on evidence changes, and cannot resurrect a removed Kindle object.
+- [x] Parsed unmanaged metadata has a bounded, checksum-protected, two-slot cache at the selected Kindle storage root plus a bounded, expiring same-origin browser fallback. The portable format excludes serials, handles, browser identity, host paths, credentials, and book bytes; neither cache reaches the backend.
+- [x] Portable hits require current live enumeration plus exact unadjusted relative path, object format, size, and modification time. Browser fallback hits additionally require the pseudonymous device/storage identity. Both count against the 2,000-object enrichment ceiling, invalidate on evidence changes, and cannot resurrect a removed Kindle object.
+- [x] Root-cache writes require a successful current-session exact-byte self-test, complete hierarchy inventory, and durable recovery callback. A/B rotation keeps one verified generation, readback verifies the new bytes, corrupt/ambiguous slots are not deleted, and prior-session deletion requires fresh exact metadata/bytes/checksum/root-membership validation.
+- [x] Cache operations cannot overwrite, rename, or broadly delete Kindle books and never claim Calibre's separate `metadata.calibre` filename.
 - [x] On a clean connection with no pending recovery, the exact-byte self-test runs automatically before inventory. A pending exact cleanup intentionally permits read-only recovery inventory first; after acknowledgement the browser automatically reruns self-test, inventory, and reconciliation before Send can resume.
 - [x] Send remains disabled unless the current connection's self-test and cleanup pass.
 - [x] Failure text states that no book was sent.
@@ -152,7 +154,7 @@ unchecked until a concrete release image, host, origin, and Kindle are accepted.
 
 ## Verification and release evidence
 
-- [x] Root unit, database, filesystem, API, parser-security, browser, MTP-fault, deployment, and integration gate passes: 50/50 files and 563/563 tests, plus client typecheck, server build, and production Vite build.
+- [x] Root unit, database, filesystem, API, parser-security, browser, MTP-fault, deployment, and integration gate passes: 53/53 files and 628/628 tests, plus client typecheck, server build, and production Vite build.
 - [x] A directly generated 10,000-row database corpus covers FTS, filtering, pagination, and complete match-index query budgets; no full filesystem scan is inferred from it.
 - [x] Current schema-v13 native `linux/arm64` hardened-container smoke covers health/readiness, API catalog/search/facets/source/cover/delivery, restart persistence, read-only root/source, Host/Origin rejection, and security headers.
 - [x] Current-image restore and catalog/cache rebuild smoke preserves profile/root/stable-book/delivery evidence, recreates derived data, and returns the exact original 459,174-byte source with its indexed SHA-256.
@@ -164,6 +166,6 @@ unchecked until a concrete release image, host, origin, and Kindle are accepted.
 
 - [x] Current schema-v13 rebuilt-image restore/catalog-rebuild and dual-architecture OCI build/execution completed successfully on the local acceptance runtime.
 - [ ] Peak browser-process memory is measured with the maximum accepted household EPUB on the intended client; the 1.5 GiB planning allowance and enforced allocation limits are not substituted for measurement.
-- [ ] The complete integrated flow is freshly retested on the physical Kindle: chooser, automatic self-test, inventory, matching, Send, open/navigation/cover, reconnect, and durable recovery.
+- [ ] The complete integrated flow is freshly retested on the physical Kindle: chooser, automatic self-test, inventory, matching, Send, open/navigation/cover, reconnect, and durable recovery. This run must also confirm root-cache creation/readback, reuse from another browser installation, A/B rotation, Kindle-UI invisibility, and coexistence with `metadata.calibre`.
 - [ ] The real husband and wife read-only mounts, multiple-root/profile scope, incremental ingestion, mount loss/restoration, backup/restore, rebuild, and byte-identical originals are accepted on the household Docker host.
 - [ ] The actual no-login service is proven private on the intended LAN/VPN, its HTTPS certificate/origin is trusted by the client, and WebUSB succeeds from that exact origin.

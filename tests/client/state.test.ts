@@ -116,6 +116,26 @@ describe("pending object cleanup journal", () => {
     expect(clearPendingObjectCleanup()).toBe(true);
   });
 
+  it("round-trips a root-level metadata-cache recovery intent", () => {
+    const entry: PendingObjectCleanup = {
+      version: 1,
+      purpose: "metadata-cache",
+      stage: "handle-assigned",
+      filename: ".kindle-bridge-device-metadata-cache-v1-a.json",
+      vendorId: 0x1949,
+      productId: 0x9981,
+      storageId: 0x10001,
+      parentHandle: 0xffff_ffff,
+      size: 1_024,
+      handle: 0x505,
+      operationId: "mtp-device-cache-a",
+      recordedAt: 1_000,
+    };
+
+    expect(persistPendingObjectCleanup(entry)).toBe(true);
+    expect(readPendingObjectCleanup()).toEqual(entry);
+  });
+
   it("rejects unsafe filenames", () => {
     expect(persistPendingObjectCleanup({
       version: 1,

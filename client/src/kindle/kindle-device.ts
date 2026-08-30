@@ -20,6 +20,17 @@ import {
   type KindleInventoryOptions,
   type KindleInventorySnapshot,
 } from "./inventory";
+import {
+  isKindleDeviceMetadataCacheTransportFailure,
+  kindleInventoryToDeviceMetadataCacheEntries,
+  loadKindleBridgeDeviceMetadataCache,
+  makeKindleBridgeDeviceMetadataCache,
+  planKindleBridgeDeviceMetadataCacheWrite,
+  type LoadedKindleBridgeDeviceMetadataCache,
+} from "./device-metadata-cache";
+import {
+  encodeKindleBridgeDeviceMetadataCache,
+} from "./device-metadata-cache-codec";
 import { KINDLE_SELF_TEST_PAYLOAD } from "./self-test-payload";
 import {
   describeStructuredFailure,
@@ -78,6 +89,11 @@ interface ObjectExpectation {
 interface GeneratedFilenamePreflight {
   readonly filename: string;
   readonly children: readonly KindleStoredObjectInfo[];
+}
+
+interface RootInspection {
+  readonly documents?: KindleStoredObjectInfo;
+  readonly objects: readonly KindleStoredObjectInfo[];
 }
 
 function bigintSize(value: number): bigint {
@@ -149,6 +165,13 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function isAbort(error: unknown, signal: AbortSignal | undefined): boolean {
+  if (signal?.aborted === true) return true;
+  if (error instanceof DOMException && error.name === "AbortError") return true;
+  if (!error || typeof error !== "object") return false;
+  return Reflect.get(error, "code") === "MTP_OPERATION_ABORTED";
+}
+
 export class KindleDevice {
   readonly store: KindleObjectStore;
   private target?: KindleTarget;
@@ -156,7 +179,12 @@ export class KindleDevice {
   private readonly random: () => number;
   private readonly createdHandles = new Map<number, string>();
   private inventoryFolderSeed?: KindleInventoryFolderSeed;
+  private rootObjectSeed?: {
+    readonly storageId: number;
+    readonly objects: readonly KindleStoredObjectInfo[];
+  };
   private readonly inventoryMetadataCacheContext?: KindleInventoryMetadataCacheContext;
+  private selfTestPassed = false;
 
   constructor(
     store: KindleObjectStore,
@@ -182,18 +210,22 @@ export class KindleDevice {
     requiredBytes = 0,
     options: KindleOperationOptions = {},
   ): Promise<KindleTarget> {
+    this.selfTestPassed = false;
     const required = bigintSize(requiredBytes);
     const storageIds = await this.store.listStorageIds(options);
     let writableCount = 0;
     let documentsCount = 0;
-    const candidates: KindleTarget[] = [];
+    const candidates: Array<KindleTarget & {
+      readonly rootObjects: readonly KindleStoredObjectInfo[];
+    }> = [];
 
     for (const storageId of storageIds) {
       const storage = await this.store.getStorageInfo(storageId, options);
       if (storage.accessCapability !== MTP_ACCESS_READ_WRITE) continue;
       writableCount += 1;
 
-      const documents = await this.findDocuments(storageId, options);
+      const root = await this.inspectRoot(storageId, options);
+      const documents = root.documents;
       if (!documents) continue;
       documentsCount += 1;
       if (storage.freeSpaceInBytes < required) continue;
@@ -203,6 +235,7 @@ export class KindleDevice {
         storage,
         documentsHandle: documents.handle,
         documents,
+        rootObjects: root.objects,
       });
     }
 
@@ -236,13 +269,24 @@ export class KindleDevice {
         ? -1
         : 1;
     });
-    this.target = candidates[0];
+    const selected = candidates[0]!;
+    this.target = {
+      storageId: selected.storageId,
+      storage: selected.storage,
+      documentsHandle: selected.documentsHandle,
+      documents: selected.documents,
+    };
+    this.rootObjectSeed = {
+      storageId: selected.storageId,
+      objects: selected.rootObjects,
+    };
     return this.target;
   }
 
   async runSelfTest(
     options: KindleOperationOptions = {},
   ): Promise<KindleSelfTestResult> {
+    this.selfTestPassed = false;
     const payload = KINDLE_SELF_TEST_PAYLOAD.slice();
     const target = await this.ensureTarget(payload.byteLength, options);
     const preflight = await this.unusedGeneratedFilename(
@@ -336,6 +380,7 @@ export class KindleDevice {
       children: preflight.children,
     };
 
+    this.selfTestPassed = true;
     return {
       filename,
       handle,
@@ -350,13 +395,37 @@ export class KindleDevice {
     const target = await this.ensureTarget(0, options);
     const folderSeed = this.inventoryFolderSeed;
     this.inventoryFolderSeed = undefined;
-    return buildKindleInventory(
+    const rootSeed = this.rootObjectSeed?.storageId === target.storageId
+      ? this.rootObjectSeed.objects
+      : undefined;
+    this.rootObjectSeed = undefined;
+    const loadedDeviceCache = options.deviceMetadataCache === false
+      ? undefined
+      : await loadKindleBridgeDeviceMetadataCache(this.store, target, options, rootSeed);
+    const inventory = await buildKindleInventory(
       this.store,
       target,
       options,
       folderSeed,
       this.inventoryMetadataCacheContext,
+      loadedDeviceCache?.context,
     );
+    if (
+      options.deviceMetadataCache === "read-write"
+      && this.selfTestPassed
+      && options.onObjectState !== undefined
+      && inventory.status === "complete"
+      && inventory.bookMetadata?.status !== "disabled"
+      && loadedDeviceCache !== undefined
+    ) {
+      await this.updateDeviceMetadataCache(
+        target,
+        inventory,
+        loadedDeviceCache,
+        options,
+      );
+    }
+    return inventory;
   }
 
   async sendAzW3(
@@ -462,6 +531,194 @@ export class KindleDevice {
     };
   }
 
+  private async updateDeviceMetadataCache(
+    target: KindleTarget,
+    inventory: KindleInventorySnapshot,
+    loaded: LoadedKindleBridgeDeviceMetadataCache,
+    options: KindleInventoryOptions,
+  ): Promise<void> {
+    const entries = kindleInventoryToDeviceMetadataCacheEntries(inventory);
+    if (loaded.active) {
+      try {
+        const unchanged = await encodeKindleBridgeDeviceMetadataCache(
+          makeKindleBridgeDeviceMetadataCache(
+            loaded.active.snapshot.cache.generation,
+            entries,
+          ),
+        );
+        options.signal?.throwIfAborted();
+        if (equalBytes(unchanged, loaded.active.snapshot.data)) return;
+      } catch (error) {
+        if (isAbort(error, options.signal)) throw error;
+        // Encoding is optional acceleration. Live inventory remains valid and
+        // no device mutation has begun.
+        return;
+      }
+    }
+
+    const plan = planKindleBridgeDeviceMetadataCacheWrite(loaded);
+    if (!plan) return;
+    let bytes: Uint8Array;
+    try {
+      bytes = await encodeKindleBridgeDeviceMetadataCache(
+        makeKindleBridgeDeviceMetadataCache(plan.generation, entries),
+      );
+      options.signal?.throwIfAborted();
+    } catch (error) {
+      if (isAbort(error, options.signal)) throw error;
+      return;
+    }
+
+    let refreshedStorage: KindleTarget["storage"];
+    try {
+      refreshedStorage = await this.store.getStorageInfo(target.storageId, options);
+    } catch (error) {
+      if (isAbort(error, options.signal)) throw error;
+      if (isKindleDeviceMetadataCacheTransportFailure(error)) throw error;
+      // The live inventory remains valid when the selected storage cannot be
+      // refreshed for this optional auxiliary write.
+      return;
+    }
+    if (
+      !this.selfTestPassed
+      || refreshedStorage.accessCapability !== MTP_ACCESS_READ_WRITE
+      || refreshedStorage.freeSpaceInBytes < bigintSize(bytes.byteLength)
+    ) {
+      return;
+    }
+
+    // Rotate A/B slots. If the inactive slot still contains a fully validated
+    // older generation, remove only that exact cache while the active verified
+    // generation remains available.
+    if (plan.replace) {
+      options.signal?.throwIfAborted();
+      try {
+        await this.store.deleteKindleBridgeMetadataCacheObject(plan.replace, options);
+      } catch (error) {
+        if (isAbort(error, options.signal)) throw error;
+        if (isKindleDeviceMetadataCacheTransportFailure(error)) throw error;
+        return;
+      }
+    }
+
+    const rootPreflight = await this.rootFilenamePreflight(
+      target.storageId,
+      plan.filename,
+      options,
+    );
+    if (rootPreflight.filenameExists || rootPreflight.atCapacity) return;
+
+    let created: KindleCreatedObject | undefined;
+    try {
+      created = await this.store.createObject(
+        {
+          storageId: target.storageId,
+          parentHandle: MTP_ROOT_ASSOCIATION_HANDLE,
+          filename: plan.filename,
+          objectFormat: MTP_OBJECT_FORMAT_UNDEFINED,
+          size: bytes.byteLength,
+          data: bytes,
+          modificationDate: this.now(),
+          onObjectState: options.onObjectState,
+        },
+        options,
+      );
+      this.recordCreated(created);
+      await this.verifyObject(
+        {
+          handle: created.handle,
+          storageId: target.storageId,
+          parentHandle: MTP_ROOT_ASSOCIATION_HANDLE,
+          filename: plan.filename,
+          size: bytes.byteLength,
+        },
+        options,
+      );
+      // Use the same strict root/format/protection/schema validation required
+      // on reconnect before clearing the durable creation journal.
+      const strictReadback = await this.store.inspectKindleBridgeMetadataCacheObject(
+        created.handle,
+        options,
+      );
+      if (!equalBytes(bytes, strictReadback.data)) {
+        throw new KindleDeviceError(
+          "MTP_READBACK_MISMATCH",
+          "The Kindle metadata cache did not round-trip byte-for-byte.",
+          {
+            handle: created.handle,
+            filename: plan.filename,
+            expectedBytes: bytes.byteLength,
+            actualBytes: strictReadback.data.byteLength,
+          },
+        );
+      }
+      options.signal?.throwIfAborted();
+      options.onObjectState?.({
+        stage: "verified",
+        handle: created.handle,
+        storageId: target.storageId,
+        parentHandle: MTP_ROOT_ASSOCIATION_HANDLE,
+        filename: plan.filename,
+        size: bytes.byteLength,
+      });
+    } catch (error) {
+      const partial = partialUploadOutcome(error);
+      if (partial?.cleanupSucceeded) {
+        if (isAbort(error, options.signal)) throw error;
+        if (isKindleDeviceMetadataCacheTransportFailure(error)) throw error;
+        return;
+      }
+      if (partial?.cleanupAttempted) {
+        throw this.cleanupFailure(
+          partial.handle,
+          partial.filename ?? plan.filename,
+          partial.cleanupError ?? error,
+          error,
+        );
+      }
+      const handle = created?.handle ?? createdHandleFromError(error);
+      if (handle === undefined) throw error;
+      try {
+        await this.deleteCreatedAndVerify(handle, options);
+      } catch (cleanupError) {
+        throw this.cleanupFailure(handle, plan.filename, cleanupError, error);
+      }
+      if (isAbort(error, options.signal)) throw error;
+      if (isKindleDeviceMetadataCacheTransportFailure(error)) throw error;
+      // The new cache was removed exactly. Keep the live inventory and the
+      // still-valid prior slot rather than failing the connection.
+    }
+  }
+
+  private async rootFilenamePreflight(
+    storageId: number,
+    filename: string,
+    options: KindleOperationOptions,
+  ): Promise<{ readonly filenameExists: boolean; readonly atCapacity: boolean }> {
+    let handles: readonly number[];
+    try {
+      handles = await this.store.listObjectHandles({
+        storageId,
+        associationHandle: MTP_ROOT_ASSOCIATION_HANDLE,
+        maxHandles: MAX_ROOT_OBJECT_HANDLES,
+      }, options);
+      for (const handle of handles) {
+        const info = await this.store.getObjectInfo(handle, options);
+        if (filenamesEqual(info.filename, filename)) {
+          return { filenameExists: true, atCapacity: handles.length >= MAX_ROOT_OBJECT_HANDLES };
+        }
+      }
+      return {
+        filenameExists: false,
+        atCapacity: handles.length >= MAX_ROOT_OBJECT_HANDLES,
+      };
+    } catch (error) {
+      if (isAbort(error, options.signal)) throw error;
+      if (isKindleDeviceMetadataCacheTransportFailure(error)) throw error;
+      return { filenameExists: true, atCapacity: true };
+    }
+  }
+
   private async ensureTarget(
     requiredBytes: number,
     options: KindleOperationOptions,
@@ -490,10 +747,10 @@ export class KindleDevice {
     return this.target;
   }
 
-  private async findDocuments(
+  private async inspectRoot(
     storageId: number,
     options: KindleOperationOptions,
-  ): Promise<KindleStoredObjectInfo | undefined> {
+  ): Promise<RootInspection> {
     const rootHandles = await this.store.listObjectHandles(
       {
         storageId,
@@ -502,16 +759,32 @@ export class KindleDevice {
       },
       options,
     );
+    const objects: KindleStoredObjectInfo[] = [];
+    let documents: KindleStoredObjectInfo | undefined;
     for (const handle of rootHandles) {
-      const info = await this.store.getObjectInfo(handle, options);
+      let info: KindleStoredObjectInfo;
+      try {
+        info = await this.store.getObjectInfo(handle, options);
+      } catch (error) {
+        if (isAbort(error, options.signal)) throw error;
+        if (isKindleDeviceMetadataCacheTransportFailure(error)) throw error;
+        // Cache seeding is optional. One unreadable unrelated root object must
+        // not hide an otherwise verified Documents association.
+        continue;
+      }
+      objects.push(info);
       if (
-        info.objectFormat === MTP_OBJECT_FORMAT_ASSOCIATION &&
-        filenamesEqual(info.filename, "Documents")
+        documents === undefined
+        && info.objectFormat === MTP_OBJECT_FORMAT_ASSOCIATION
+        && filenamesEqual(info.filename, "Documents")
       ) {
-        return info;
+        documents = info;
       }
     }
-    return undefined;
+    return Object.freeze({
+      ...(documents === undefined ? {} : { documents }),
+      objects: Object.freeze(objects),
+    });
   }
 
   private async unusedGeneratedFilename(
@@ -569,7 +842,9 @@ export class KindleDevice {
         actual: actual.storageId,
       };
     }
-    if (actual.parentHandle !== expected.parentHandle) {
+    const parentMatches = actual.parentHandle === expected.parentHandle
+      || (expected.parentHandle === MTP_ROOT_ASSOCIATION_HANDLE && actual.parentHandle === 0);
+    if (!parentMatches) {
       mismatches.parentHandle = {
         expected: expected.parentHandle,
         actual: actual.parentHandle,

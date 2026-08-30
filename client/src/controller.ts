@@ -35,6 +35,7 @@ import {
   type KindleSelfTestResult,
 } from "./kindle";
 import { DebugLog } from "./log";
+import { isFatalTransportFailure } from "./error-diagnostics";
 import type { MtpObjectCreationState } from "./mtp";
 import {
   clearPendingObjectCleanup,
@@ -337,13 +338,7 @@ function errorContext(error: AppError): Readonly<Record<string, unknown>> {
 }
 
 function isFatalInventoryError(error: unknown): boolean {
-  if (error && typeof error === "object" && Reflect.get(error, "fatal") === true) return true;
-  const code = error && typeof error === "object" ? Reflect.get(error, "code") : undefined;
-  return code === "MTP_INVALID_STATE"
-    || code === "MTP_TRANSPORT_ERROR"
-    || code === "MTP_COMMAND_TIMEOUT"
-    || code === "MTP_INACTIVITY_TIMEOUT"
-    || (typeof code === "string" && code.startsWith("USB_"));
+  return isFatalTransportFailure(error);
 }
 
 function bookTransferCommandTimeoutMs(bytes: number): number {
@@ -365,7 +360,8 @@ function pendingCleanupInstruction(entry: PendingObjectCleanup | undefined): str
   const target = entry.deviceLabel
     ? `${entry.deviceLabel} (VID 0x${entry.vendorId.toString(16).padStart(4, "0")}, PID 0x${entry.productId.toString(16).padStart(4, "0")})`
     : `the device with VID 0x${entry.vendorId.toString(16).padStart(4, "0")} and PID 0x${entry.productId.toString(16).padStart(4, "0")}`;
-  return `Inspect Kindle Documents on ${target} for exactly ${entry.filename} (${handle}). Remove only that exact managed filename if it is partial or unwanted; never delete a similarly named book.`;
+  const location = entry.purpose === "metadata-cache" ? "the Kindle storage root" : "Kindle Documents";
+  return `Inspect ${location} on ${target} for exactly ${entry.filename} (${handle}). Remove only that exact managed filename if it is partial or unwanted; never delete a similarly named object.`;
 }
 
 function failInterruptedTransfer(
@@ -1265,6 +1261,8 @@ export class AppController {
           signal,
           aggregateTimeoutMs:
             this.#dependencies.postUploadInventoryTimeoutMs ?? DEFAULT_POST_UPLOAD_INVENTORY_TIMEOUT_MS,
+          deviceMetadataCache: "read-write",
+          onObjectState: this.#objectStateHandler("metadata-cache", undefined, connection.details),
         },
       );
       const inventory = sent.inventory?.objects.some((object) => object.handle === sent.transfer.handle)
@@ -1730,6 +1728,8 @@ export class AppController {
           signal,
           aggregateTimeoutMs:
             this.#dependencies.connectInventoryTimeoutMs ?? DEFAULT_CONNECT_INVENTORY_TIMEOUT_MS,
+          deviceMetadataCache: "read-write",
+          onObjectState: this.#objectStateHandler("metadata-cache", undefined, connection.details),
         });
       } catch (inventoryError) {
         if (isFatalInventoryError(inventoryError)) throw inventoryError;

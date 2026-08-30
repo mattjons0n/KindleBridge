@@ -239,7 +239,8 @@ function renderError(state: AppState): string {
 function renderRecovery(state: AppState): string {
   const pending = state.pendingObjectCleanup;
   if (!pending || state.device.kind === "transferring" || state.selfTest.kind === "running") return "";
-  return `<section class="notice error recovery-notice" role="alert"><div class="grow"><strong>Interrupted Kindle write</strong>Inspect Documents for exactly <code>${escapeHtml(pending.filename)}</code>. Remove only that exact managed filename if it is partial, then acknowledge the inspection.<div class="actions"><button type="button" data-action="confirm-cleanup-inspection">I inspected this filename</button></div></div></section>`;
+  const location = pending.purpose === "metadata-cache" ? "the Kindle storage root" : "Documents";
+  return `<section class="notice error recovery-notice" role="alert"><div class="grow"><strong>Interrupted Kindle write</strong>Inspect ${location} for exactly <code>${escapeHtml(pending.filename)}</code>. Remove only that exact managed filename if it is partial, then acknowledge the inspection.<div class="actions"><button type="button" data-action="confirm-cleanup-inspection">I inspected this filename</button></div></div></section>`;
 }
 
 function renderProfile(state: AppState, draft: TargetProfile): string {

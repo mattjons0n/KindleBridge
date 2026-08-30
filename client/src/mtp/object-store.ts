@@ -1,6 +1,7 @@
 import {
   MTP_ALL_ASSOCIATIONS,
   MTP_ALL_OBJECT_FORMATS,
+  MTP_ROOT_PARENT,
   MtpObjectFormat,
   MtpOperationCode,
 } from "./constants";
@@ -24,6 +25,13 @@ import {
   type MtpTransactionResult,
   outgoingDataFromBytes,
 } from "./session";
+import {
+  KINDLE_BRIDGE_DEVICE_METADATA_CACHE_HARD_MAX_BYTES,
+  decodeKindleBridgeDeviceMetadataCache,
+  isKindleBridgeDeviceMetadataCacheFilename,
+  type KindleBridgeDeviceMetadataCache,
+} from "../kindle/device-metadata-cache-codec";
+import type { KindleBridgeMetadataCacheObjectSnapshot } from "../kindle/contracts";
 
 const UINT32_MAX = 0xffff_ffff;
 const MTP_MAX_DATA_PAYLOAD_LENGTH = UINT32_MAX - 12;
@@ -34,6 +42,7 @@ const MAX_STORAGE_INFO_DATA_BYTES = 2_048;
 const MAX_OBJECT_INFO_DATA_BYTES = 2_048;
 const MAX_CLEANUP_VERIFICATION_HANDLES = 10_000;
 const MAX_CREATE_PARENT_HANDLES = 10_000;
+const MAX_CACHE_ROOT_HANDLES = 256;
 
 export interface MtpListObjectHandlesRequest {
   readonly storageId: number;
@@ -104,11 +113,13 @@ export type MtpObjectStoreErrorCode =
   | "MTP_OBJECT_TOO_LARGE"
   | "MTP_OBJECT_DATA_SIZE_MISMATCH"
   | "MTP_OBJECT_DELETE_UNVERIFIED"
+  | "MTP_OBJECT_DELETE_MISMATCH"
   | "MTP_READ_LIMIT_EXCEEDED"
   | "MTP_HANDLE_LIMIT_EXCEEDED";
 
 export class MtpObjectStoreError extends Error {
   readonly code: MtpObjectStoreErrorCode;
+  readonly fatal?: true;
   override readonly cause?: unknown;
 
   constructor(code: MtpObjectStoreErrorCode, message: string, cause?: unknown) {
@@ -116,6 +127,9 @@ export class MtpObjectStoreError extends Error {
     this.name = "MtpObjectStoreError";
     this.code = code;
     this.cause = cause;
+    if (cause && typeof cause === "object" && Reflect.get(cause, "fatal") === true) {
+      this.fatal = true;
+    }
   }
 }
 
@@ -184,6 +198,14 @@ function isBlob(value: MtpObjectData): value is Blob {
   return typeof Blob !== "undefined" && value instanceof Blob;
 }
 
+function equalBytes(left: Uint8Array, right: Uint8Array): boolean {
+  if (left.byteLength !== right.byteLength) return false;
+  for (let index = 0; index < left.byteLength; index += 1) {
+    if (left[index] !== right[index]) return false;
+  }
+  return true;
+}
+
 function assertSafeFilename(filename: string): void {
   if (
     filename.length === 0
@@ -212,6 +234,7 @@ export class MtpObjectStore {
     readonly metadata: MtpObjectCreationMetadata;
     readonly callback?: (state: MtpObjectCreationState) => void;
   }>();
+  private readonly validatedCacheSnapshots = new WeakMap<object, { readonly sessionOwned: boolean }>();
 
   constructor(session: MtpSession) {
     this.session = session;
@@ -458,7 +481,9 @@ export class MtpObjectStore {
       throw await this.cleanupAfterCreateFailure(handle, request.filename, error, options);
     }
 
-    if (returnedStorageId !== request.storageId || returnedParentHandle !== request.parentHandle) {
+    const returnedParentMatches = returnedParentHandle === request.parentHandle
+      || (request.parentHandle === MTP_ROOT_PARENT && returnedParentHandle === 0);
+    if (returnedStorageId !== request.storageId || !returnedParentMatches) {
       const mismatch = new MtpObjectStoreError(
         "MTP_SEND_OBJECT_INFO_MISMATCH",
         `SendObjectInfo returned storage 0x${returnedStorageId.toString(16)}, parent 0x${returnedParentHandle.toString(16)}, handle 0x${handle.toString(16)}`,
@@ -482,7 +507,7 @@ export class MtpObjectStore {
     return {
       handle,
       storageId: returnedStorageId,
-      parentHandle: returnedParentHandle,
+      parentHandle: request.parentHandle,
       filename: request.filename,
       size: request.size,
     };
@@ -498,6 +523,137 @@ export class MtpObjectStore {
       );
     }
     await this.deleteOwnedObject(handle, options);
+  }
+
+  async inspectKindleBridgeMetadataCacheObject(
+    handle: number,
+    options: MtpOperationOptions = {},
+  ): Promise<KindleBridgeMetadataCacheObjectSnapshot> {
+    const snapshot = await this.readValidatedCacheObject(handle, options);
+    this.validatedCacheSnapshots.set(snapshot, { sessionOwned: this.ownedHandles.has(handle) });
+    return snapshot;
+  }
+
+  async deleteKindleBridgeMetadataCacheObject(
+    snapshot: KindleBridgeMetadataCacheObjectSnapshot,
+    options: MtpOperationOptions = {},
+  ): Promise<void> {
+    const capability = this.validatedCacheSnapshots.get(snapshot);
+    if (!capability) {
+      throw new MtpObjectStoreError(
+        "MTP_OBJECT_DELETE_MISMATCH",
+        "refusing a forged, foreign-session, or already-consumed cache deletion snapshot",
+      );
+    }
+    this.validatedCacheSnapshots.delete(snapshot);
+    const current = await this.readValidatedCacheObject(snapshot.info.handle, options);
+    if (!this.sameStoredObjectInfo(current.info, snapshot.info)
+      || !equalBytes(current.data, snapshot.data)) {
+      throw new MtpObjectStoreError(
+        "MTP_OBJECT_DELETE_MISMATCH",
+        `cache object 0x${snapshot.info.handle.toString(16).padStart(8, "0")} changed before conditional deletion`,
+      );
+    }
+    if (capability.sessionOwned) {
+      if (!this.ownedHandles.has(snapshot.info.handle)) {
+        throw new MtpObjectStoreError(
+          "MTP_OBJECT_DELETE_MISMATCH",
+          "the session-owned cache deletion capability is no longer current",
+        );
+      }
+      await this.deleteOwnedObject(snapshot.info.handle, options);
+      return;
+    }
+    await this.session.execute(
+      {
+        operationCode: MtpOperationCode.DeleteObject,
+        parameters: [snapshot.info.handle, MTP_ALL_OBJECT_FORMATS],
+        expectedResponseParameterCount: 0,
+      },
+      options,
+    );
+    const remainingHandles = await this.listObjectHandles({
+      storageId: snapshot.info.storageId,
+      associationHandle: MTP_ROOT_PARENT,
+      maxHandles: MAX_CACHE_ROOT_HANDLES,
+    }, options);
+    if (remainingHandles.includes(snapshot.info.handle)) {
+      throw new MtpObjectStoreError(
+        "MTP_OBJECT_DELETE_UNVERIFIED",
+        `cache object 0x${snapshot.info.handle.toString(16).padStart(8, "0")} still exists after conditional DeleteObject`,
+      );
+    }
+  }
+
+  private async readValidatedCacheObject(
+    handle: number,
+    options: MtpOperationOptions,
+  ): Promise<KindleBridgeMetadataCacheObjectSnapshot> {
+    assertSpecificObjectHandle(handle, "object handle");
+    const info = await this.getObjectInfo(handle, options);
+    const rootHandles = await this.listObjectHandles({
+      storageId: info.storageId,
+      associationHandle: MTP_ROOT_PARENT,
+      maxHandles: MAX_CACHE_ROOT_HANDLES,
+    }, options);
+    if (
+      !rootHandles.includes(handle)
+      || (info.parentHandle !== 0 && info.parentHandle !== MTP_ROOT_PARENT)
+      || info.objectFormat !== MtpObjectFormat.Undefined
+      || info.protectionStatus !== 0
+      || info.associationType !== 0
+      || !isKindleBridgeDeviceMetadataCacheFilename(info.filename)
+      || !Number.isSafeInteger(info.compressedSize)
+      || info.compressedSize < 1
+      || info.compressedSize > KINDLE_BRIDGE_DEVICE_METADATA_CACHE_HARD_MAX_BYTES
+    ) {
+      throw new MtpObjectStoreError(
+        "MTP_OBJECT_DELETE_MISMATCH",
+        `object 0x${handle.toString(16).padStart(8, "0")} is not a bounded root-level Kindle Bridge metadata cache`,
+      );
+    }
+    const data = await this.readObject(handle, {
+      ...options,
+      maxBytes: info.compressedSize,
+    });
+    if (data.byteLength !== info.compressedSize) {
+      throw new MtpObjectStoreError(
+        "MTP_OBJECT_DELETE_MISMATCH",
+        `cache object 0x${handle.toString(16).padStart(8, "0")} size changed while it was inspected`,
+      );
+    }
+    let cache: KindleBridgeDeviceMetadataCache;
+    try {
+      cache = await decodeKindleBridgeDeviceMetadataCache(data, {
+        maxBytes: KINDLE_BRIDGE_DEVICE_METADATA_CACHE_HARD_MAX_BYTES,
+      });
+    } catch (error) {
+      throw new MtpObjectStoreError(
+        "MTP_OBJECT_DELETE_MISMATCH",
+        `object 0x${handle.toString(16).padStart(8, "0")} is not a valid Kindle Bridge metadata cache`,
+        error,
+      );
+    }
+    return Object.freeze({
+      info: Object.freeze({ ...info }),
+      data: data.slice(),
+      cache,
+    });
+  }
+
+  private sameStoredObjectInfo(
+    left: KindleBridgeMetadataCacheObjectSnapshot["info"],
+    right: KindleBridgeMetadataCacheObjectSnapshot["info"],
+  ): boolean {
+    return left.handle === right.handle
+      && left.storageId === right.storageId
+      && left.objectFormat === right.objectFormat
+      && left.protectionStatus === right.protectionStatus
+      && left.compressedSize === right.compressedSize
+      && left.parentHandle === right.parentHandle
+      && left.associationType === right.associationType
+      && left.filename === right.filename
+      && left.modificationDate === right.modificationDate;
   }
 
   private async deleteOwnedObject(handle: number, options: MtpOperationOptions): Promise<void> {

@@ -297,9 +297,54 @@ describe("AppController local conversion flow", () => {
     expect(app.requestDevice).toHaveBeenCalledOnce();
     expect(app.connection.runSelfTest).toHaveBeenCalledOnce();
     expect(app.connection.refreshInventory).toHaveBeenCalledOnce();
+    expect(app.connection.refreshInventory).toHaveBeenCalledWith(expect.objectContaining({
+      deviceMetadataCache: "read-write",
+      onObjectState: expect.any(Function),
+    }));
     expect(app.controller.state).toMatchObject({
       device: { kind: "ready" },
       selfTest: { kind: "passed", byteLength: 1037 },
+    });
+  });
+
+  it("journals an interrupted root-cache write and reruns the safe sequence after acknowledgement", async () => {
+    const app = harness();
+    vi.mocked(app.connection.refreshInventory).mockImplementationOnce(async (options) => {
+      const metadata = {
+        storageId: 0x10001,
+        parentHandle: 0xffff_ffff,
+        filename: ".kindle-bridge-device-metadata-cache-v1-a.json",
+        size: 1_024,
+      };
+      options?.onObjectState?.({ stage: "send-object-info-intent", ...metadata });
+      options?.onObjectState?.({ stage: "handle-assigned", handle: 0x606, ...metadata });
+      throw Object.assign(new Error("cache readback could not be verified"), {
+        code: "MTP_OBJECT_VERIFICATION_FAILED",
+      });
+    });
+
+    await app.controller.connect();
+
+    expect(app.controller.state.pendingObjectCleanup).toMatchObject({
+      purpose: "metadata-cache",
+      stage: "handle-assigned",
+      parentHandle: 0xffff_ffff,
+      handle: 0x606,
+    });
+    expect(readPendingObjectCleanup()).toEqual(app.controller.state.pendingObjectCleanup);
+    expect(app.root.querySelector(".recovery-notice")?.textContent).toContain(
+      "Inspect the Kindle storage root",
+    );
+
+    await app.controller.confirmCleanupInspection();
+
+    expect(app.connection.runSelfTest).toHaveBeenCalledTimes(2);
+    expect(app.connection.refreshInventory).toHaveBeenCalledTimes(2);
+    expect(readPendingObjectCleanup()).toBeUndefined();
+    expect(app.controller.state).toMatchObject({
+      selfTest: { kind: "passed", byteLength: 1037 },
+      catalogInventoryState: "ready",
+      pendingObjectCleanup: undefined,
     });
   });
 
@@ -478,6 +523,12 @@ describe("AppController local conversion flow", () => {
     expect(waitingTab.connection.prepareAfterConnect).not.toHaveBeenCalled();
     expect(waitingTab.connection.runSelfTest).not.toHaveBeenCalled();
     expect(waitingTab.connection.refreshInventory).toHaveBeenCalledOnce();
+    expect(vi.mocked(waitingTab.connection.refreshInventory).mock.calls[0]?.[0]).not.toHaveProperty(
+      "deviceMetadataCache",
+    );
+    expect(vi.mocked(waitingTab.connection.refreshInventory).mock.calls[0]?.[0]).not.toHaveProperty(
+      "onObjectState",
+    );
     await expect(
       waitingTab.controller.sendCatalogBook({ profileId: "profile-1", book: waitingTab.book }),
     ).rejects.toMatchObject({ code: "INVALID_STATE" });
@@ -1290,6 +1341,8 @@ describe("AppController local conversion flow", () => {
       expect.objectContaining({
         signal: expect.any(AbortSignal),
         aggregateTimeoutMs: expect.any(Number),
+        deviceMetadataCache: "read-write",
+        onObjectState: expect.any(Function),
       }),
     );
     expect(app.catalogApi.createDelivery).toHaveBeenCalledWith(

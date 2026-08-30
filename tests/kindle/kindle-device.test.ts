@@ -63,6 +63,20 @@ describe("KindleDevice policy", () => {
     });
   });
 
+  it("does not fail Documents discovery for an unreadable unrelated root object", async () => {
+    const store = new FakeKindleObjectStore();
+    store.objects.set(20, objectInfo(20, {
+      parentHandle: 0,
+      filename: "metadata.calibre",
+    }));
+    store.metadataFailures.set(20, new Error("unrelated root metadata unavailable"));
+
+    await expect(kindle(store).inspect()).resolves.toMatchObject({
+      storageId: 1,
+      documentsHandle: 10,
+    });
+  });
+
   it("rejects read-only storage", async () => {
     const store = new FakeKindleObjectStore();
     store.storages.set(1, storageInfo({ accessCapability: 1 }));

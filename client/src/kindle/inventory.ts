@@ -9,14 +9,18 @@ import {
   type KindleBookMetadata,
 } from "./book-metadata";
 import type { PseudonymousKindleIdentity } from "./device-identity";
+import type {
+  KindleBridgeDeviceMetadataCache,
+  KindleBridgeDeviceMetadataCacheEntry,
+} from "./device-metadata-cache-codec";
 import { extractManagedFilenameToken } from "./filenames";
 import { hasSufficientKindleObjectDistinguishability } from "./matching";
 import type {
   KindleMetadataCache,
   KindleMetadataCacheEntry,
   KindleMetadataCacheEvidence,
-  KindleMetadataCacheHit,
 } from "./metadata-cache";
+import { isFatalTransportFailure } from "../error-diagnostics";
 
 const UINT32_MAX = 0xffff_ffff;
 const DEFAULT_MAX_OBJECTS = 10_000;
@@ -136,6 +140,10 @@ export interface KindleInventoryMetadataSummary {
   readonly managedObjectCount?: number;
   /** Objects whose parsed fields were reused after a live path/size/time match. */
   readonly cacheHitObjectCount?: number;
+  /** Portable hits read from a validated cache object on this Kindle. */
+  readonly deviceCacheHitObjectCount?: number;
+  /** Same-origin browser cache hits used after portable-cache misses. */
+  readonly browserCacheHitObjectCount?: number;
   /** Successfully returned bytes. */
   readonly readByteCount: number;
   /** Sum of declared object sizes reserved against the total read budget. */
@@ -173,6 +181,11 @@ export interface KindleInventoryMetadataCacheContext {
   readonly identity: PseudonymousKindleIdentity;
 }
 
+/** Strictly decoded cache files discovered on the selected Kindle storage. */
+export interface KindleInventoryDeviceMetadataCacheContext {
+  readonly caches: readonly KindleBridgeDeviceMetadataCache[];
+}
+
 export interface KindleInventoryMetadataOptions {
   readonly maxObjects?: number;
   readonly maxObjectBytes?: number;
@@ -187,6 +200,11 @@ export interface KindleInventoryOptions extends KindleOperationOptions {
   readonly maxIssues?: number;
   /** Enabled with conservative limits by default; `false` performs metadata-only hierarchy enumeration. */
   readonly bookMetadata?: false | KindleInventoryMetadataOptions;
+  /**
+   * Portable cache reads are enabled by default. A write request is honored
+   * only after this KindleDevice instance has passed its exact-byte self-test.
+   */
+  readonly deviceMetadataCache?: false | "read-only" | "read-write";
 }
 
 interface ResolvedInventoryLimits {
@@ -292,13 +310,7 @@ function isAbort(error: unknown, signal: AbortSignal | undefined): boolean {
 }
 
 function isTransportFailure(error: unknown): boolean {
-  if (error && typeof error === "object" && Reflect.get(error, "fatal") === true) return true;
-  const code = safeErrorCode(error);
-  return code === "MTP_INVALID_STATE"
-    || code === "MTP_TRANSPORT_ERROR"
-    || code === "MTP_COMMAND_TIMEOUT"
-    || code === "MTP_INACTIVITY_TIMEOUT"
-    || code?.startsWith("USB_") === true;
+  return isFatalTransportFailure(error);
 }
 
 function isUint32(value: number): boolean {
@@ -400,6 +412,8 @@ interface MetadataCounters {
   indistinguishable: number;
   managed: number;
   cached: number;
+  deviceCached: number;
+  browserCached: number;
   readBytes: number;
   budgetedBytes: number;
 }
@@ -427,6 +441,8 @@ function metadataSummary(
     indistinguishableObjectCount: counters.indistinguishable,
     ...(counters.managed === 0 ? {} : { managedObjectCount: counters.managed }),
     ...(counters.cached === 0 ? {} : { cacheHitObjectCount: counters.cached }),
+    ...(counters.deviceCached === 0 ? {} : { deviceCacheHitObjectCount: counters.deviceCached }),
+    ...(counters.browserCached === 0 ? {} : { browserCacheHitObjectCount: counters.browserCached }),
     readByteCount: counters.readBytes,
     budgetedByteCount: counters.budgetedBytes,
     truncated: reasons.size > 0,
@@ -459,12 +475,14 @@ function objectWithParsedMetadata(
 function cacheEvidenceFor(
   object: KindleInventoryObject,
   context: KindleInventoryMetadataCacheContext | undefined,
+  livePathCounts: ReadonlyMap<string, number>,
 ): KindleMetadataCacheEvidence | undefined {
   if (
     !context
     || object.metadataAdjusted
     || object.modificationDate === undefined
     || object.relativePath.length === 0
+    || livePathCounts.get(portablePathKey(object.relativePath)) !== 1
   ) {
     return undefined;
   }
@@ -478,34 +496,138 @@ function cacheEvidenceFor(
   };
 }
 
+interface InventoryMetadataCacheHit {
+  readonly provenance: "device-metadata-cache" | "browser-metadata-cache";
+  readonly authoritative: false;
+  readonly metadata: KindleBookMetadata;
+}
+
+function deviceCacheEvidenceKey(
+  relativePath: string,
+  objectFormat: number,
+  size: number,
+  modificationDate: string,
+): string {
+  return `${relativePath}\u0000${objectFormat.toString(10)}\u0000${size.toString(10)}\u0000${modificationDate}`;
+}
+
+function portablePathKey(relativePath: string): string {
+  return relativePath.toLocaleLowerCase("en-US");
+}
+
+function liveCachePathCounts(
+  objects: readonly KindleInventoryObject[],
+): ReadonlyMap<string, number> {
+  const counts = new Map<string, number>();
+  for (const object of objects) {
+    if (object.kind !== "file" || object.metadataAdjusted || object.relativePath.length === 0) continue;
+    const key = portablePathKey(object.relativePath);
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  return counts;
+}
+
+function equalBookMetadata(left: KindleBookMetadata, right: KindleBookMetadata): boolean {
+  return left.title === right.title
+    && left.language === right.language
+    && left.authors.length === right.authors.length
+    && left.authors.every((value, index) => value === right.authors[index])
+    && left.identifiers.length === right.identifiers.length
+    && left.identifiers.every((value, index) => value === right.identifiers[index]);
+}
+
+function portableMetadataHits(
+  objects: readonly KindleInventoryObject[],
+  maximum: number,
+  context: KindleInventoryDeviceMetadataCacheContext | undefined,
+  livePathCounts: ReadonlyMap<string, number>,
+): ReadonlyMap<number, InventoryMetadataCacheHit> {
+  if (!context || context.caches.length === 0) return new Map();
+  const entries = new Map<string, KindleBridgeDeviceMetadataCacheEntry | null>();
+  for (const cache of context.caches) {
+    for (const entry of cache.entries) {
+      const key = deviceCacheEvidenceKey(
+        entry.relativePath,
+        entry.objectFormat,
+        entry.size,
+        entry.modificationDate,
+      );
+      const existing = entries.get(key);
+      if (existing === undefined) entries.set(key, entry);
+      else if (existing !== null && !equalBookMetadata(existing.metadata, entry.metadata)) {
+        // Conflicting valid generations with identical live evidence are
+        // ambiguous. Re-read the book rather than choosing either value.
+        entries.set(key, null);
+      }
+    }
+  }
+
+  const hits = new Map<number, InventoryMetadataCacheHit>();
+  for (const object of objects) {
+    if (
+      hits.size >= maximum
+      || !isEligibleBookObject(object)
+      || !hasSupportedEmbeddedMetadata(object.filename)
+      || (object.managedToken !== undefined && !object.metadataAdjusted)
+      || object.metadataAdjusted
+      || object.modificationDate === undefined
+      || object.relativePath.length === 0
+      || livePathCounts.get(portablePathKey(object.relativePath)) !== 1
+    ) {
+      continue;
+    }
+    const entry = entries.get(deviceCacheEvidenceKey(
+      object.relativePath,
+      object.objectFormat,
+      object.size,
+      object.modificationDate,
+    ));
+    if (!entry) continue;
+    hits.set(object.handle, Object.freeze({
+      provenance: "device-metadata-cache",
+      authoritative: false,
+      metadata: entry.metadata,
+    }));
+  }
+  return hits;
+}
+
 async function cachedMetadataHits(
   objects: readonly KindleInventoryObject[],
   maximum: number,
   context: KindleInventoryMetadataCacheContext | undefined,
+  deviceContext: KindleInventoryDeviceMetadataCacheContext | undefined,
+  livePathCounts: ReadonlyMap<string, number>,
   signal: AbortSignal | undefined,
-): Promise<ReadonlyMap<number, KindleMetadataCacheHit>> {
-  if (!context) return new Map();
+): Promise<ReadonlyMap<number, InventoryMetadataCacheHit>> {
+  const byHandle = new Map(portableMetadataHits(
+    objects,
+    maximum,
+    deviceContext,
+    livePathCounts,
+  ));
+  if (!context || byHandle.size >= maximum) return byHandle;
   const handles: number[] = [];
   const evidence: KindleMetadataCacheEvidence[] = [];
   for (const object of objects) {
     if (
-      evidence.length >= maximum
+      byHandle.size + evidence.length >= maximum
+      || byHandle.has(object.handle)
       || !isEligibleBookObject(object)
       || !hasSupportedEmbeddedMetadata(object.filename)
       || (object.managedToken !== undefined && !object.metadataAdjusted)
     ) {
       continue;
     }
-    const candidate = cacheEvidenceFor(object, context);
+    const candidate = cacheEvidenceFor(object, context, livePathCounts);
     if (!candidate) continue;
     handles.push(object.handle);
     evidence.push(candidate);
   }
-  if (evidence.length === 0) return new Map();
+  if (evidence.length === 0) return byHandle;
   try {
     const hits = await context.cache.lookupMany(evidence);
     signal?.throwIfAborted();
-    const byHandle = new Map<number, KindleMetadataCacheHit>();
     for (let index = 0; index < hits.length; index += 1) {
       const hit = hits[index];
       if (hit?.authoritative === false) byHandle.set(handles[index]!, hit);
@@ -515,7 +637,7 @@ async function cachedMetadataHits(
     if (isAbort(error, signal)) throw error;
     // The cache is an optional acceleration only. Corrupt, unavailable, or
     // quota-blocked browser storage must fall back to live bounded reads.
-    return new Map();
+    return byHandle;
   }
 }
 
@@ -526,6 +648,7 @@ async function enrichBookMetadata(
   operationOptions: KindleOperationOptions,
   signal: AbortSignal | undefined,
   cacheContext?: KindleInventoryMetadataCacheContext,
+  deviceCacheContext?: KindleInventoryDeviceMetadataCacheContext,
 ): Promise<{
   readonly objects: readonly KindleInventoryObject[];
   readonly summary: KindleInventoryMetadataSummary;
@@ -540,6 +663,8 @@ async function enrichBookMetadata(
     indistinguishable: 0,
     managed: 0,
     cached: 0,
+    deviceCached: 0,
+    browserCached: 0,
     readBytes: 0,
     budgetedBytes: 0,
   };
@@ -551,10 +676,13 @@ async function enrichBookMetadata(
     };
   }
 
+  const livePathCounts = liveCachePathCounts(objects);
   const cacheHits = await cachedMetadataHits(
     objects,
     limits.maxObjects,
     cacheContext,
+    deviceCacheContext,
+    livePathCounts,
     signal,
   );
   const cacheEntries: KindleMetadataCacheEntry[] = [];
@@ -601,12 +729,21 @@ async function enrichBookMetadata(
     const cacheHit = cacheHits.get(object.handle);
     if (cacheHit !== undefined) {
       counters.cached += 1;
+      if (cacheHit.provenance === "device-metadata-cache") counters.deviceCached += 1;
+      else counters.browserCached += 1;
       if (hasParsedMetadata(cacheHit.metadata)) counters.enriched += 1;
       const enrichedObject = objectWithParsedMetadata(object, cacheHit.metadata);
       if (!hasSufficientKindleObjectDistinguishability(enrichedObject)) {
         counters.indistinguishable += 1;
       }
       enrichedObjects.push(enrichedObject);
+      if (cacheHit.provenance === "device-metadata-cache") {
+        const evidence = cacheEvidenceFor(object, cacheContext, livePathCounts);
+        if (cacheWritesEnabled && evidence !== undefined) {
+          cacheEntries.push({ evidence, metadata: cacheHit.metadata });
+          await flushCacheEntries();
+        }
+      }
       continue;
     }
 
@@ -657,7 +794,7 @@ async function enrichBookMetadata(
         counters.indistinguishable += 1;
       }
       enrichedObjects.push(enrichedObject);
-      const evidence = cacheEvidenceFor(object, cacheContext);
+      const evidence = cacheEvidenceFor(object, cacheContext, livePathCounts);
       if (cacheWritesEnabled && evidence !== undefined) {
         cacheEntries.push({ evidence, metadata });
         await flushCacheEntries();
@@ -689,6 +826,7 @@ export async function buildKindleInventory(
   options: KindleInventoryOptions = {},
   folderSeed?: KindleInventoryFolderSeed,
   cacheContext?: KindleInventoryMetadataCacheContext,
+  deviceCacheContext?: KindleInventoryDeviceMetadataCacheContext,
 ): Promise<KindleInventorySnapshot> {
   const limits = resolveLimits(options);
   const operationOptions: KindleOperationOptions = {
@@ -873,6 +1011,7 @@ export async function buildKindleInventory(
     operationOptions,
     options.signal,
     cacheContext,
+    deviceCacheContext,
   );
   return Object.freeze({
     status: issueCount === 0 ? "complete" : "partial",

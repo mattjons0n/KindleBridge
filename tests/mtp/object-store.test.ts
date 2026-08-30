@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  createKindleBridgeDeviceMetadataCacheFilename,
+  encodeKindleBridgeDeviceMetadataCache,
+} from "../../client/src/kindle/device-metadata-cache-codec";
+import {
   decodeContainer,
   decodeContainerParameters,
   encodeDataContainer,
@@ -35,6 +39,8 @@ import { FakeMtpBulkTransport, splitContainerStream } from "./fake-transport";
 const STORAGE_ID = 0x0001_0001;
 const DOCUMENTS_HANDLE = 0x0000_0042;
 const CREATED_HANDLE = 0x1234_abcd;
+const CACHE_HANDLE = 0x00ca_c4e0;
+const CACHE_FILENAME = createKindleBridgeDeviceMetadataCacheFilename("a");
 
 function ok(transactionId: number, parameters: readonly number[] = []): Uint8Array {
   return encodeResponseContainer(MtpResponseCode.OK, transactionId, parameters);
@@ -57,6 +63,34 @@ async function openStore(reads: readonly Uint8Array[]) {
 function writtenContainers(transport: FakeMtpBulkTransport) {
   return splitContainerStream(transport.allWrittenBytes())
     .map((bytes) => decodeContainer(bytes));
+}
+
+async function cacheBytes(generation = 1): Promise<Uint8Array> {
+  return encodeKindleBridgeDeviceMetadataCache({
+    version: 1,
+    parserRevision: 1,
+    generation,
+    entries: [],
+  });
+}
+
+function cacheObjectInfo(
+  bytes: Uint8Array,
+  overrides: Partial<ReturnType<typeof makeUploadObjectInfo>> = {},
+) {
+  return {
+    ...makeUploadObjectInfo({
+      storageId: STORAGE_ID,
+      // Some Kindles encode a root object's ObjectInfo parent as zero even
+      // though GetObjectHandles addresses the root with 0xffffffff.
+      parentHandle: 0,
+      objectFormat: MtpObjectFormat.Undefined,
+      compressedSize: bytes.byteLength,
+      filename: CACHE_FILENAME,
+      modificationDate: "20260830T120000Z",
+    }),
+    ...overrides,
+  };
 }
 
 describe("MtpObjectStore read operations", () => {
@@ -127,7 +161,7 @@ describe("MtpObjectStore read operations", () => {
       data(MtpOperationCode.GetObject, 1, payload), ok(1),
     ]);
     await expect(second.store.readObject(7, { maxBytes: payload.byteLength - 1 }))
-      .rejects.toMatchObject({ code: "MTP_READ_LIMIT_EXCEEDED" });
+      .rejects.toMatchObject({ code: "MTP_READ_LIMIT_EXCEEDED", fatal: true });
   });
 
   it("rejects an oversized object-handle dataset from its header before inventory allocation", async () => {
@@ -146,11 +180,208 @@ describe("MtpObjectStore read operations", () => {
       maxHandles: 2,
     })).rejects.toMatchObject({
       code: "MTP_HANDLE_LIMIT_EXCEEDED",
+      fatal: true,
     });
   });
 });
 
+describe("MtpObjectStore prior-session Kindle Bridge cache deletion", () => {
+  it("accepts ObjectInfo parent zero, relists the root with 0xffffffff, and deletes only the exact validated cache", async () => {
+    const payload = await cacheBytes();
+    const objectInfo = cacheObjectInfo(payload);
+    const { store, transport } = await openStore([
+      data(MtpOperationCode.GetObjectInfo, 1, encodeObjectInfo(objectInfo)), ok(1),
+      data(MtpOperationCode.GetObjectHandles, 2, encodeObjectHandles([CACHE_HANDLE])), ok(2),
+      data(MtpOperationCode.GetObject, 3, payload), ok(3),
+      data(MtpOperationCode.GetObjectInfo, 4, encodeObjectInfo(objectInfo)), ok(4),
+      data(MtpOperationCode.GetObjectHandles, 5, encodeObjectHandles([CACHE_HANDLE])), ok(5),
+      data(MtpOperationCode.GetObject, 6, payload), ok(6),
+      ok(7),
+      data(MtpOperationCode.GetObjectHandles, 8, encodeObjectHandles([])), ok(8),
+    ]);
+
+    const snapshot = await store.inspectKindleBridgeMetadataCacheObject(CACHE_HANDLE);
+    expect(snapshot).toMatchObject({
+      info: {
+        handle: CACHE_HANDLE,
+        parentHandle: 0,
+        filename: CACHE_FILENAME,
+      },
+      cache: { generation: 1, entries: [] },
+    });
+    expect(snapshot.data).toEqual(payload);
+
+    // Inspection must not silently confer the broader current-session
+    // ownership accepted by the ordinary deletion API.
+    await expect(store.deleteObject(CACHE_HANDLE)).rejects.toMatchObject({
+      code: "MTP_OBJECT_NOT_OWNED",
+    });
+
+    const forged = { ...snapshot, data: snapshot.data.slice() };
+    await expect(store.deleteKindleBridgeMetadataCacheObject(forged)).rejects.toMatchObject({
+      code: "MTP_OBJECT_DELETE_MISMATCH",
+    });
+
+    await expect(store.deleteKindleBridgeMetadataCacheObject(snapshot)).resolves.toBeUndefined();
+    await expect(store.deleteKindleBridgeMetadataCacheObject(snapshot)).rejects.toMatchObject({
+      code: "MTP_OBJECT_DELETE_MISMATCH",
+    });
+
+    const commands = writtenContainers(transport)
+      .filter(({ type }) => type === MtpContainerType.Command);
+    expect(commands.map(({ code }) => code)).toEqual([
+      MtpOperationCode.OpenSession,
+      MtpOperationCode.GetObjectInfo,
+      MtpOperationCode.GetObjectHandles,
+      MtpOperationCode.GetObject,
+      MtpOperationCode.GetObjectInfo,
+      MtpOperationCode.GetObjectHandles,
+      MtpOperationCode.GetObject,
+      MtpOperationCode.DeleteObject,
+      MtpOperationCode.GetObjectHandles,
+    ]);
+    const rootRelists = commands.filter(({ code }) => code === MtpOperationCode.GetObjectHandles);
+    expect(rootRelists.map(({ payload: parameters }) => decodeContainerParameters(parameters))).toEqual([
+      [STORAGE_ID, 0, MTP_ROOT_PARENT],
+      [STORAGE_ID, 0, MTP_ROOT_PARENT],
+      [STORAGE_ID, 0, MTP_ROOT_PARENT],
+    ]);
+    const deletes = commands.filter(({ code }) => code === MtpOperationCode.DeleteObject);
+    expect(deletes).toHaveLength(1);
+    expect(decodeContainerParameters(deletes[0]!.payload)).toEqual([CACHE_HANDLE, 0]);
+  });
+
+  it.each(["bytes", "metadata"] as const)(
+    "refuses conditional deletion when the validated cache %s change",
+    async (changed) => {
+      const original = await cacheBytes(1);
+      const replacement = changed === "bytes" ? await cacheBytes(2) : original;
+      expect(replacement.byteLength).toBe(original.byteLength);
+      const originalInfo = cacheObjectInfo(original);
+      const replacementInfo = cacheObjectInfo(replacement, changed === "metadata"
+        ? { modificationDate: "20260830T120001Z" }
+        : {});
+      const { store, transport } = await openStore([
+        data(MtpOperationCode.GetObjectInfo, 1, encodeObjectInfo(originalInfo)), ok(1),
+        data(MtpOperationCode.GetObjectHandles, 2, encodeObjectHandles([CACHE_HANDLE])), ok(2),
+        data(MtpOperationCode.GetObject, 3, original), ok(3),
+        data(MtpOperationCode.GetObjectInfo, 4, encodeObjectInfo(replacementInfo)), ok(4),
+        data(MtpOperationCode.GetObjectHandles, 5, encodeObjectHandles([CACHE_HANDLE])), ok(5),
+        data(MtpOperationCode.GetObject, 6, replacement), ok(6),
+      ]);
+
+      const snapshot = await store.inspectKindleBridgeMetadataCacheObject(CACHE_HANDLE);
+      await expect(store.deleteKindleBridgeMetadataCacheObject(snapshot)).rejects.toMatchObject({
+        code: "MTP_OBJECT_DELETE_MISMATCH",
+      });
+
+      const commands = writtenContainers(transport)
+        .filter(({ type }) => type === MtpContainerType.Command);
+      expect(commands.some(({ code }) => code === MtpOperationCode.DeleteObject)).toBe(false);
+    },
+  );
+
+  it("never deletes exact-name cache bytes that fail strict cache validation", async () => {
+    const invalid = new TextEncoder().encode('{"not":"a-kindle-bridge-cache"}');
+    const objectInfo = cacheObjectInfo(invalid);
+    const { store, transport } = await openStore([
+      data(MtpOperationCode.GetObjectInfo, 1, encodeObjectInfo(objectInfo)), ok(1),
+      data(MtpOperationCode.GetObjectHandles, 2, encodeObjectHandles([CACHE_HANDLE])), ok(2),
+      data(MtpOperationCode.GetObject, 3, invalid), ok(3),
+    ]);
+
+    await expect(store.inspectKindleBridgeMetadataCacheObject(CACHE_HANDLE)).rejects.toMatchObject({
+      code: "MTP_OBJECT_DELETE_MISMATCH",
+    });
+
+    const commands = writtenContainers(transport)
+      .filter(({ type }) => type === MtpContainerType.Command);
+    expect(commands.some(({ code }) => code === MtpOperationCode.DeleteObject)).toBe(false);
+  });
+
+  it("never reads or deletes a valid cache payload behind a non-exact cache filename", async () => {
+    const payload = await cacheBytes();
+    const objectInfo = cacheObjectInfo(payload, {
+      filename: ".kindle-bridge-device-metadata-cache-v1-c.json",
+    });
+    const { store, transport } = await openStore([
+      data(MtpOperationCode.GetObjectInfo, 1, encodeObjectInfo(objectInfo)), ok(1),
+      data(MtpOperationCode.GetObjectHandles, 2, encodeObjectHandles([CACHE_HANDLE])), ok(2),
+    ]);
+
+    await expect(store.inspectKindleBridgeMetadataCacheObject(CACHE_HANDLE)).rejects.toMatchObject({
+      code: "MTP_OBJECT_DELETE_MISMATCH",
+    });
+
+    const commands = writtenContainers(transport)
+      .filter(({ type }) => type === MtpContainerType.Command);
+    expect(commands.some(({ code }) => code === MtpOperationCode.GetObject)).toBe(false);
+    expect(commands.some(({ code }) => code === MtpOperationCode.DeleteObject)).toBe(false);
+  });
+});
+
 describe("MtpObjectStore create and scoped delete", () => {
+  it("normalizes a root SendObjectInfo parent-zero response and relists the MTP root for cleanup", async () => {
+    const payload = Uint8Array.of(1, 2, 3);
+    const { store, transport } = await openStore([
+      data(MtpOperationCode.GetObjectHandles, 1, encodeObjectHandles([])), ok(1),
+      ok(2, [STORAGE_ID, 0, CREATED_HANDLE]),
+      ok(3),
+      ok(4),
+      data(MtpOperationCode.GetObjectHandles, 5, encodeObjectHandles([])), ok(5),
+    ]);
+
+    const created = await store.createObject({
+      storageId: STORAGE_ID,
+      parentHandle: MTP_ROOT_PARENT,
+      filename: CACHE_FILENAME,
+      objectFormat: MtpObjectFormat.Undefined,
+      size: payload.byteLength,
+      data: payload,
+    });
+    expect(created).toEqual({
+      handle: CREATED_HANDLE,
+      storageId: STORAGE_ID,
+      parentHandle: MTP_ROOT_PARENT,
+      filename: CACHE_FILENAME,
+      size: payload.byteLength,
+    });
+
+    await store.deleteObject(CREATED_HANDLE);
+
+    const containers = writtenContainers(transport);
+    const commands = containers.filter(({ type }) => type === MtpContainerType.Command);
+    expect(commands.map(({ code }) => code)).toEqual([
+      MtpOperationCode.OpenSession,
+      MtpOperationCode.GetObjectHandles,
+      MtpOperationCode.SendObjectInfo,
+      MtpOperationCode.SendObject,
+      MtpOperationCode.DeleteObject,
+      MtpOperationCode.GetObjectHandles,
+    ]);
+    expect(decodeContainerParameters(commands[1]!.payload)).toEqual([
+      STORAGE_ID,
+      0,
+      MTP_ROOT_PARENT,
+    ]);
+    expect(decodeContainerParameters(commands[2]!.payload)).toEqual([
+      STORAGE_ID,
+      MTP_ROOT_PARENT,
+    ]);
+    expect(decodeContainerParameters(commands[5]!.payload)).toEqual([
+      STORAGE_ID,
+      0,
+      MTP_ROOT_PARENT,
+    ]);
+    const sentInfo = containers.find(
+      ({ type, code }) => type === MtpContainerType.Data && code === MtpOperationCode.SendObjectInfo,
+    );
+    expect(sentInfo).toBeDefined();
+    // ObjectInfo.ParentObject uses zero for a root object even though the
+    // SendObjectInfo command parameter and later root relists use 0xffffffff.
+    expect(decodeObjectInfo(sentInfo!.payload).parentHandle).toBe(0);
+  });
+
   it("sends ObjectInfo, streams exact object bytes, reports written progress, and deletes its handle", async () => {
     const payload = Uint8Array.of(0x41, 0, 0xf0, 0x9f, 0x98, 0x80, 0xff);
     const objectInfo = makeUploadObjectInfo({

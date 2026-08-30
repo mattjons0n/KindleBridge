@@ -1,6 +1,7 @@
 import type {
   KindleCreateObjectRequest,
   KindleCreatedObject,
+  KindleBridgeMetadataCacheObjectSnapshot,
   KindleObjectStore,
   KindleOperationOptions,
   KindleReadObjectOptions,
@@ -12,6 +13,11 @@ import {
   MTP_OBJECT_FORMAT_ASSOCIATION,
   MTP_ROOT_ASSOCIATION_HANDLE,
 } from "../../client/src/kindle/kindle-device";
+import {
+  KINDLE_BRIDGE_DEVICE_METADATA_CACHE_HARD_MAX_BYTES,
+  decodeKindleBridgeDeviceMetadataCache,
+  isKindleBridgeDeviceMetadataCacheFilename,
+} from "../../client/src/kindle/device-metadata-cache-codec";
 
 export function storageInfo(
   overrides: Partial<KindleStorageInfo> = {},
@@ -62,6 +68,7 @@ export class FakeKindleObjectStore implements KindleObjectStore {
   nextHandle = 100;
   corruptReadback = false;
   failDelete = false;
+  readonly validatedCacheSnapshots = new WeakMap<object, { readonly sessionOwned: boolean }>();
   metadataMutation?: (
     info: KindleStoredObjectInfo,
   ) => KindleStoredObjectInfo;
@@ -74,7 +81,7 @@ export class FakeKindleObjectStore implements KindleObjectStore {
         storageId: 1,
         objectFormat: MTP_OBJECT_FORMAT_ASSOCIATION,
         associationType: 1,
-        parentHandle: MTP_ROOT_ASSOCIATION_HANDLE,
+        parentHandle: 0,
         filename: "Documents",
       }),
     );
@@ -118,7 +125,8 @@ export class FakeKindleObjectStore implements KindleObjectStore {
       .filter(
         (info) =>
           query.associationHandle === undefined ||
-          info.parentHandle === query.associationHandle,
+          info.parentHandle === query.associationHandle
+          || (query.associationHandle === MTP_ROOT_ASSOCIATION_HANDLE && info.parentHandle === 0),
       )
       .map(({ handle }) => handle);
     if (query.maxHandles !== undefined && handles.length > query.maxHandles) {
@@ -184,7 +192,7 @@ export class FakeKindleObjectStore implements KindleObjectStore {
 
     let info = objectInfo(handle, {
       storageId: request.storageId,
-      parentHandle: request.parentHandle,
+      parentHandle: request.parentHandle === MTP_ROOT_ASSOCIATION_HANDLE ? 0 : request.parentHandle,
       filename: request.filename,
       objectFormat: request.objectFormat,
       compressedSize: request.size,
@@ -242,11 +250,66 @@ export class FakeKindleObjectStore implements KindleObjectStore {
       request.onObjectState?.({
         stage: "cleanup-succeeded",
         handle,
-        storageId: info.storageId,
-        parentHandle: info.parentHandle,
-        filename: info.filename,
-        size: info.compressedSize,
+        storageId: request.storageId,
+        parentHandle: request.parentHandle,
+        filename: request.filename,
+        size: request.size,
       });
     }
+  }
+
+  async inspectKindleBridgeMetadataCacheObject(
+    handle: number,
+    _options?: KindleOperationOptions,
+  ): Promise<KindleBridgeMetadataCacheObjectSnapshot> {
+    const info = await this.getObjectInfo(handle);
+    const rootHandles = await this.listObjectHandles({
+      storageId: info.storageId,
+      associationHandle: MTP_ROOT_ASSOCIATION_HANDLE,
+      maxHandles: 256,
+    });
+    if (
+      !rootHandles.includes(handle)
+      || (info.parentHandle !== 0 && info.parentHandle !== MTP_ROOT_ASSOCIATION_HANDLE)
+      || info.objectFormat !== 0x3000
+      || info.protectionStatus !== 0
+      || info.associationType !== 0
+      || !isKindleBridgeDeviceMetadataCacheFilename(info.filename)
+      || info.compressedSize < 1
+      || info.compressedSize > KINDLE_BRIDGE_DEVICE_METADATA_CACHE_HARD_MAX_BYTES
+    ) {
+      throw new Error(`Invalid cache candidate ${handle}`);
+    }
+    const data = await this.readObject(handle, { maxBytes: info.compressedSize });
+    if (data.byteLength !== info.compressedSize) throw new Error(`Cache size mismatch ${handle}`);
+    const cache = await decodeKindleBridgeDeviceMetadataCache(data);
+    const snapshot = Object.freeze({ info: Object.freeze({ ...info }), data: data.slice(), cache });
+    this.validatedCacheSnapshots.set(snapshot, { sessionOwned: this.ownedHandles.has(handle) });
+    return snapshot;
+  }
+
+  async deleteKindleBridgeMetadataCacheObject(
+    snapshot: KindleBridgeMetadataCacheObjectSnapshot,
+    _options?: KindleOperationOptions,
+  ): Promise<void> {
+    const capability = this.validatedCacheSnapshots.get(snapshot);
+    if (!capability) {
+      throw new Error("Refusing forged or consumed cache snapshot");
+    }
+    this.validatedCacheSnapshots.delete(snapshot);
+    if (this.failDelete) throw new Error("simulated delete failure");
+    const current = this.objects.get(snapshot.info.handle);
+    const currentData = this.objectData.get(snapshot.info.handle);
+    if (!current || !currentData || JSON.stringify(current) !== JSON.stringify(snapshot.info)) {
+      throw new Error(`Exact metadata mismatch for handle ${snapshot.info.handle}`);
+    }
+    if (currentData.byteLength !== snapshot.data.byteLength
+      || currentData.some((byte, index) => byte !== snapshot.data[index])) {
+      throw new Error(`Exact byte mismatch for handle ${snapshot.info.handle}`);
+    }
+    this.deletedHandles.push(snapshot.info.handle);
+    this.objects.delete(snapshot.info.handle);
+    this.objectData.delete(snapshot.info.handle);
+    this.ownedHandles.delete(snapshot.info.handle);
   }
 }

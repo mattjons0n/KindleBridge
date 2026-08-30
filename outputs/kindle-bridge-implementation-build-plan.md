@@ -48,7 +48,7 @@ Milestones 0–9 now implement the production software that was absent from that
 - a reproducibly rebuilt boko artifact with pre-retention archive, spine, DOM/IR/style, MathML, normalized XHTML/CSS, cache, and 200 MiB AZW3-output limits plus actual-WASM hostile-input regressions;
 - strict host/origin controls and documented private HTTPS reverse-proxy/VPN operation.
 
-The original automated baseline was 18 test files and 133 passing tests; it is historical. The authoritative 2026-08-30 root `npm run check` completed with 50/50 test files and 563/563 tests, followed by successful client typechecking, server build, and production Vite build. Physical success still applies only to the earlier transfer POC. A fresh physical integrated journey, real household-mount/private-origin checks, and measured peak browser memory remain Milestone 10.
+The original automated baseline was 18 test files and 133 passing tests; it is historical. The authoritative 2026-08-30 root `npm run check` completed with 53/53 test files and 628/628 tests, followed by successful client typechecking, server build, and production Vite build. Physical success still applies only to the earlier transfer POC. A fresh physical integrated journey, real household-mount/private-origin checks, and measured peak browser memory remain Milestone 10.
 
 ## 3. Implemented architecture
 
@@ -148,7 +148,7 @@ Exit gate:
 
 - The target Docker environment and network boundary are documented.
 - A public unauthenticated route is explicitly rejected.
-- The expanded root `npm run check` gate passes at 50/50 files and 563/563 tests, with client typechecking and both production builds green.
+- The expanded root `npm run check` gate passes at 53/53 files and 628/628 tests, with client typechecking and both production builds green.
 
 ### Milestone 1 — Full-stack foundation — Implemented
 
@@ -271,7 +271,7 @@ Tasks:
 - Recursively enumerate the Documents hierarchy read-only and model complete versus partial inventory scans. Retain and page the bounded device presentation rather than discarding everything after the first screen; the default limit is 10,000 readable objects with 100-row UI pages.
 - Capture only the bounded metadata needed for matching: object identity where persistent support is proven, parent, filename, size, and safe parsed identifiers.
 - Prune Kindle `.sdr` sidecars and avoid whole-object reads that cannot improve evidence: valid managed derivatives use their stronger token, while unsupported KFX/AZW8 metadata remains conservatively incomplete.
-- Cache successfully parsed unmanaged metadata only in the same-origin browser, keyed by pseudonymous device plus exact live storage/path/size/modification evidence. Never let the cache replace live enumeration or reach the backend.
+- Cache successfully parsed unmanaged metadata in bounded checksum-protected A/B files at the selected Kindle storage root, with a same-origin browser cache as fallback. Portable reuse requires exact current unadjusted path/object-format/size/modification evidence; browser fallback additionally requires pseudonymous device/storage evidence. Never let either cache replace live enumeration or reach the backend.
 - Automatically run the existing exact-byte self-test after every successful clean connection. If an exact recovery record is pending, first allow only the read-only inventory needed to identify and present that cleanup; do not enable Send.
 - Enable Send only when the self-test and cleanup pass in the current connection.
 - When the user acknowledges an exact durable recovery record on a retained connection, acquire the device-operation lock and rerun the same post-connect self-test, inventory, and catalog reconciliation sequence. A failure remains fail-closed and does not restore Send readiness.
@@ -282,7 +282,7 @@ Tasks:
 Exit gate:
 
 - **Connect Kindle** remains a direct user action. With no pending recovery, the exact-byte self-test proceeds first and inventory follows automatically. A pending exact cleanup intentionally allows read-only recovery inventory first, followed by self-test, inventory, and reconciliation after acknowledgement.
-- Safe-write, Documents reading, and library comparison are visibly separate phases. A cache hit can accelerate parsing only after the current live object is observed; a first scan or changed object still takes the bounded live path.
+- Safe-write, Documents reading, and library comparison are visibly separate phases. A cache hit can accelerate parsing only after the current live object is observed; a first scan or changed object still takes the bounded live path. Kindle-resident cache updates occur only after the self-test and complete hierarchy inventory, keep one verified A/B slot during rotation, and have no authority over books or `metadata.calibre`.
 - A failure displays **Safe-write check failed. No book has been sent.** and Send stays disabled.
 - Disconnect, BFCache restoration, long observed hidden/visible browser gaps, navigation, duplicate tabs, already-claimed interfaces, recovery-acknowledgement races, and every self-test transaction failure are covered by fault tests. These browser events do not prove detection of every OS sleep transition.
 - The known `0x1949 / 0x9981` Kindle passes a fresh physical inventory and automatic-self-test run.
@@ -451,6 +451,7 @@ Mocks can prove behavior, not Kindle acceptance. Any release that changes conver
 | HTTPS origin cannot use WebUSB | Trusted certificate and real-hostname physical test before release |
 | Two tabs or apps contend for the Kindle | Browser-wide lock, cross-tab lease, one active MTP writer |
 | USB fails after object creation | Existing journal, trustworthy current-session handle, exact cleanup only; acknowledgement reruns locked self-test/inventory/reconciliation before Send can resume |
+| Portable Kindle metadata cache is stale, corrupt, or interrupted during rotation | Require current live hierarchy evidence; checksum/canonical decoding; bounded A/B slots; exact readback; self-test/recovery gate; conditional deletion of only a freshly revalidated app-owned slot |
 | Transfer succeeds but DB recording fails | Stable managed filename token and idempotent delivery retry |
 | Conversion consumes excessive browser memory | Enforced pre-retention converter/output limits, transferable buffers, no V1 derivative cache, plus a still-required measured peak on the intended browser |
 | Database loss removes non-rebuildable history | Separate durable/rebuildable state, backups, restore drill, migration rollback |
@@ -471,9 +472,9 @@ Mocks can prove behavior, not Kindle acceptance. Any release that changes conver
 
 ## 10. Completion and next gate
 
-The read-only catalog slice and the later watcher, inventory, reconciliation, Send, converter-hardening, recovery, and Docker software are implemented. The authoritative root gate passes at 50/50 files and 563/563 tests with typechecking and production builds. The current schema-v13 local image passes restore/rebuild, hardened native arm64, cross-runtime amd64, and attested dual-architecture OCI acceptance. Before household release:
+The read-only catalog slice and the later watcher, inventory, reconciliation, Send, converter-hardening, recovery, and Docker software are implemented. The authoritative root gate passes at 53/53 files and 628/628 tests with typechecking and production builds. The current schema-v13 local image passes restore/rebuild, hardened native arm64, cross-runtime amd64, and attested dual-architecture OCI acceptance. Before household release:
 
-1. Repeat the expanded journey on the physical Kindle: user-initiated chooser, automatic exact-byte self-test, complete/partial inventory behavior, confirmed/possible matching, catalog-driven Send, Kindle indexing/open/navigation/cover, reconnect, and durable match recovery.
+1. Repeat the expanded journey on the physical Kindle: user-initiated chooser, automatic exact-byte self-test, complete/partial inventory behavior, confirmed/possible matching, catalog-driven Send, Kindle indexing/open/navigation/cover, reconnect, durable match recovery, and root-cache creation/reuse/A-B rotation from a second browser installation without surfacing the cache in the Kindle library or changing `metadata.calibre`.
 2. Configure the real husband and wife read-only host mounts, including multiple roots, and verify profile scope, incremental ingestion, source health, byte-identical originals, mount loss/restoration, backup/restore, and rebuild on the intended host.
 3. Verify the intended LAN/VPN exposure and exact trusted HTTPS origin on the client that will use WebUSB. The no-login service must not be publicly reachable.
 4. Measure peak browser memory with the largest accepted household EPUB on the intended WebUSB client and record the result against the documented planning allowance.

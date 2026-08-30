@@ -23,6 +23,7 @@ import {
   type MtpOperationOptions,
 } from "./mtp";
 import type { DeviceDetails } from "./state";
+import { isFatalTransportFailure } from "./error-diagnostics";
 import {
   WebUsbBulkTransport,
   captureDescriptorSnapshot,
@@ -100,13 +101,7 @@ function safeErrorCode(error: unknown): string | undefined {
 }
 
 function isFatalInventoryError(error: unknown): boolean {
-  if (error && typeof error === "object" && Reflect.get(error, "fatal") === true) return true;
-  const code = safeErrorCode(error);
-  return code === "MTP_INVALID_STATE"
-    || code === "MTP_TRANSPORT_ERROR"
-    || code === "MTP_COMMAND_TIMEOUT"
-    || code === "MTP_INACTIVITY_TIMEOUT"
-    || code?.startsWith("USB_") === true;
+  return isFatalTransportFailure(error);
 }
 
 async function inventoryWithAggregateDeadline(
@@ -255,6 +250,12 @@ export class ConnectedKindle {
 
   refreshInventory(options: KindleInventoryRefreshOptions = {}): Promise<KindleInventorySnapshot> {
     return this.#runExclusive(async () => {
+      if (options.deviceMetadataCache === "read-write" && !this.#selfTestResult?.cleanedUp) {
+        throw new KindleDeviceError(
+          "MTP_SELF_TEST_REQUIRED",
+          "The exact-byte safe-write check must pass before updating the Kindle metadata cache.",
+        );
+      }
       const inventory = await inventoryWithAggregateDeadline(this.#kindle, options);
       this.#inventory = inventory;
       return inventory;

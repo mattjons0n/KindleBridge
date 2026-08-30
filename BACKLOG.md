@@ -14,7 +14,7 @@ Any future change must preserve:
 - post-transfer handle, parent, filename, and size verification;
 - fail-closed behavior after an interrupted or unverified write.
 
-Before changing the policy, measure the safe-write test separately from inventory on the physical `0x1949 / 0x9981` Kindle. Kindle Bridge now labels those phases separately, prunes `.sdr` sidecars, skips redundant managed-file reads, and maintains a browser-local unchanged-metadata cache. Measure again before assuming the self-test is the remaining bottleneck; a first scan and cache misses can still require bounded full-object reads.
+Before changing the policy, measure the safe-write test separately from inventory on the physical `0x1949 / 0x9981` Kindle. Kindle Bridge now labels those phases separately, prunes `.sdr` sidecars, skips redundant managed-file reads, and maintains a portable Kindle-resident metadata cache with a browser-local fallback. Measure again before assuming the self-test is the remaining bottleneck; a first scan and genuine cache misses can still require bounded full-object reads.
 
 Acceptance requires tests for every retained trigger and failure path, plus a fresh physical Kindle transfer/reconnect/recovery run.
 

@@ -69,7 +69,7 @@ export type TransferState =
   | { readonly kind: "verified"; readonly purpose: TransferPurpose; readonly filename: string; readonly artifactId?: string; readonly totalBytes: number; readonly physicalOpenConfirmed: boolean }
   | { readonly kind: "failed"; readonly purpose: TransferPurpose; readonly filename: string; readonly artifactId?: string; readonly error: AppError; readonly cleanupRequired?: string };
 
-export type PendingObjectPurpose = "self-test" | "catalog" | TransferPurpose;
+export type PendingObjectPurpose = "self-test" | "catalog" | "metadata-cache" | TransferPurpose;
 export type PendingObjectStage = "send-object-info-intent" | "handle-assigned";
 
 /**
@@ -164,7 +164,10 @@ function isUint32(value: unknown): value is number {
 }
 
 function isPendingObjectPurpose(value: unknown): value is PendingObjectPurpose {
-  return value === "self-test" || value === "catalog" || value === "integrated";
+  return value === "self-test"
+    || value === "catalog"
+    || value === "metadata-cache"
+    || value === "integrated";
 }
 
 function isPendingObjectStage(value: unknown): value is PendingObjectStage {

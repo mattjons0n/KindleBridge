@@ -24,6 +24,13 @@ const USB_TRANSPORT_CODES = new Set([
   "USB_TRANSFER_ABORTED",
 ]);
 
+const FATAL_MTP_CODES = new Set([
+  "MTP_INVALID_STATE",
+  "MTP_TRANSPORT_ERROR",
+  "MTP_COMMAND_TIMEOUT",
+  "MTP_INACTIVITY_TIMEOUT",
+]);
+
 function record(value: unknown): Readonly<Record<string, unknown>> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? value as Readonly<Record<string, unknown>>
@@ -116,4 +123,38 @@ export function findTransportDiagnostic(error: unknown): TransportDiagnostic | u
   }
 
   return undefined;
+}
+
+/**
+ * Finds a faulted protocol/transport state through bounded error wrappers.
+ * Object-store limit errors intentionally preserve their user-facing code,
+ * so callers must also see a fatal MTP session nested as their cause.
+ */
+export function isFatalTransportFailure(error: unknown): boolean {
+  const seen = new Set<object>();
+  const queue: unknown[] = [error];
+
+  for (let visited = 0; queue.length && visited < MAX_ERROR_CHAIN_DEPTH * 2; visited += 1) {
+    const current = queue.shift();
+    const candidate = record(current);
+    if (!candidate || seen.has(candidate)) continue;
+    seen.add(candidate);
+
+    if (candidate.fatal === true) return true;
+    const code = typeof candidate.code === "string" ? candidate.code : undefined;
+    if (
+      (code !== undefined && FATAL_MTP_CODES.has(code))
+      || code?.startsWith("USB_") === true
+    ) {
+      return true;
+    }
+    queue.push(
+      candidate.cause,
+      candidate.originalFailure,
+      candidate.originalCause,
+      candidate.cleanupError,
+    );
+  }
+
+  return false;
 }

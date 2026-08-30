@@ -168,6 +168,31 @@ describe("AppView", () => {
     expect(callbacks.onCleanupInspectionConfirmed).toHaveBeenCalledOnce();
   });
 
+  it("directs interrupted metadata-cache recovery to the Kindle storage root", () => {
+    const root = document.createElement("div");
+    new AppView(root, {
+      ...initialAppState(),
+      pendingObjectCleanup: {
+        version: 1,
+        purpose: "metadata-cache",
+        stage: "handle-assigned",
+        filename: ".kindle-bridge-device-metadata-cache-v1-a.json",
+        vendorId: 0x1949,
+        productId: 0x9981,
+        storageId: 1,
+        parentHandle: 0xffff_ffff,
+        size: 1_024,
+        handle: 4,
+        operationId: "operation-cache-recovery",
+        recordedAt: Date.now(),
+      },
+    }, handlers(), new DebugLog(), { autoStartCatalog: false });
+
+    expect(root.querySelector(".recovery-notice")?.textContent).toContain(
+      "Inspect the Kindle storage root",
+    );
+  });
+
   it("forwards the conversion action", () => {
     const root = document.createElement("div");
     const callbacks = handlers();
