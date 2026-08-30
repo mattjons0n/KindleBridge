@@ -2,6 +2,7 @@ import {
   KindleDevice,
   KindleDeviceError,
   acquireKindleDeviceLease,
+  createKindleModificationDateProbe,
   createKindleMetadataCache,
   derivePseudonymousKindleIdentity,
   type KindleBookTransferResult,
@@ -13,6 +14,7 @@ import {
   type KindleInventoryOptions,
   type KindleInventorySnapshot,
   type KindleMetadataCache,
+  type KindleModificationDateProbe,
   type KindleSelfTestResult,
   type KindleTransferProgress,
 } from "./kindle";
@@ -79,9 +81,12 @@ export interface OpenKindleOptions extends MtpOperationOptions {
   readonly kindleOptions?: KindleDeviceOptions;
   /** Injectable browser-local acceleration; raw Kindle inventory never leaves the browser. */
   readonly metadataCache?: KindleMetadataCache;
+  /** Injectable, page-local aggregate probe; it never persists or logs raw device values. */
+  readonly modificationDateProbe?: KindleModificationDateProbe;
 }
 
 const defaultKindleMetadataCache = createKindleMetadataCache();
+const defaultKindleModificationDateProbe = createKindleModificationDateProbe();
 
 export class KindleRuntimeBusyError extends Error {
   readonly code = "KINDLE_OPERATION_BUSY" as const;
@@ -434,6 +439,7 @@ export async function openKindle(
     identitySecretProvider,
     kindleOptions,
     metadataCache = defaultKindleMetadataCache,
+    modificationDateProbe = defaultKindleModificationDateProbe,
     ...operationOptions
   } = options;
   let details = initialDetails(device);
@@ -484,7 +490,9 @@ export async function openKindle(
     const kindle = new KindleDevice(
       store,
       kindleOptions,
-      identity === undefined ? undefined : { cache: metadataCache, identity },
+      identity === undefined
+        ? undefined
+        : { cache: metadataCache, identity, modificationDateProbe },
     );
     const target = await kindle.inspect(0, operationOptions);
     details = {

@@ -20,6 +20,12 @@ import type {
   KindleMetadataCacheEntry,
   KindleMetadataCacheEvidence,
 } from "./metadata-cache";
+import {
+  isCanonicalMtpModificationDate,
+  type KindleModificationDateProbe,
+  type KindleModificationDateProbeCandidate,
+  type KindleModificationDateProbeSummary,
+} from "./modification-date-diagnostics";
 import { isFatalTransportFailure } from "../error-diagnostics";
 
 const UINT32_MAX = 0xffff_ffff;
@@ -259,6 +265,7 @@ export interface KindleInventoryMetadataCacheDiagnostics {
     readonly writeAttemptedObjectCount: number;
     readonly writeAcceptedObjectCount: number;
   };
+  readonly modificationDateProbe?: KindleModificationDateProbeSummary;
   readonly device?: KindleInventoryDeviceMetadataCacheDiagnostics;
 }
 
@@ -290,6 +297,7 @@ export interface KindleInventoryFolderSeed {
 export interface KindleInventoryMetadataCacheContext {
   readonly cache: KindleMetadataCache;
   readonly identity: PseudonymousKindleIdentity;
+  readonly modificationDateProbe?: KindleModificationDateProbe;
 }
 
 /** Strictly decoded cache files discovered on the selected Kindle storage. */
@@ -457,10 +465,8 @@ function safeRelativePath(parent: string, filename: string, maxLength: number): 
   };
 }
 
-const MTP_MODIFICATION_DATE_PATTERN = /^\d{8}T\d{6}(?:\.\d{1,9})?(?:Z|[+-]\d{4})?$/u;
-
 function safeModificationDate(value: string): string | undefined {
-  return MTP_MODIFICATION_DATE_PATTERN.test(value) ? value : undefined;
+  return isCanonicalMtpModificationDate(value) ? value : undefined;
 }
 
 function metadataIsConsistent(
@@ -928,6 +934,7 @@ async function enrichBookMetadata(
     readonly missingObjectCount: number;
     readonly invalidObjectCount: number;
   } = { missingObjectCount: 0, invalidObjectCount: 0 },
+  modificationDateProbe?: KindleModificationDateProbeSummary,
 ): Promise<{
   readonly objects: readonly KindleInventoryObject[];
   readonly summary: KindleInventoryMetadataSummary;
@@ -985,6 +992,7 @@ async function enrichBookMetadata(
           writeAttemptedObjectCount: 0,
           writeAcceptedObjectCount: 0,
         }),
+        ...(modificationDateProbe === undefined ? {} : { modificationDateProbe }),
       }),
     };
   }
@@ -1159,6 +1167,7 @@ async function enrichBookMetadata(
         writeAttemptedObjectCount: counters.browserWriteAttempts,
         writeAcceptedObjectCount: counters.browserWriteAccepted,
       }),
+      ...(modificationDateProbe === undefined ? {} : { modificationDateProbe }),
     }),
   };
 }
@@ -1187,6 +1196,7 @@ export async function buildKindleInventory(
   const issues: KindleInventoryIssue[] = [];
   let missingModificationDateObjectCount = 0;
   let invalidModificationDateObjectCount = 0;
+  const modificationDateProbeCandidates: KindleModificationDateProbeCandidate[] = [];
   const seenHandles = new Set<number>([target.documentsHandle]);
   const queue: FolderWork[] = [{
     handle: target.documentsHandle,
@@ -1347,6 +1357,16 @@ export async function buildKindleInventory(
         if (info.modificationDate.length === 0) missingModificationDateObjectCount += 1;
         else invalidModificationDateObjectCount += 1;
       }
+      if (isMetadataCacheDiagnosticCandidate(object)) {
+        modificationDateProbeCandidates.push({
+          relativePath: object.relativePath,
+          objectFormat: object.objectFormat,
+          size: object.size,
+          metadataAdjusted: object.metadataAdjusted,
+          uniquePath: false,
+          rawModificationDate: info.modificationDate,
+        });
+      }
       objects.push(object);
       if (kind === "folder" && !isKindleSidecarFolderFilename(info.filename)) {
         queue.push({
@@ -1358,6 +1378,17 @@ export async function buildKindleInventory(
       }
     }
   }
+
+  const probePathCounts = liveCachePathCounts(objects);
+  const modificationDateProbe = cacheContext?.modificationDateProbe?.observe({
+    deviceKey: cacheContext.identity.key,
+    storageId: target.storageId,
+    candidates: modificationDateProbeCandidates.map((candidate) => Object.freeze({
+      ...candidate,
+      uniquePath: candidate.relativePath.length > 0
+        && probePathCounts.get(portablePathKey(candidate.relativePath)) === 1,
+    })),
+  });
 
   const enrichment = await enrichBookMetadata(
     store,
@@ -1371,6 +1402,7 @@ export async function buildKindleInventory(
       missingObjectCount: missingModificationDateObjectCount,
       invalidObjectCount: invalidModificationDateObjectCount,
     },
+    modificationDateProbe,
   );
   return Object.freeze({
     status: issueCount === 0 ? "complete" : "partial",

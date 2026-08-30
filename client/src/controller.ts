@@ -1815,8 +1815,9 @@ export class AppController {
     const diagnostics = inventory.metadataCacheDiagnostics;
     if (diagnostics === undefined) return;
     const device = diagnostics.device;
+    const modificationDateProbe = diagnostics.modificationDateProbe;
     this.log.info("Kindle metadata cache diagnostics", {
-      schemaVersion: 1,
+      schemaVersion: 2,
       evidence: {
         candidateObjects: diagnostics.evidence.candidateObjectCount,
         validModificationDates: diagnostics.evidence.validModificationDateObjectCount,
@@ -1850,6 +1851,58 @@ export class AppController {
         writeAttempts: diagnostics.browser.writeAttemptedObjectCount,
         writeAccepted: diagnostics.browser.writeAcceptedObjectCount,
       },
+      ...(modificationDateProbe === undefined ? {} : {
+        modificationDateProbe: {
+          candidateObjects: modificationDateProbe.candidateObjectCount,
+          sampledObjects: modificationDateProbe.sampledObjectCount,
+          nonemptyValues: modificationDateProbe.nonemptyValueObjectCount,
+          truncated: modificationDateProbe.truncated,
+          distinctValues: modificationDateProbe.distinctValueCount,
+          mostCommonValueObjects: modificationDateProbe.mostCommonValueObjectCount,
+          codeUnitLength: {
+            minimum: modificationDateProbe.minimumCodeUnitLength,
+            maximum: modificationDateProbe.maximumCodeUnitLength,
+          },
+          shapes: {
+            canonicalMtp: modificationDateProbe.shapes.canonicalMtp,
+            basicColonOffset: modificationDateProbe.shapes.basicColonOffset,
+            extendedIso: modificationDateProbe.shapes.extendedIso,
+            extendedIsoSpace: modificationDateProbe.shapes.extendedIsoSpace,
+            lowercaseMarker: modificationDateProbe.shapes.lowercaseMarker,
+            surroundingWhitespace: modificationDateProbe.shapes.surroundingWhitespace,
+            trailingNull: modificationDateProbe.shapes.trailingNull,
+            digitsOnly: modificationDateProbe.shapes.digitsOnly,
+            controlOrNonAscii: modificationDateProbe.shapes.controlOrNonAscii,
+            overlong: modificationDateProbe.shapes.overlong,
+            other: modificationDateProbe.shapes.other,
+          },
+          features: {
+            hyphen: modificationDateProbe.features.hyphen,
+            colon: modificationDateProbe.features.colon,
+            period: modificationDateProbe.features.period,
+            plus: modificationDateProbe.features.plus,
+            whitespace: modificationDateProbe.features.whitespace,
+            lowercaseMarker: modificationDateProbe.features.lowercaseMarker,
+            controlOrNonAscii: modificationDateProbe.features.controlOrNonAscii,
+            trailingNull: modificationDateProbe.features.trailingNull,
+          },
+          reconnect: {
+            outcome: modificationDateProbe.reconnect.outcome,
+            comparableObjects: modificationDateProbe.reconnect.comparableObjectCount,
+            unchangedValues: modificationDateProbe.reconnect.unchangedValueObjectCount,
+            changedValues: modificationDateProbe.reconnect.changedValueObjectCount,
+            currentOnlyObjects: modificationDateProbe.reconnect.currentOnlyObjectCount,
+            previousOnlyObjects: modificationDateProbe.reconnect.previousOnlyObjectCount,
+          },
+          ...(modificationDateProbe.selfTest === undefined ? {} : {
+            selfTest: {
+              returnedShape: modificationDateProbe.selfTest.returnedShape,
+              returnedCodeUnitLength: modificationDateProbe.selfTest.returnedCodeUnitLength,
+              exactRequestedValueMatch: modificationDateProbe.selfTest.exactRequestedValueMatch,
+            },
+          }),
+        },
+      }),
       ...(device === undefined ? {} : {
         device: {
           mode: device.mode,

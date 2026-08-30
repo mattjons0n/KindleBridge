@@ -349,6 +349,54 @@ describe("AppController local conversion flow", () => {
           writeAcceptedObjectCount: 0,
           cacheKey: "private-cache-key",
         },
+        modificationDateProbe: {
+          candidateObjectCount: 81,
+          sampledObjectCount: 81,
+          nonemptyValueObjectCount: 81,
+          truncated: false,
+          distinctValueCount: 73,
+          mostCommonValueObjectCount: 3,
+          minimumCodeUnitLength: 20,
+          maximumCodeUnitLength: 24,
+          shapes: {
+            canonicalMtp: 0,
+            basicColonOffset: 0,
+            extendedIso: 81,
+            extendedIsoSpace: 0,
+            lowercaseMarker: 0,
+            surroundingWhitespace: 0,
+            trailingNull: 0,
+            digitsOnly: 0,
+            controlOrNonAscii: 0,
+            overlong: 0,
+            other: 0,
+          },
+          features: {
+            hyphen: 81,
+            colon: 81,
+            period: 3,
+            plus: 0,
+            whitespace: 0,
+            lowercaseMarker: 0,
+            controlOrNonAscii: 0,
+            trailingNull: 0,
+          },
+          reconnect: {
+            outcome: "compared",
+            comparableObjectCount: 81,
+            unchangedValueObjectCount: 81,
+            changedValueObjectCount: 0,
+            currentOnlyObjectCount: 0,
+            previousOnlyObjectCount: 0,
+          },
+          selfTest: {
+            returnedShape: "extended-iso",
+            returnedCodeUnitLength: 20,
+            exactRequestedValueMatch: false,
+            rawTimestamp: "2026-08-30T12:34:56Z",
+          },
+          representativeRawTimestamp: "2026-08-30T12:34:56Z",
+        },
         device: {
           mode: "read-write",
           loadOutcome: "loaded",
@@ -376,7 +424,7 @@ describe("AppController local conversion flow", () => {
       message === "Kindle metadata cache diagnostics"
     ));
     expect(entry?.context).toEqual({
-      schemaVersion: 1,
+      schemaVersion: 2,
       evidence: {
         candidateObjects: 81,
         validModificationDates: 0,
@@ -407,6 +455,51 @@ describe("AppController local conversion flow", () => {
         writeAttempts: 0,
         writeAccepted: 0,
       },
+      modificationDateProbe: {
+        candidateObjects: 81,
+        sampledObjects: 81,
+        nonemptyValues: 81,
+        truncated: false,
+        distinctValues: 73,
+        mostCommonValueObjects: 3,
+        codeUnitLength: { minimum: 20, maximum: 24 },
+        shapes: {
+          canonicalMtp: 0,
+          basicColonOffset: 0,
+          extendedIso: 81,
+          extendedIsoSpace: 0,
+          lowercaseMarker: 0,
+          surroundingWhitespace: 0,
+          trailingNull: 0,
+          digitsOnly: 0,
+          controlOrNonAscii: 0,
+          overlong: 0,
+          other: 0,
+        },
+        features: {
+          hyphen: 81,
+          colon: 81,
+          period: 3,
+          plus: 0,
+          whitespace: 0,
+          lowercaseMarker: 0,
+          controlOrNonAscii: 0,
+          trailingNull: 0,
+        },
+        reconnect: {
+          outcome: "compared",
+          comparableObjects: 81,
+          unchangedValues: 81,
+          changedValues: 0,
+          currentOnlyObjects: 0,
+          previousOnlyObjects: 0,
+        },
+        selfTest: {
+          returnedShape: "extended-iso",
+          returnedCodeUnitLength: 20,
+          exactRequestedValueMatch: false,
+        },
+      },
       device: {
         mode: "read-write",
         loadOutcome: "loaded",
@@ -429,6 +522,7 @@ describe("AppController local conversion flow", () => {
     expect(formatted).not.toContain("private-cache-key");
     expect(formatted).not.toContain("Private title");
     expect(formatted).not.toContain("device-supplied private error");
+    expect(formatted).not.toContain("2026-08-30T12:34:56Z");
   });
 
   it("journals an interrupted root-cache write and reruns the safe sequence after acknowledgement", async () => {

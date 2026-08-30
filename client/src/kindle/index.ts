@@ -10,4 +10,5 @@ export * from "./inventory";
 export * from "./kindle-device";
 export * from "./matching";
 export * from "./metadata-cache";
+export * from "./modification-date-diagnostics";
 export * from "./self-test-payload";

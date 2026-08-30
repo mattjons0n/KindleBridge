@@ -11,6 +11,10 @@ import {
   createKindleMetadataCache,
   type KindleMetadataCache,
 } from "../../client/src/kindle/metadata-cache";
+import {
+  createKindleModificationDateProbe,
+  type KindleModificationDateProbe,
+} from "../../client/src/kindle/modification-date-diagnostics";
 import { makeKindleBookFixture } from "./book-fixture";
 import { FakeKindleObjectStore, objectInfo } from "./fake-store";
 
@@ -29,6 +33,7 @@ const cacheIdentity = Object.freeze({
 function cacheEnabledDevice(
   store: FakeKindleObjectStore,
   cache: KindleMetadataCache,
+  modificationDateProbe?: KindleModificationDateProbe,
 ): KindleDevice {
   return new KindleDevice(
     store,
@@ -36,7 +41,11 @@ function cacheEnabledDevice(
       now: () => new Date("2026-08-29T12:00:00Z"),
       random: () => 0,
     },
-    { cache, identity: cacheIdentity },
+    {
+      cache,
+      identity: cacheIdentity,
+      ...(modificationDateProbe === undefined ? {} : { modificationDateProbe }),
+    },
   );
 }
 
@@ -477,6 +486,53 @@ describe("recursive Kindle Documents inventory", () => {
       });
     }
     expect(store.readRequests).toEqual([{ handle: 11, maxBytes: book.byteLength }]);
+  });
+
+  it("diagnoses an invalid timestamp shape and its same-page reconnect stability", async () => {
+    const store = new FakeKindleObjectStore();
+    const cache = createKindleMetadataCache({ persistence: null, now: () => 1_300 });
+    const probe = createKindleModificationDateProbe();
+    store.objects.set(11, objectInfo(11, {
+      parentHandle: 10,
+      filename: "shape-probe.azw3",
+      modificationDate: "2026-08-29T12:00:00Z",
+    }));
+    store.metadataMutation = (info) => ({
+      ...info,
+      modificationDate: "2026-08-29T12:00:00Z",
+    });
+
+    const firstDevice = cacheEnabledDevice(store, cache, probe);
+    await firstDevice.runSelfTest();
+    const first = await firstDevice.inventory({
+      bookMetadata: false,
+      deviceMetadataCache: false,
+    });
+    expect(first.metadataCacheDiagnostics?.modificationDateProbe).toMatchObject({
+      candidateObjectCount: 1,
+      nonemptyValueObjectCount: 1,
+      shapes: { extendedIso: 1 },
+      reconnect: { outcome: "no-previous-snapshot" },
+      selfTest: {
+        returnedShape: "extended-iso",
+        exactRequestedValueMatch: false,
+      },
+    });
+
+    const secondDevice = cacheEnabledDevice(store, cache, probe);
+    await secondDevice.runSelfTest();
+    const second = await secondDevice.inventory({
+      bookMetadata: false,
+      deviceMetadataCache: false,
+    });
+    expect(second.metadataCacheDiagnostics?.modificationDateProbe?.reconnect).toEqual({
+      outcome: "compared",
+      comparableObjectCount: 1,
+      unchangedValueObjectCount: 1,
+      changedValueObjectCount: 0,
+      currentOnlyObjectCount: 0,
+      previousOnlyObjectCount: 0,
+    });
   });
 
   it("reports a failed browser-cache lookup while preserving the live inventory", async () => {

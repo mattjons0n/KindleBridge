@@ -383,6 +383,8 @@ export class KindleDevice {
 
     let handle: number | undefined;
     let primaryFailure: unknown;
+    let verifiedModificationDate: string | undefined;
+    const requestedModificationDate = this.now();
     try {
       const created = await this.store.createObject(
         {
@@ -392,14 +394,14 @@ export class KindleDevice {
           objectFormat: MTP_OBJECT_FORMAT_TEXT,
           size: payload.byteLength,
           data: payload,
-          modificationDate: this.now(),
+          modificationDate: requestedModificationDate,
           onObjectState: options.onObjectState,
         },
         options,
       );
       handle = created.handle;
       this.recordCreated(created);
-      await this.verifyObject(
+      const verified = await this.verifyObject(
         {
           handle,
           storageId: target.storageId,
@@ -409,6 +411,7 @@ export class KindleDevice {
         },
         options,
       );
+      verifiedModificationDate = verified.modificationDate;
 
       const readback = await this.store.readObject(handle, {
         ...options,
@@ -466,6 +469,14 @@ export class KindleDevice {
     };
 
     this.selfTestPassed = true;
+    if (verifiedModificationDate !== undefined) {
+      this.inventoryMetadataCacheContext?.modificationDateProbe?.recordSelfTest({
+        deviceKey: this.inventoryMetadataCacheContext.identity.key,
+        storageId: target.storageId,
+        requestedModificationDate,
+        returnedModificationDate: verifiedModificationDate,
+      });
+    }
     return {
       filename,
       handle,
