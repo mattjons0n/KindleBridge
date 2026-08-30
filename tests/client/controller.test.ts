@@ -311,8 +311,27 @@ describe("AppController local conversion flow", () => {
     });
   });
 
-  it("logs only whitelisted aggregate Kindle metadata-cache diagnostics", async () => {
+  it("logs exact development timestamp evidence without unrelated private fields", async () => {
     const app = harness();
+    const exactTimestamp = "2026-08-30T12:34:56Z";
+    const utf16LeBase64 = (value: string): string => btoa([...value]
+      .map((character) => {
+        const codeUnit = character.charCodeAt(0);
+        return String.fromCharCode(codeUnit & 0xff, codeUnit >>> 8);
+      })
+      .join(""));
+    const exactTimestampUtf16LeBase64 = utf16LeBase64(exactTimestamp);
+    const exactValues = [
+      { value: exactTimestamp, utf16LeBase64: exactTimestampUtf16LeBase64, objectCount: 17 },
+      ...Array.from({ length: 64 }, (_, index) => {
+        const value = `device-value-${index.toString().padStart(2, "0")}`;
+        return {
+          value,
+          utf16LeBase64: utf16LeBase64(value),
+          objectCount: 1,
+        };
+      }),
+    ];
     const diagnosticInventory = {
       ...app.connection.latestInventory!,
       metadataCacheDiagnostics: {
@@ -354,8 +373,8 @@ describe("AppController local conversion flow", () => {
           sampledObjectCount: 81,
           nonemptyValueObjectCount: 81,
           truncated: false,
-          distinctValueCount: 73,
-          mostCommonValueObjectCount: 3,
+          distinctValueCount: 65,
+          mostCommonValueObjectCount: 17,
           minimumCodeUnitLength: 20,
           maximumCodeUnitLength: 24,
           shapes: {
@@ -393,9 +412,11 @@ describe("AppController local conversion flow", () => {
             returnedShape: "extended-iso",
             returnedCodeUnitLength: 20,
             exactRequestedValueMatch: false,
-            rawTimestamp: "2026-08-30T12:34:56Z",
+            requestedValue: "20260830T123456Z",
+            returnedValue: exactTimestamp,
+            returnedUtf16LeBase64: exactTimestampUtf16LeBase64,
           },
-          representativeRawTimestamp: "2026-08-30T12:34:56Z",
+          exactValues,
         },
         device: {
           mode: "read-write",
@@ -424,7 +445,7 @@ describe("AppController local conversion flow", () => {
       message === "Kindle metadata cache diagnostics"
     ));
     expect(entry?.context).toEqual({
-      schemaVersion: 2,
+      schemaVersion: 3,
       evidence: {
         candidateObjects: 81,
         validModificationDates: 0,
@@ -460,8 +481,8 @@ describe("AppController local conversion flow", () => {
         sampledObjects: 81,
         nonemptyValues: 81,
         truncated: false,
-        distinctValues: 73,
-        mostCommonValueObjects: 3,
+        distinctValues: 65,
+        mostCommonValueObjects: 17,
         codeUnitLength: { minimum: 20, maximum: 24 },
         shapes: {
           canonicalMtp: 0,
@@ -498,6 +519,9 @@ describe("AppController local conversion flow", () => {
           returnedShape: "extended-iso",
           returnedCodeUnitLength: 20,
           exactRequestedValueMatch: false,
+          requestedValue: "20260830T123456Z",
+          returnedValue: exactTimestamp,
+          returnedUtf16LeBase64: exactTimestampUtf16LeBase64,
         },
       },
       device: {
@@ -517,12 +541,28 @@ describe("AppController local conversion flow", () => {
         cachePayloadBytes: 167,
       },
     });
+    const exactEntries = app.controller.log.entries.filter(({ message }) => (
+      message === "Kindle modification-date exact values"
+    ));
+    expect(exactEntries.map(({ context }) => context)).toEqual([{
+      schemaVersion: 1,
+      chunk: 1,
+      chunks: 2,
+      totalDistinctValues: 65,
+      values: exactValues.slice(0, 64),
+    }, {
+      schemaVersion: 1,
+      chunk: 2,
+      chunks: 2,
+      totalDistinctValues: 65,
+      values: exactValues.slice(64),
+    }]);
     const formatted = app.controller.log.format();
     expect(formatted).not.toContain("private-book.azw3");
     expect(formatted).not.toContain("private-cache-key");
     expect(formatted).not.toContain("Private title");
     expect(formatted).not.toContain("device-supplied private error");
-    expect(formatted).not.toContain("2026-08-30T12:34:56Z");
+    expect(formatted).toContain(exactTimestamp);
   });
 
   it("journals an interrupted root-cache write and reruns the safe sequence after acknowledgement", async () => {

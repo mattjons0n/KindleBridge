@@ -66,7 +66,16 @@ export interface KindleModificationDateProbeSummary {
     readonly returnedShape: KindleModificationDateShape;
     readonly returnedCodeUnitLength: number;
     readonly exactRequestedValueMatch: boolean;
+    readonly requestedValue: string;
+    readonly returnedValue: string;
+    readonly returnedUtf16LeBase64: string;
   };
+  /** Exact development evidence, emitted to the browser debug log in bounded chunks. */
+  readonly exactValues: readonly {
+    readonly value: string;
+    readonly utf16LeBase64: string;
+    readonly objectCount: number;
+  }[];
 }
 
 export interface KindleModificationDateProbeCandidate {
@@ -183,6 +192,15 @@ function requestedMtpTimestamp(value: Date): string {
   return `${iso.slice(0, 4)}${iso.slice(5, 7)}${iso.slice(8, 10)}T${iso.slice(11, 13)}${iso.slice(14, 16)}${iso.slice(17, 19)}Z`;
 }
 
+function utf16LeBase64(value: string): string {
+  let binary = "";
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+    binary += String.fromCharCode(codeUnit & 0xff, codeUnit >>> 8);
+  }
+  return btoa(binary);
+}
+
 function observationKey(deviceKey: string, storageId: number): string {
   return `${deviceKey}\u0000${storageId.toString(10)}`;
 }
@@ -209,11 +227,14 @@ export function createKindleModificationDateProbe(): KindleModificationDateProbe
   return Object.freeze({
     recordSelfTest(observation: KindleModificationDateSelfTestObservation): void {
       const state = stateFor(observationKey(observation.deviceKey, observation.storageId));
+      const requestedValue = requestedMtpTimestamp(observation.requestedModificationDate);
       state.selfTest = Object.freeze({
         returnedShape: classifyKindleModificationDate(observation.returnedModificationDate),
         returnedCodeUnitLength: observation.returnedModificationDate.length,
-        exactRequestedValueMatch:
-          observation.returnedModificationDate === requestedMtpTimestamp(observation.requestedModificationDate),
+        exactRequestedValueMatch: observation.returnedModificationDate === requestedValue,
+        requestedValue,
+        returnedValue: observation.returnedModificationDate,
+        returnedUtf16LeBase64: utf16LeBase64(observation.returnedModificationDate),
       });
     },
 
@@ -277,6 +298,13 @@ export function createKindleModificationDateProbe(): KindleModificationDateProbe
         }
       }
       state.snapshot = currentSnapshot;
+      const exactValues = Object.freeze([...valueCounts.entries()]
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([value, objectCount]) => Object.freeze({
+          value,
+          utf16LeBase64: utf16LeBase64(value),
+          objectCount,
+        })));
 
       return Object.freeze({
         candidateObjectCount: observation.candidates.length,
@@ -299,6 +327,7 @@ export function createKindleModificationDateProbe(): KindleModificationDateProbe
           previousOnlyObjectCount,
         }),
         ...(state.selfTest === undefined ? {} : { selfTest: state.selfTest }),
+        exactValues,
       });
     },
   });

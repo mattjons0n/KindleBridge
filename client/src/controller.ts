@@ -1817,7 +1817,7 @@ export class AppController {
     const device = diagnostics.device;
     const modificationDateProbe = diagnostics.modificationDateProbe;
     this.log.info("Kindle metadata cache diagnostics", {
-      schemaVersion: 2,
+      schemaVersion: 3,
       evidence: {
         candidateObjects: diagnostics.evidence.candidateObjectCount,
         validModificationDates: diagnostics.evidence.validModificationDateObjectCount,
@@ -1899,6 +1899,10 @@ export class AppController {
               returnedShape: modificationDateProbe.selfTest.returnedShape,
               returnedCodeUnitLength: modificationDateProbe.selfTest.returnedCodeUnitLength,
               exactRequestedValueMatch: modificationDateProbe.selfTest.exactRequestedValueMatch,
+              requestedValue: modificationDateProbe.selfTest.requestedValue,
+              returnedValue: modificationDateProbe.selfTest.returnedValue,
+              returnedUtf16LeBase64:
+                modificationDateProbe.selfTest.returnedUtf16LeBase64,
             },
           }),
         },
@@ -1929,6 +1933,23 @@ export class AppController {
         },
       }),
     });
+    if (modificationDateProbe !== undefined && modificationDateProbe.exactValues.length > 0) {
+      const chunkSize = 64;
+      const chunkCount = Math.ceil(modificationDateProbe.exactValues.length / chunkSize);
+      for (let offset = 0; offset < modificationDateProbe.exactValues.length; offset += chunkSize) {
+        this.log.info("Kindle modification-date exact values", {
+          schemaVersion: 1,
+          chunk: Math.floor(offset / chunkSize) + 1,
+          chunks: chunkCount,
+          totalDistinctValues: modificationDateProbe.exactValues.length,
+          values: modificationDateProbe.exactValues.slice(offset, offset + chunkSize).map((entry) => ({
+            value: entry.value,
+            utf16LeBase64: entry.utf16LeBase64,
+            objectCount: entry.objectCount,
+          })),
+        });
+      }
+    }
   }
 
   async #reconcileCatalogInventory(

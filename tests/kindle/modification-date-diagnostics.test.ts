@@ -27,7 +27,7 @@ function candidate(
   };
 }
 
-describe("privacy-safe Kindle modification-date diagnostics", () => {
+describe("Kindle modification-date diagnostics", () => {
   it("classifies fixed timestamp shapes without returning raw values", () => {
     expect(classifyKindleModificationDate("20260830T123456Z")).toBe("canonical-mtp");
     expect(classifyKindleModificationDate("20260830T123456+02:00")).toBe("basic-colon-offset");
@@ -39,7 +39,7 @@ describe("privacy-safe Kindle modification-date diagnostics", () => {
     expect(classifyKindleModificationDate("1725021296000")).toBe("digits-only");
   });
 
-  it("reports aggregate shape and exact reconnect stability only", () => {
+  it("reports exact raw values, their code units, and reconnect stability", () => {
     const probe = createKindleModificationDateProbe();
     const privateDate = "2026-08-30T12:34:56Z";
     probe.recordSelfTest({
@@ -76,8 +76,22 @@ describe("privacy-safe Kindle modification-date diagnostics", () => {
         returnedShape: "extended-iso",
         returnedCodeUnitLength: 20,
         exactRequestedValueMatch: false,
+        requestedValue: "20260830T123456Z",
+        returnedValue: privateDate,
       },
     });
+    const privateDateUtf16LeBase64 = btoa([...privateDate]
+      .map((value) => {
+        const codeUnit = value.charCodeAt(0);
+        return String.fromCharCode(codeUnit & 0xff, codeUnit >>> 8);
+      })
+      .join(""));
+    expect(first.selfTest?.returnedUtf16LeBase64).toBe(privateDateUtf16LeBase64);
+    expect(first.exactValues).toEqual([{
+      value: privateDate,
+      utf16LeBase64: privateDateUtf16LeBase64,
+      objectCount: 2,
+    }]);
 
     const second = probe.observe({
       deviceKey: identity,
@@ -97,7 +111,7 @@ describe("privacy-safe Kindle modification-date diagnostics", () => {
       previousOnlyObjectCount: 0,
     });
     const serialized = JSON.stringify({ first, second });
-    expect(serialized).not.toContain(privateDate);
+    expect(serialized).toContain(privateDate);
     expect(serialized).not.toContain("Private/One.azw3");
     expect(serialized).not.toContain(identity);
   });

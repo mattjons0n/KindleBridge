@@ -225,9 +225,9 @@ export interface KindleInventoryDeviceMetadataCacheDiagnostics {
 }
 
 /**
- * Aggregate, privacy-safe cache telemetry. Counts can diagnose optional-cache
- * misses without retaining paths, timestamps, book metadata, identities, or
- * device handles in the debug log.
+ * Bounded cache telemetry plus explicit development timestamp evidence.
+ * Exact modification-date values are intentionally included; paths, book
+ * metadata, identities, and device handles remain outside the debug log.
  */
 export interface KindleInventoryMetadataCacheDiagnostics {
   readonly evidence: {
