@@ -9,7 +9,7 @@ container evidence passed. `[ ]` deliberately identifies release-host,
 household-data, browser-memory, secure-origin, or physical-device evidence that
 cannot be inferred from mocks or localhost.
 
-The authoritative root gate passed 49/49 test files and 533/533 tests, followed
+The authoritative root gate passed 49/49 test files and 536/536 tests, followed
 by successful client typechecking, server build, and production Vite build. The
 generic operator template in `deploy/docker/RELEASE_CHECKLIST.md` remains
 unchecked until a concrete release image, host, origin, and Kindle are accepted.
@@ -148,7 +148,7 @@ unchecked until a concrete release image, host, origin, and Kindle are accepted.
 
 ## Verification and release evidence
 
-- [x] Root unit, database, filesystem, API, parser-security, browser, MTP-fault, deployment, and integration gate passes: 49/49 files and 533/533 tests, plus client typecheck, server build, and production Vite build.
+- [x] Root unit, database, filesystem, API, parser-security, browser, MTP-fault, deployment, and integration gate passes: 49/49 files and 536/536 tests, plus client typecheck, server build, and production Vite build.
 - [x] A directly generated 10,000-row database corpus covers FTS, filtering, pagination, and complete match-index query budgets; no full filesystem scan is inferred from it.
 - [x] Current schema-v13 native `linux/arm64` hardened-container smoke covers health/readiness, API catalog/search/facets/source/cover/delivery, restart persistence, read-only root/source, Host/Origin rejection, and security headers.
 - [x] Current-image restore and catalog/cache rebuild smoke preserves profile/root/stable-book/delivery evidence, recreates derived data, and returns the exact original 459,174-byte source with its indexed SHA-256.

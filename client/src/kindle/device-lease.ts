@@ -11,7 +11,6 @@ export interface BrowserLockManagerLike {
     options: {
       readonly mode: "exclusive";
       readonly ifAvailable: true;
-      readonly signal?: AbortSignal;
     },
     callback: (lock: BrowserLockLike | null) => Promise<T> | T,
   ): Promise<T>;
@@ -72,6 +71,7 @@ async function acquireBrowserLock(
   lockName: string,
   signal: AbortSignal | undefined,
 ): Promise<KindleDeviceLease> {
+  throwIfAborted(signal);
   let resolveAcquisition: (lease: KindleDeviceLease | undefined) => void = () => undefined;
   let rejectAcquisition: (error: unknown) => void = () => undefined;
   let resolveHold: () => void = () => undefined;
@@ -97,29 +97,58 @@ async function acquireBrowserLock(
     },
   };
 
-  requestCompletion = manager.request(
-    lockName,
-    {
-      mode: "exclusive",
-      ifAvailable: true,
-      ...(signal === undefined ? {} : { signal }),
-    },
-    async (lock) => {
-      if (!lock) {
-        resolveAcquisition(undefined);
-        return;
-      }
-      resolveAcquisition(lease);
-      await hold;
-    },
-  );
+  const rejectOnAbort = (): void => {
+    try {
+      throwIfAborted(signal);
+    } catch (error) {
+      rejectAcquisition(error);
+    }
+  };
+  signal?.addEventListener("abort", rejectOnAbort, { once: true });
+
+  try {
+    requestCompletion = manager.request(
+      lockName,
+      {
+        mode: "exclusive",
+        ifAvailable: true,
+      },
+      async (lock) => {
+        // Web Locks forbids combining `signal` with `ifAvailable`. Preserve
+        // cancellation by rejecting while pending and refusing any late grant.
+        throwIfAborted(signal);
+        if (!lock) {
+          resolveAcquisition(undefined);
+          return;
+        }
+        resolveAcquisition(lease);
+        await hold;
+      },
+    );
+  } catch (error) {
+    signal?.removeEventListener("abort", rejectOnAbort);
+    throw error;
+  }
   void requestCompletion.catch((error) => rejectAcquisition(error));
 
-  const result = await acquired;
+  let result: KindleDeviceLease | undefined;
+  try {
+    result = await acquired;
+  } finally {
+    signal?.removeEventListener("abort", rejectOnAbort);
+  }
   if (!result) {
     // The callback has already completed when `ifAvailable` returns null.
     await requestCompletion;
     throw new KindleDeviceLeaseError();
+  }
+  try {
+    throwIfAborted(signal);
+  } catch (error) {
+    // An abort may win between the lock callback and this continuation. Do not
+    // leave a browser-wide lock held by a caller that never received the lease.
+    await result.release();
+    throw error;
   }
   return result;
 }

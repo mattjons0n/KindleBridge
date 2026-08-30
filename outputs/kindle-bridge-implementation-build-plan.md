@@ -48,7 +48,7 @@ Milestones 0–9 now implement the production software that was absent from that
 - a reproducibly rebuilt boko artifact with pre-retention archive, spine, DOM/IR/style, MathML, normalized XHTML/CSS, cache, and 200 MiB AZW3-output limits plus actual-WASM hostile-input regressions;
 - strict host/origin controls and documented private HTTPS reverse-proxy/VPN operation.
 
-The original automated baseline was 18 test files and 133 passing tests; it is historical. The authoritative 2026-08-30 root `npm run check` completed with 49/49 test files and 533/533 tests, followed by successful client typechecking, server build, and production Vite build. Physical success still applies only to the earlier transfer POC. A fresh physical integrated journey, real household-mount/private-origin checks, and measured peak browser memory remain Milestone 10.
+The original automated baseline was 18 test files and 133 passing tests; it is historical. The authoritative 2026-08-30 root `npm run check` completed with 49/49 test files and 536/536 tests, followed by successful client typechecking, server build, and production Vite build. Physical success still applies only to the earlier transfer POC. A fresh physical integrated journey, real household-mount/private-origin checks, and measured peak browser memory remain Milestone 10.
 
 ## 3. Implemented architecture
 
@@ -148,7 +148,7 @@ Exit gate:
 
 - The target Docker environment and network boundary are documented.
 - A public unauthenticated route is explicitly rejected.
-- The expanded root `npm run check` gate passes at 49/49 files and 533/533 tests, with client typechecking and both production builds green.
+- The expanded root `npm run check` gate passes at 49/49 files and 536/536 tests, with client typechecking and both production builds green.
 
 ### Milestone 1 — Full-stack foundation — Implemented
 
@@ -468,7 +468,7 @@ Mocks can prove behavior, not Kindle acceptance. Any release that changes conver
 
 ## 10. Completion and next gate
 
-The read-only catalog slice and the later watcher, inventory, reconciliation, Send, converter-hardening, recovery, and Docker software are implemented. The authoritative root gate passes at 49/49 files and 533/533 tests with typechecking and production builds. The current schema-v13 local image passes restore/rebuild, hardened native arm64, cross-runtime amd64, and attested dual-architecture OCI acceptance. Before household release:
+The read-only catalog slice and the later watcher, inventory, reconciliation, Send, converter-hardening, recovery, and Docker software are implemented. The authoritative root gate passes at 49/49 files and 536/536 tests with typechecking and production builds. The current schema-v13 local image passes restore/rebuild, hardened native arm64, cross-runtime amd64, and attested dual-architecture OCI acceptance. Before household release:
 
 1. Repeat the expanded journey on the physical Kindle: user-initiated chooser, automatic exact-byte self-test, complete/partial inventory behavior, confirmed/possible matching, catalog-driven Send, Kindle indexing/open/navigation/cover, reconnect, and durable match recovery.
 2. Configure the real husband and wife read-only host mounts, including multiple roots, and verify profile scope, incremental ingestion, source health, byte-identical originals, mount loss/restoration, backup/restore, and rebuild on the intended host.

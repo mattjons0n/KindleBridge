@@ -173,6 +173,35 @@ async function expectedIdentityKey(device: FakeUsbDevice): Promise<string> {
 }
 
 describe("openKindle cross-layer orchestration", () => {
+  it("does not open WebUSB when cancellation wins as the device lease settles", async () => {
+    const device = new FakeUsbDevice();
+    const usb = new FakeUsbManager();
+    const controller = new AbortController();
+    const release = vi.fn(async () => undefined);
+    const leaseProvider = {
+      acquire: vi.fn(async () => {
+        controller.abort(new DOMException("cancelled after lease", "AbortError"));
+        return {
+          scope: "browser" as const,
+          released: false,
+          release,
+        };
+      }),
+    };
+
+    await expect(openKindle(device, {
+      onDescriptor: () => undefined,
+      onUsbOpen: () => undefined,
+      onMtpReading: () => undefined,
+    }, usb, {
+      signal: controller.signal,
+      leaseProvider,
+    })).rejects.toMatchObject({ name: "AbortError" });
+
+    expect(device.calls).toEqual([]);
+    expect(release).toHaveBeenCalledOnce();
+  });
+
   it("retains the cross-tab writer lease until late native USB work really settles", async () => {
     const device = new FakeUsbDevice();
     const session = { isOpen: false, close: vi.fn(async () => undefined) };

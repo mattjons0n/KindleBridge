@@ -439,6 +439,7 @@ export async function openKindle(
     lease = leaseProvider
       ? await leaseProvider.acquire({ signal: operationOptions.signal })
       : await acquireKindleDeviceLease({ signal: operationOptions.signal });
+    operationOptions.signal?.throwIfAborted();
     transport = await WebUsbBulkTransport.connect(device, { usb });
     operationOptions.signal?.throwIfAborted();
     details = {
