@@ -1,0 +1,57 @@
+//! Style system for CSS property types, computed styles, and cascade.
+//!
+//! This module contains:
+//! - CSS property types (Color, Length, Display, etc.)
+//! - ComputedStyle and StylePool for style management
+//! - Declaration parsing and stylesheet handling
+//! - CSS cascade implementation
+
+mod cascade;
+mod declaration;
+pub(crate) mod parse;
+mod properties;
+mod style_pool;
+mod to_css;
+mod types;
+
+/// Serialize a style value back to its CSS text representation.
+///
+/// Implemented by all property value types and by `ComputedStyle` itself
+/// (which emits only non-default properties).
+pub trait ToCss {
+    /// Write this value as CSS to the buffer.
+    fn to_css(&self, buf: &mut String);
+
+    /// Convert to a CSS string (convenience method).
+    fn to_css_string(&self) -> String {
+        let mut buf = String::new();
+        self.to_css(&mut buf);
+        buf
+    }
+}
+
+// Re-export property types
+pub use properties::{
+    BorderCollapse, BorderStyle, BoxSizing, BreakValue, Clear, Color, DecorationStyle, Display,
+    Float, FontStyle, FontVariant, FontWeight, Hyphens, Length, ListStylePosition, ListStyleType,
+    OverflowWrap, TextAlign, TextTransform, VerticalAlign, Visibility, WhiteSpace, WordBreak,
+};
+
+// Re-export core style types
+pub use style_pool::StylePool;
+pub use to_css::{changed_property_value, changed_property_value_from, for_each_changed_property};
+pub use types::{AbsFontSize, ComputedStyle, StyleId};
+
+// Re-export declaration type (kept minimal)
+pub use declaration::Declaration;
+
+// Re-export stylesheet types from parse module
+pub use parse::{CssRule, InlineStyle, Origin, Specificity, Stylesheet, TextDecorationValue};
+
+// Re-export cascade function
+pub(crate) use cascade::inherit_from_parent;
+pub use cascade::{CascadeIndex, CascadeScratch, compute_styles, compute_styles_indexed};
+
+// Re-export macro for internal use
+#[allow(unused_imports)]
+pub(crate) use properties::enum_property;

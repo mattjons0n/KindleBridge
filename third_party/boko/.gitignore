@@ -1,0 +1,15 @@
+/target
+/fuzz/target
+/fuzz/artifacts
+/fuzz/Cargo.lock
+# Keep only the named seed inputs; libFuzzer regenerates the rest locally.
+/fuzz/corpus/from_bytes/*
+!/fuzz/corpus/from_bytes/seed_*
+# libFuzzer per-job worker logs (created wherever `cargo fuzz run` is invoked)
+fuzz-*.log
+perf.data
+/web/pkg
+*.pyc
+*.DS_Store
+kfxinput/
+/.claude/

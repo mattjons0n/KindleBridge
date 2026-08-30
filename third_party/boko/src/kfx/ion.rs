@@ -1,0 +1,1391 @@
+//! Amazon Ion binary format parser.
+//!
+//! Ion is Amazon's data serialization format used in KFX ebooks.
+//! This implements a minimal parser sufficient for reading KFX content.
+//!
+//! Reference: <https://amazon-ion.github.io/ion-docs/docs/binary.html>
+
+use std::io;
+
+/// Ion binary version marker (BVM)
+pub const ION_MAGIC: [u8; 4] = [0xe0, 0x01, 0x00, 0xea];
+
+/// Ion type codes
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum IonType {
+    Null = 0,
+    Bool = 1,
+    PosInt = 2,
+    NegInt = 3,
+    Float = 4,
+    Decimal = 5,
+    Timestamp = 6,
+    Symbol = 7,
+    String = 8,
+    Clob = 9,
+    Blob = 10,
+    List = 11,
+    Sexp = 12,
+    Struct = 13,
+    Annotation = 14,
+}
+
+impl IonType {
+    fn from_nibble(n: u8) -> Option<Self> {
+        match n {
+            0 => Some(IonType::Null),
+            1 => Some(IonType::Bool),
+            2 => Some(IonType::PosInt),
+            3 => Some(IonType::NegInt),
+            4 => Some(IonType::Float),
+            5 => Some(IonType::Decimal),
+            6 => Some(IonType::Timestamp),
+            7 => Some(IonType::Symbol),
+            8 => Some(IonType::String),
+            9 => Some(IonType::Clob),
+            10 => Some(IonType::Blob),
+            11 => Some(IonType::List),
+            12 => Some(IonType::Sexp),
+            13 => Some(IonType::Struct),
+            14 => Some(IonType::Annotation),
+            _ => None, // Reserved (15)
+        }
+    }
+}
+
+/// Parsed Ion value.
+///
+/// Symbols are stored as raw u64 IDs - use the KFX symbol table to resolve them.
+/// Structs use a Vec for fields (O(n) lookup) which is optimal for small structs
+/// typical in KFX data. Field order is preserved for serialization.
+#[derive(Debug, Clone)]
+pub enum IonValue {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    /// Decimal value stored as string for precision (e.g., "0.833333").
+    /// Encoded as Ion decimal (type 5) with coefficient + exponent.
+    Decimal(String),
+    /// Symbol ID (resolve via KFX_SYMBOL_TABLE or doc_symbols)
+    Symbol(u64),
+    String(String),
+    Blob(Vec<u8>),
+    List(Vec<IonValue>),
+    /// Struct fields as (symbol_id, value) pairs in parse order.
+    /// Order is preserved for both parsing and serialization.
+    Struct(Vec<(u64, IonValue)>),
+    /// Annotated value: (annotation symbol IDs, inner value)
+    Annotated(Vec<u64>, Box<IonValue>),
+}
+
+impl IonValue {
+    /// Get as string if this is a String value.
+    #[inline]
+    pub fn as_string(&self) -> Option<&str> {
+        match self {
+            IonValue::String(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Get as i64 if this is an Int value.
+    #[inline]
+    pub fn as_int(&self) -> Option<i64> {
+        match self {
+            IonValue::Int(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    /// Get as symbol ID if this is a Symbol value.
+    #[inline]
+    pub fn as_symbol(&self) -> Option<u64> {
+        match self {
+            IonValue::Symbol(id) => Some(*id),
+            _ => None,
+        }
+    }
+
+    /// Get as bool if this is a Bool value.
+    #[inline]
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            IonValue::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    /// Get as list if this is a List value.
+    #[inline]
+    pub fn as_list(&self) -> Option<&[IonValue]> {
+        match self {
+            IonValue::List(items) => Some(items),
+            _ => None,
+        }
+    }
+
+    /// Get struct fields if this is a Struct value.
+    #[inline]
+    pub fn as_struct(&self) -> Option<&[(u64, IonValue)]> {
+        match self {
+            IonValue::Struct(fields) => Some(fields),
+            _ => None,
+        }
+    }
+
+    /// Get float value if this is a Float value.
+    #[inline]
+    pub fn as_float(&self) -> Option<f64> {
+        match self {
+            IonValue::Float(f) => Some(*f),
+            _ => None,
+        }
+    }
+
+    /// Get field from struct by symbol ID. O(n) scan - optimal for small structs.
+    #[inline]
+    pub fn get(&self, symbol_id: u64) -> Option<&IonValue> {
+        self.as_struct()?
+            .iter()
+            .find(|(k, _)| *k == symbol_id)
+            .map(|(_, v)| v)
+    }
+
+    /// Unwrap annotated value to get inner value.
+    pub fn unwrap_annotated(&self) -> &IonValue {
+        match self {
+            IonValue::Annotated(_, inner) => inner.unwrap_annotated(),
+            other => other,
+        }
+    }
+}
+
+/// Maximum container nesting depth. KFX Ion is shallow in practice; this only
+/// exists to stop a crafted deeply-nested value from overflowing the stack.
+const MAX_ION_DEPTH: usize = 256;
+
+/// Ion binary parser.
+pub struct IonParser<'a> {
+    data: &'a [u8],
+    pos: usize,
+    depth: usize,
+    /// Remaining value budget. The depth cap bounds nesting but not the total
+    /// node count: a small crafted input can still expand into tens of
+    /// millions of `IonValue`s (a memory/CPU bomb — one 432-byte fuzz input
+    /// produced 33M nodes). A well-formed document has at most one value per
+    /// input byte, so a generous multiple of the input length is a safe cap.
+    budget: usize,
+}
+
+impl<'a> IonParser<'a> {
+    /// Create a new parser for the given data.
+    #[inline]
+    pub fn new(data: &'a [u8]) -> Self {
+        Self {
+            data,
+            pos: 0,
+            depth: 0,
+            budget: data.len().saturating_mul(16).saturating_add(1024),
+        }
+    }
+
+    /// Compute `self.pos + length` for a value whose `length` is a byte span,
+    /// erroring if it overruns the buffer. Container and skip types use this so a
+    /// crafted oversized length can neither loop forever nor slice out of bounds.
+    #[inline]
+    fn span_end(&self, length: usize) -> io::Result<usize> {
+        match self.pos.checked_add(length) {
+            Some(end) if end <= self.data.len() => Ok(end),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Ion value length exceeds buffer",
+            )),
+        }
+    }
+
+    /// Parse Ion data starting with the BVM marker.
+    pub fn parse(&mut self) -> io::Result<IonValue> {
+        if self.data.len() < 4 || self.data[..4] != ION_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "not Ion data (missing BVM)",
+            ));
+        }
+        self.pos = 4;
+        self.parse_value()
+    }
+
+    /// Parse a single Ion value at the current position, enforcing a recursion
+    /// depth limit so nested containers can't overflow the stack.
+    fn parse_value(&mut self) -> io::Result<IonValue> {
+        self.depth += 1;
+        if self.depth > MAX_ION_DEPTH {
+            self.depth -= 1;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Ion nesting too deep",
+            ));
+        }
+        let budget = self.budget.checked_sub(1);
+        let Some(budget) = budget else {
+            self.depth -= 1;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Ion value count exceeds limit",
+            ));
+        };
+        self.budget = budget;
+        let result = self.parse_value_inner();
+        self.depth -= 1;
+        result
+    }
+
+    /// Parse a single Ion value at current position.
+    fn parse_value_inner(&mut self) -> io::Result<IonValue> {
+        if self.pos >= self.data.len() {
+            return Ok(IonValue::Null);
+        }
+
+        let type_byte = self.data[self.pos];
+        self.pos += 1;
+
+        let type_code = type_byte >> 4;
+        let length_code = type_byte & 0x0f;
+
+        // Null is encoded as length_code 15 for any type
+        if length_code == 15 {
+            return Ok(IonValue::Null);
+        }
+
+        let ion_type = match IonType::from_nibble(type_code) {
+            Some(t) => t,
+            None => return Ok(IonValue::Null), // Reserved type
+        };
+
+        // Get actual length
+        let length = if length_code == 14 {
+            self.read_varuint()? as usize
+        } else {
+            length_code as usize
+        };
+
+        match ion_type {
+            IonType::Null => {
+                // Type 0 with length > 0 is a NOP pad, skip the bytes
+                self.pos = self.span_end(length)?;
+                Ok(IonValue::Null)
+            }
+
+            IonType::Bool => Ok(IonValue::Bool(length_code != 0)),
+
+            IonType::PosInt => {
+                let value = self.read_uint(length)?;
+                if value > i64::MAX as u64 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "positive integer too large for i64",
+                    ));
+                }
+                Ok(IonValue::Int(value as i64))
+            }
+
+            IonType::NegInt => {
+                let value = self.read_uint(length)?;
+                // For negative integers, the magnitude is stored, and we negate it.
+                // i64::MIN has magnitude 2^63, which fits in u64 but not as positive i64.
+                if value > (i64::MAX as u64) + 1 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "negative integer too large for i64",
+                    ));
+                }
+                // Handle i64::MIN specially (magnitude 2^63 can't be negated normally)
+                if value == (i64::MAX as u64) + 1 {
+                    Ok(IonValue::Int(i64::MIN))
+                } else {
+                    Ok(IonValue::Int(-(value as i64)))
+                }
+            }
+
+            IonType::Float => {
+                let value = match length {
+                    0 => 0.0, // Positive zero
+                    4 => {
+                        let bytes: [u8; 4] = self.read_bytes(4)?.try_into().unwrap();
+                        f32::from_be_bytes(bytes) as f64
+                    }
+                    8 => {
+                        let bytes: [u8; 8] = self.read_bytes(8)?.try_into().unwrap();
+                        f64::from_be_bytes(bytes)
+                    }
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "invalid float length",
+                        ));
+                    }
+                };
+                Ok(IonValue::Float(value))
+            }
+
+            IonType::Decimal => {
+                if length == 0 {
+                    return Ok(IonValue::Decimal("0".to_string()));
+                }
+
+                let end = self.span_end(length)?;
+
+                // Read exponent as VarInt (signed). It must stay inside this
+                // value's span: a crafted exponent that runs past `end` would
+                // consume bytes belonging to sibling values and silently
+                // mis-structure the document.
+                let (exponent, _) = self.read_varint()?;
+                if self.pos > end {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Ion decimal exponent overruns value",
+                    ));
+                }
+
+                // Read coefficient as signed Int (remaining bytes)
+                let coef_len = end.saturating_sub(self.pos);
+                let coefficient = if coef_len == 0 {
+                    0i64
+                } else {
+                    self.read_signed_int(coef_len)?
+                };
+
+                // Convert to decimal string
+                let value = if exponent == 0 {
+                    coefficient.to_string()
+                } else if exponent > 0 {
+                    // Positive exponent: shift left (multiply). The exponent is
+                    // attacker-controlled, so use checked arithmetic instead of
+                    // panicking on overflow.
+                    let multiplier = u32::try_from(exponent)
+                        .ok()
+                        .and_then(|e| 10i64.checked_pow(e))
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "Ion decimal exponent out of range",
+                            )
+                        })?;
+                    coefficient
+                        .checked_mul(multiplier)
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "Ion decimal coefficient overflow",
+                            )
+                        })?
+                        .to_string()
+                } else {
+                    // Negative exponent: we have decimal places. Like the
+                    // positive branch, the exponent is attacker-controlled —
+                    // bound it before allocating `abs_exp` zero digits. An
+                    // i64 coefficient never has more than 19 significant
+                    // digits, so anything beyond a generous cap is garbage.
+                    if exponent < -64 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Ion decimal exponent out of range",
+                        ));
+                    }
+                    let abs_exp = (-exponent) as usize;
+                    let coef_str = coefficient.abs().to_string();
+
+                    let decimal_str = if coef_str.len() <= abs_exp {
+                        // Need leading zeros: 5 with exp -3 -> 0.005
+                        let zeros = abs_exp - coef_str.len();
+                        format!("0.{}{}", "0".repeat(zeros), coef_str)
+                    } else {
+                        // Insert decimal point
+                        let split = coef_str.len() - abs_exp;
+                        format!("{}.{}", &coef_str[..split], &coef_str[split..])
+                    };
+
+                    if coefficient < 0 {
+                        format!("-{}", decimal_str)
+                    } else {
+                        decimal_str
+                    }
+                };
+
+                Ok(IonValue::Decimal(value))
+            }
+
+            IonType::Timestamp => {
+                // Skip - not used in KFX reading
+                self.pos = self.span_end(length)?;
+                Ok(IonValue::Null)
+            }
+
+            IonType::Symbol => {
+                let symbol_id = self.read_uint(length)?;
+                Ok(IonValue::Symbol(symbol_id))
+            }
+
+            IonType::String => {
+                let bytes = self.read_bytes(length)?;
+                let s = String::from_utf8_lossy(bytes).into_owned();
+                Ok(IonValue::String(s))
+            }
+
+            IonType::Blob | IonType::Clob => {
+                let bytes = self.read_bytes(length)?.to_vec();
+                Ok(IonValue::Blob(bytes))
+            }
+
+            IonType::List | IonType::Sexp => {
+                let end = self.span_end(length)?;
+                let mut items = Vec::new();
+                while self.pos < end {
+                    items.push(self.parse_value()?);
+                }
+                Ok(IonValue::List(items))
+            }
+
+            IonType::Struct => {
+                let end = self.span_end(length)?;
+                let mut fields = Vec::new();
+                while self.pos < end {
+                    let field_name = self.read_varuint()? as u64;
+                    let value = self.parse_value()?;
+                    fields.push((field_name, value));
+                }
+                Ok(IonValue::Struct(fields))
+            }
+
+            IonType::Annotation => {
+                let end = self.span_end(length)?;
+
+                // Read annotation length (VarUInt). The annotation-symbol
+                // span must stay inside the wrapper's own span, or a crafted
+                // length lets this value consume its siblings' bytes.
+                let ann_len = self.read_varuint()? as usize;
+                let ann_end = self.span_end(ann_len)?;
+                if ann_end > end {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Ion annotation overruns wrapper",
+                    ));
+                }
+
+                // Read annotation symbol IDs
+                let mut annotations = Vec::new();
+                while self.pos < ann_end {
+                    annotations.push(self.read_varuint()? as u64);
+                }
+
+                // Parse the annotated value
+                let inner = if self.pos < end {
+                    self.parse_value()?
+                } else {
+                    IonValue::Null
+                };
+
+                // Contain any malformed inner value: whatever it did or
+                // didn't consume, the wrapper ends exactly at `end`, so the
+                // parent's loop resumes at the right sibling boundary.
+                self.pos = end;
+
+                Ok(IonValue::Annotated(annotations, Box::new(inner)))
+            }
+        }
+    }
+
+    /// Read bytes from current position.
+    #[inline]
+    fn read_bytes(&mut self, len: usize) -> io::Result<&'a [u8]> {
+        let end = self
+            .pos
+            .checked_add(len)
+            .filter(|&end| end <= self.data.len())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::UnexpectedEof, "unexpected end of data")
+            })?;
+        let bytes = &self.data[self.pos..end];
+        self.pos = end;
+        Ok(bytes)
+    }
+
+    /// Read a VarUInt (7 bits per byte, MSB set on last byte).
+    #[inline]
+    fn read_varuint(&mut self) -> io::Result<u32> {
+        // Accumulate in u64: 5 seven-bit groups are 35 bits, so a u32
+        // accumulator would silently shift the high bits out on the fifth
+        // byte (aliasing a huge length to a small one). Cap the byte count
+        // and reject values that don't fit a u32 instead.
+        let mut result: u64 = 0;
+        for _ in 0..5 {
+            if self.pos >= self.data.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "unexpected end of data",
+                ));
+            }
+            let byte = self.data[self.pos];
+            self.pos += 1;
+            result = (result << 7) | (byte & 0x7f) as u64;
+            if byte & 0x80 != 0 {
+                return u32::try_from(result)
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "VarUInt too large"));
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "VarUInt too large",
+        ))
+    }
+
+    /// Read unsigned integer (big-endian, up to 8 bytes).
+    #[inline]
+    fn read_uint(&mut self, len: usize) -> io::Result<u64> {
+        if len == 0 {
+            return Ok(0);
+        }
+        if len > 8 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "integer too large (> 8 bytes)",
+            ));
+        }
+        let bytes = self.read_bytes(len)?;
+        let mut result: u64 = 0;
+        for &b in bytes {
+            result = (result << 8) | b as u64;
+        }
+        Ok(result)
+    }
+
+    /// Read a VarInt (signed, 7 bits per byte, MSB set on last byte).
+    /// Returns (value, bytes_read).
+    ///
+    /// Like `read_varuint`, the byte count is capped and accumulation is
+    /// checked: an unbounded loop would let a crafted input shift the high
+    /// bits out silently (aliasing huge values onto small ones), and a
+    /// 10-byte VarInt encoding 1<<63 would make the final negation overflow
+    /// (a release-mode abort, since the crate ships with overflow-checks).
+    fn read_varint(&mut self) -> io::Result<(i64, usize)> {
+        const MAX_BYTES: usize = 9;
+        let too_large = || io::Error::new(io::ErrorKind::InvalidData, "VarInt too large");
+
+        if self.pos >= self.data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "unexpected end of data",
+            ));
+        }
+
+        let first_byte = self.data[self.pos];
+        let is_negative = (first_byte & 0x40) != 0;
+
+        // First byte: bits 0-5 are value, bit 6 is sign, bit 7 is stop
+        let mut result: i64 = (first_byte & 0x3f) as i64;
+        let mut bytes_read = 1;
+        self.pos += 1;
+
+        // If stop bit not set, read more bytes
+        if (first_byte & 0x80) == 0 {
+            loop {
+                if bytes_read >= MAX_BYTES {
+                    return Err(too_large());
+                }
+                if self.pos >= self.data.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "unexpected end of data",
+                    ));
+                }
+                let byte = self.data[self.pos];
+                self.pos += 1;
+                bytes_read += 1;
+                result = result
+                    .checked_shl(7)
+                    .filter(|r| r >> 7 == result)
+                    .ok_or_else(too_large)?
+                    | (byte & 0x7f) as i64;
+                if byte & 0x80 != 0 {
+                    break;
+                }
+            }
+        }
+
+        if is_negative {
+            result = result.checked_neg().ok_or_else(too_large)?;
+        }
+
+        Ok((result, bytes_read))
+    }
+
+    /// Read a signed integer (coefficient in decimal).
+    /// Sign is in the high bit of the first byte.
+    fn read_signed_int(&mut self, len: usize) -> io::Result<i64> {
+        if len == 0 {
+            return Ok(0);
+        }
+        if len > 8 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "integer too large (> 8 bytes)",
+            ));
+        }
+
+        let bytes = self.read_bytes(len)?;
+        let is_negative = (bytes[0] & 0x80) != 0;
+
+        // Clear sign bit and read magnitude
+        let mut magnitude: u64 = (bytes[0] & 0x7f) as u64;
+        for &b in &bytes[1..] {
+            magnitude = (magnitude << 8) | b as u64;
+        }
+
+        if is_negative {
+            Ok(-(magnitude as i64))
+        } else {
+            Ok(magnitude as i64)
+        }
+    }
+}
+
+// ============================================================================
+// Ion Binary Writer
+// ============================================================================
+
+/// Ion binary format writer.
+///
+/// Writes Ion values in binary format for KFX export.
+pub struct IonWriter {
+    buffer: Vec<u8>,
+}
+
+impl IonWriter {
+    /// Create a new empty writer.
+    pub fn new() -> Self {
+        Self { buffer: Vec::new() }
+    }
+
+    /// Get the written data, consuming the writer.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.buffer
+    }
+
+    /// Write the Ion BVM (Binary Version Marker).
+    pub fn write_bvm(&mut self) {
+        self.buffer.extend_from_slice(&ION_MAGIC);
+    }
+
+    /// Write an IonValue.
+    pub fn write_value(&mut self, value: &IonValue) {
+        match value {
+            IonValue::Null => self.write_null(),
+            IonValue::Bool(b) => self.write_bool(*b),
+            IonValue::Int(n) => self.write_int(*n),
+            IonValue::Float(f) => self.write_float(*f),
+            IonValue::Decimal(s) => self.write_decimal(s),
+            IonValue::Symbol(id) => self.write_symbol(*id),
+            IonValue::String(s) => self.write_string(s),
+            IonValue::Blob(data) => self.write_blob(data),
+            IonValue::List(items) => self.write_list(items),
+            IonValue::Struct(fields) => self.write_struct(fields),
+            IonValue::Annotated(annotations, inner) => self.write_annotated(annotations, inner),
+        }
+    }
+
+    /// Write null value.
+    pub fn write_null(&mut self) {
+        self.buffer.push(0x0f); // type 0, length 15 = null
+    }
+
+    /// Write boolean value.
+    pub fn write_bool(&mut self, value: bool) {
+        self.buffer.push(if value { 0x11 } else { 0x10 });
+    }
+
+    /// Write integer value.
+    pub fn write_int(&mut self, value: i64) {
+        if value == 0 {
+            self.buffer.push(0x20); // type 2, length 0
+            return;
+        }
+
+        let (type_code, magnitude) = if value >= 0 {
+            (2u8, value as u64)
+        } else if value == i64::MIN {
+            // Special case: i64::MIN magnitude is 2^63 which needs 8 bytes
+            (3u8, 0x8000_0000_0000_0000u64)
+        } else {
+            (3u8, (-value) as u64)
+        };
+
+        let (bytes, skip) = uint_bytes(magnitude);
+        self.write_type_descriptor(type_code, 8 - skip);
+        self.buffer.extend_from_slice(&bytes[skip..]);
+    }
+
+    /// Write float value (always as 64-bit).
+    pub fn write_float(&mut self, value: f64) {
+        if value == 0.0 && value.is_sign_positive() {
+            self.buffer.push(0x40); // type 4, length 0 = positive zero
+        } else {
+            self.buffer.push(0x48); // type 4, length 8
+            self.buffer.extend_from_slice(&value.to_be_bytes());
+        }
+    }
+
+    /// Write decimal value from string (e.g., "0.833333", "1.5").
+    ///
+    /// Encodes as Ion decimal (type 5) with coefficient + exponent.
+    /// This matches Kindle's expected format for style values.
+    pub fn write_decimal(&mut self, s: &str) {
+        let val: f64 = s.parse().unwrap_or(0.0);
+
+        if val == 0.0 {
+            // Zero: single byte with exponent 0
+            self.buffer.push(0x51); // type 5, length 1
+            self.buffer.push(0x80); // exponent 0, stop bit
+            return;
+        }
+
+        // Convert to coefficient and exponent with precision 6
+        // (matches Kindle Previewer output like 0.833333)
+        //
+        // The float→int cast saturates; i64::MIN's magnitude is 2^63, whose
+        // signed-Int encoding needs 9 bytes — more than the reader accepts —
+        // so the writer would emit bytes its own parser rejects (found by the
+        // ion_roundtrip fuzz target). Clamp to MIN+1 (magnitude 2^63-1, 8
+        // bytes); the one-ulp precision loss is meaningless at 9.2e12.
+        let mut coef = ((val * 1_000_000.0).round() as i64).max(i64::MIN + 1);
+        let mut exp: i8 = -6;
+
+        // Normalize: remove trailing zeros, but never past exponent 0 —
+        // reference KFX keeps integral decimals at exponent 0 (572., not
+        // 5.72d2), and old-firmware parsers are only exercised on that form.
+        while coef != 0 && coef % 10 == 0 && exp < 0 {
+            coef /= 10;
+            exp += 1;
+        }
+
+        // Encode decimal bytes
+        let mut decimal_bytes = Vec::new();
+
+        // 1. Exponent as VarInt (signed)
+        let exp_mag = exp.unsigned_abs();
+        let exp_sign = if exp < 0 { 0x40 } else { 0x00 };
+        decimal_bytes.push(0x80 | exp_sign | (exp_mag & 0x3F));
+
+        // 2. Coefficient as signed Int (magnitude encoding)
+        if coef != 0 {
+            let coef_mag = coef.unsigned_abs();
+            let is_neg = coef < 0;
+
+            // Encode magnitude as big-endian bytes
+            let (coef_buf, coef_skip) = uint_bytes(coef_mag);
+            let coef_bytes = &coef_buf[coef_skip..];
+
+            // Check if we need a sign byte
+            let needs_sign_byte = (coef_bytes[0] & 0x80) != 0;
+
+            if is_neg {
+                if needs_sign_byte {
+                    decimal_bytes.push(0x80); // negative sign byte
+                    decimal_bytes.extend_from_slice(coef_bytes);
+                } else {
+                    // Set sign bit in first byte
+                    decimal_bytes.push(coef_bytes[0] | 0x80);
+                    decimal_bytes.extend_from_slice(&coef_bytes[1..]);
+                }
+            } else {
+                if needs_sign_byte {
+                    decimal_bytes.push(0x00); // positive sign byte
+                }
+                decimal_bytes.extend_from_slice(coef_bytes);
+            }
+        }
+
+        // Write type descriptor and bytes
+        self.write_type_descriptor(5, decimal_bytes.len());
+        self.buffer.extend_from_slice(&decimal_bytes);
+    }
+
+    /// Write symbol (by ID).
+    pub fn write_symbol(&mut self, id: u64) {
+        if id == 0 {
+            self.buffer.push(0x70); // type 7, length 0
+            return;
+        }
+        let (bytes, skip) = uint_bytes(id);
+        self.write_type_descriptor(7, 8 - skip);
+        self.buffer.extend_from_slice(&bytes[skip..]);
+    }
+
+    /// Write string value.
+    pub fn write_string(&mut self, s: &str) {
+        let bytes = s.as_bytes();
+        self.write_type_descriptor(8, bytes.len());
+        self.buffer.extend_from_slice(bytes);
+    }
+
+    /// Write blob value.
+    pub fn write_blob(&mut self, data: &[u8]) {
+        self.write_type_descriptor(10, data.len());
+        self.buffer.extend_from_slice(data);
+    }
+
+    /// Write list value.
+    pub fn write_list(&mut self, items: &[IonValue]) {
+        let start = self.buffer.len();
+        for item in items {
+            self.write_value(item);
+        }
+        self.finish_container(11, start);
+    }
+
+    /// Write struct value (preserves field order).
+    pub fn write_struct(&mut self, fields: &[(u64, IonValue)]) {
+        let start = self.buffer.len();
+        for (key, value) in fields {
+            self.write_varuint(*key);
+            self.write_value(value);
+        }
+        self.finish_container(13, start);
+    }
+
+    /// Write annotated value.
+    pub fn write_annotated(&mut self, annotations: &[u64], inner: &IonValue) {
+        let start = self.buffer.len();
+        // Annotation IDs, then their byte length prefixed in front of them.
+        for &ann in annotations {
+            self.write_varuint(ann);
+        }
+        let (ann_len, n) = varuint_bytes((self.buffer.len() - start) as u64);
+        self.insert_at(start, &ann_len[..n]);
+        // Inner value, then the annotation wrapper's type descriptor.
+        self.write_value(inner);
+        self.finish_container(14, start);
+    }
+
+    /// Retroactively prefix everything written since `start` with a type
+    /// descriptor, shifting the bytes in place.
+    ///
+    /// Containers can't know their length until their contents are written;
+    /// serializing children into the parent's buffer and back-patching keeps
+    /// deeply nested KFX values in one allocation, instead of a temporary
+    /// `IonWriter` per container copied into its parent (an allocation per
+    /// container and a copy per nesting level).
+    fn finish_container(&mut self, type_code: u8, start: usize) {
+        let len = self.buffer.len() - start;
+        let mut desc = [0u8; 11];
+        let desc_len = if len < 14 {
+            desc[0] = (type_code << 4) | (len as u8);
+            1
+        } else {
+            desc[0] = (type_code << 4) | 14;
+            let (bytes, n) = varuint_bytes(len as u64);
+            desc[1..=n].copy_from_slice(&bytes[..n]);
+            1 + n
+        };
+        self.insert_at(start, &desc[..desc_len]);
+    }
+
+    /// Insert `bytes` at `pos`, shifting the tail right.
+    fn insert_at(&mut self, pos: usize, bytes: &[u8]) {
+        let old_len = self.buffer.len();
+        self.buffer.resize(old_len + bytes.len(), 0);
+        self.buffer.copy_within(pos..old_len, pos + bytes.len());
+        self.buffer[pos..pos + bytes.len()].copy_from_slice(bytes);
+    }
+
+    /// Write type descriptor byte(s).
+    fn write_type_descriptor(&mut self, type_code: u8, length: usize) {
+        if length < 14 {
+            self.buffer.push((type_code << 4) | (length as u8));
+        } else {
+            self.buffer.push((type_code << 4) | 14);
+            self.write_varuint(length as u64);
+        }
+    }
+
+    /// Write VarUInt to buffer.
+    fn write_varuint(&mut self, value: u64) {
+        write_varuint_to(&mut self.buffer, value);
+    }
+}
+
+impl Default for IonWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Encode unsigned int as big-endian bytes (minimal length), returned as a
+/// stack buffer and the number of leading bytes to skip (`value == 0` encodes
+/// as zero bytes).
+fn uint_bytes(value: u64) -> ([u8; 8], usize) {
+    ((value.to_be_bytes()), (value.leading_zeros() / 8) as usize)
+}
+
+/// Encode a VarUInt (7 bits per byte, MSB set on the last byte) into a stack
+/// buffer, returning the buffer and the number of bytes used.
+fn varuint_bytes(value: u64) -> ([u8; 10], usize) {
+    let mut out = [0u8; 10];
+    if value == 0 {
+        out[0] = 0x80;
+        return (out, 1);
+    }
+    let groups = (64 - value.leading_zeros() as usize).div_ceil(7);
+    let mut v = value;
+    for i in (0..groups).rev() {
+        out[i] = (v & 0x7f) as u8;
+        v >>= 7;
+    }
+    out[groups - 1] |= 0x80; // Last byte has MSB set
+    (out, groups)
+}
+
+/// Write VarUInt to a buffer (7 bits per byte, MSB set on last byte).
+fn write_varuint_to(buf: &mut Vec<u8>, value: u64) {
+    let (bytes, len) = varuint_bytes(value);
+    buf.extend_from_slice(&bytes[..len]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_varint_errors_instead_of_panicking() {
+        // Decimal (type 5, len 11) whose exponent VarInt encodes 1<<63:
+        // 0x41 (sign bit, no stop), seven 0x00 continuation bytes, 0x80 stop,
+        // then one coefficient byte. Accumulates i64::MIN as a magnitude and
+        // used to abort on `-result` ("attempt to negate with overflow").
+        let data = [
+            0xe0, 0x01, 0x00, 0xea, // BVM
+            0x5b, // Decimal, length 11
+            0x41, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, // exponent VarInt
+            0x01, 0x01, // coefficient bytes
+        ];
+        let mut parser = IonParser::new(&data);
+        assert!(parser.parse().is_err());
+
+        // Even longer VarInts must error (previously the high bits were
+        // silently shifted out, aliasing huge exponents onto small values).
+        let data = [
+            0xe0, 0x01, 0x00, 0xea, //
+            0x5e, 0x8e, // Decimal, VarUInt length 14
+            0x41, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x80, // 14-byte exponent VarInt
+        ];
+        let mut parser = IonParser::new(&data);
+        assert!(parser.parse().is_err());
+    }
+
+    #[test]
+    fn value_count_bomb_is_bounded() {
+        // A crafted container that expands into tens of millions of nodes
+        // from a few hundred bytes (found by the container fuzz target) must
+        // error out fast instead of exhausting memory/CPU.
+        let data = [
+            0xe0, 0x01, 0x00, 0xea, 0xcc, 0xcc, 0xcc, 0x00, 0x01, 0x00, 0xcc, 0xea, 0x86, 0x86,
+            0x4d, 0xff, 0xdb, 0xff, 0xcc, 0xc4, 0xcc, 0xcc, 0xcc, 0xea, 0x86, 0x86, 0x4d, 0xff,
+            0xdb, 0x0c, 0x00, 0xcc, 0xc4, 0xcc, 0xea, 0x86, 0x86, 0x4d, 0xff, 0xdb, 0xff, 0xcc,
+            0xc4, 0xcc, 0xcc, 0xcc, 0xea, 0x86, 0x86, 0x4d, 0xff, 0xe9, 0x00, 0x00, 0x00, 0xcc,
+            0xcc, 0xcc, 0xcc, 0xcc, 0x00, 0x01, 0x00, 0xcc,
+        ];
+        // The point is that it returns (Ok or Err) quickly without OOM; the
+        // budget guarantees termination.
+        let mut parser = IonParser::new(&data);
+        let _ = parser.parse();
+    }
+
+    #[test]
+    fn decimal_exponent_cannot_overrun_value_span() {
+        // Decimal claims length 1, but its exponent VarInt runs 9 bytes deep
+        // into what would be sibling values.
+        let data = [
+            0xe0, 0x01, 0x00, 0xea, // BVM
+            0x51, // Decimal, length 1
+            0x41, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, // runaway VarInt
+        ];
+        let mut parser = IonParser::new(&data);
+        assert!(parser.parse().is_err());
+    }
+
+    #[test]
+    fn test_parse_bool() {
+        let data = [0xe0, 0x01, 0x00, 0xea, 0x11]; // true
+        let mut parser = IonParser::new(&data);
+        assert_eq!(parser.parse().unwrap().as_int(), None);
+
+        let data = [0xe0, 0x01, 0x00, 0xea, 0x10]; // false
+        let mut parser = IonParser::new(&data);
+        if let IonValue::Bool(b) = parser.parse().unwrap() {
+            assert!(!b);
+        } else {
+            panic!("expected bool");
+        }
+    }
+
+    #[test]
+    fn test_parse_int() {
+        let data = [0xe0, 0x01, 0x00, 0xea, 0x21, 0x2a]; // int 42
+        let mut parser = IonParser::new(&data);
+        assert_eq!(parser.parse().unwrap().as_int(), Some(42));
+    }
+
+    #[test]
+    fn test_parse_negative_int() {
+        // -42: type 3 (NegInt), length 1, magnitude 42
+        let data = [0xe0, 0x01, 0x00, 0xea, 0x31, 0x2a];
+        let mut parser = IonParser::new(&data);
+        assert_eq!(parser.parse().unwrap().as_int(), Some(-42));
+    }
+
+    #[test]
+    fn test_parse_large_positive_int() {
+        // 8-byte positive integer: 0x7FFFFFFFFFFFFFFF (i64::MAX)
+        let data = [
+            0xe0, 0x01, 0x00, 0xea, // BVM
+            0x28, // PosInt, length 8
+            0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        ];
+        let mut parser = IonParser::new(&data);
+        assert_eq!(parser.parse().unwrap().as_int(), Some(i64::MAX));
+    }
+
+    #[test]
+    fn test_parse_large_negative_int() {
+        // -2^63 (i64::MIN): magnitude is 0x8000000000000000
+        let data = [
+            0xe0, 0x01, 0x00, 0xea, // BVM
+            0x38, // NegInt, length 8
+            0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let mut parser = IonParser::new(&data);
+        assert_eq!(parser.parse().unwrap().as_int(), Some(i64::MIN));
+    }
+
+    #[test]
+    fn test_parse_string() {
+        let data = [0xe0, 0x01, 0x00, 0xea, 0x82, b'h', b'i'];
+        let mut parser = IonParser::new(&data);
+        assert_eq!(parser.parse().unwrap().as_string(), Some("hi"));
+    }
+
+    #[test]
+    fn test_parse_struct() {
+        // struct { 10: "a", 20: 1 }
+        // VarUInt encoding: value with MSB set as stop bit
+        // 10 = 0x0A, with MSB = 0x8A
+        // 20 = 0x14, with MSB = 0x94
+        let data = [
+            0xe0, 0x01, 0x00, 0xea, // BVM
+            0xd6, // struct, length 6
+            0x8a, // field 10 (VarUInt: 10 | 0x80)
+            0x81, b'a', // string "a"
+            0x94, // field 20 (VarUInt: 20 | 0x80)
+            0x21, 0x01, // int 1
+        ];
+        let mut parser = IonParser::new(&data);
+        let value = parser.parse().unwrap();
+        assert_eq!(value.get(10).and_then(|v| v.as_string()), Some("a"));
+        assert_eq!(value.get(20).and_then(|v| v.as_int()), Some(1));
+    }
+
+    #[test]
+    fn test_nop_pad_skipped() {
+        // NOP pad: type 0, length 3 (skip 3 bytes), followed by int 42
+        // Struct content: field1(1) + nop(4) + field2(1) + int(2) = 8 bytes
+        let data = [
+            0xe0, 0x01, 0x00, 0xea, // BVM
+            0xd8, // struct, length 8
+            0x81, // field 1
+            0x03, 0xAA, 0xBB, 0xCC, // NOP pad (type 0, len 3, 3 garbage bytes)
+            0x82, // field 2
+            0x21, 0x2a, // int 42
+        ];
+        let mut parser = IonParser::new(&data);
+        let value = parser.parse().unwrap();
+        // Field 1 gets Null (from NOP), field 2 should have value 42
+        assert!(matches!(value.get(1), Some(IonValue::Null)));
+        assert_eq!(value.get(2).and_then(|v| v.as_int()), Some(42));
+    }
+
+    #[test]
+    fn test_float_zero() {
+        // Float with length 0 is positive zero
+        let data = [0xe0, 0x01, 0x00, 0xea, 0x40]; // float, length 0
+        let mut parser = IonParser::new(&data);
+        if let IonValue::Float(f) = parser.parse().unwrap() {
+            assert_eq!(f, 0.0);
+            assert!(f.is_sign_positive());
+        } else {
+            panic!("expected float");
+        }
+    }
+
+    #[test]
+    fn test_float_invalid_length() {
+        // Float with invalid length (e.g., 3) should error
+        let data = [0xe0, 0x01, 0x00, 0xea, 0x43, 0x00, 0x00, 0x00];
+        let mut parser = IonParser::new(&data);
+        assert!(parser.parse().is_err());
+    }
+
+    #[test]
+    fn test_list_length_overrunning_buffer_is_rejected() {
+        // List claiming length 11 with no content bytes. Previously the
+        // `while pos < end` loop spun forever pushing Null (OOM); now it errors.
+        let data = [0xe0, 0x01, 0x00, 0xea, 0xbb];
+        let mut parser = IonParser::new(&data);
+        assert!(parser.parse().is_err());
+    }
+
+    #[test]
+    fn test_deeply_nested_list_is_rejected_not_stack_overflow() {
+        // Ion VarUInt: 7 bits/byte, big-endian, stop bit (0x80) on the last byte.
+        fn encode_varuint(mut v: usize) -> Vec<u8> {
+            let mut bytes = vec![(v & 0x7f) as u8 | 0x80];
+            v >>= 7;
+            while v > 0 {
+                bytes.insert(0, (v & 0x7f) as u8);
+                v >>= 7;
+            }
+            bytes
+        }
+        // Nest lists deeper than MAX_ION_DEPTH; each 0xbe is a List with a
+        // VarUInt length. Must hit the depth guard, not overflow the stack.
+        let mut buf = vec![0x10u8]; // innermost: bool false
+        for _ in 0..(MAX_ION_DEPTH + 50) {
+            let len = buf.len();
+            let mut next = vec![0xbeu8];
+            next.extend_from_slice(&encode_varuint(len));
+            next.extend_from_slice(&buf);
+            buf = next;
+        }
+        let mut data = ION_MAGIC.to_vec();
+        data.extend_from_slice(&buf);
+        let mut parser = IonParser::new(&data);
+        assert!(parser.parse().is_err());
+    }
+
+    #[test]
+    fn test_decimal_exponent_overflow_is_rejected() {
+        // Decimal (0x52) with exponent VarInt 0x94 (= +20) and coefficient 1.
+        // 10^20 overflows i64; must error instead of panicking on overflow.
+        let data = [0xe0, 0x01, 0x00, 0xea, 0x52, 0x94, 0x01];
+        let mut parser = IonParser::new(&data);
+        assert!(parser.parse().is_err());
+    }
+
+    #[test]
+    fn test_decimal_large_negative_exponent_is_rejected() {
+        // Regression for a fuzzer-found OOM: a decimal with a large-magnitude
+        // negative exponent drove `"0".repeat(abs_exp)` to a multi-exabyte
+        // allocation. Exponent VarInt [0x40, 0xE4] = -100, coefficient 1.
+        // The parser must reject it instead of trying to allocate the zeros.
+        let data = [0xe0, 0x01, 0x00, 0xea, 0x53, 0x40, 0xE4, 0x01];
+        let mut parser = IonParser::new(&data);
+        assert!(parser.parse().is_err());
+    }
+
+    // ========================================================================
+    // IonWriter tests
+    // ========================================================================
+
+    #[test]
+    fn test_writer_roundtrip_int() {
+        // Write an integer and verify we can parse it back
+        let mut writer = IonWriter::new();
+        writer.write_bvm();
+        writer.write_int(42);
+
+        let data = writer.into_bytes();
+        let mut parser = IonParser::new(&data);
+        assert_eq!(parser.parse().unwrap().as_int(), Some(42));
+    }
+
+    #[test]
+    fn test_writer_roundtrip_negative_int() {
+        let mut writer = IonWriter::new();
+        writer.write_bvm();
+        writer.write_int(-42);
+
+        let data = writer.into_bytes();
+        let mut parser = IonParser::new(&data);
+        assert_eq!(parser.parse().unwrap().as_int(), Some(-42));
+    }
+
+    #[test]
+    fn test_writer_roundtrip_string() {
+        let mut writer = IonWriter::new();
+        writer.write_bvm();
+        writer.write_string("hello");
+
+        let data = writer.into_bytes();
+        let mut parser = IonParser::new(&data);
+        assert_eq!(parser.parse().unwrap().as_string(), Some("hello"));
+    }
+
+    #[test]
+    fn test_writer_roundtrip_struct() {
+        let mut writer = IonWriter::new();
+        writer.write_bvm();
+        writer.write_struct(&[
+            (10, IonValue::String("test".to_string())),
+            (20, IonValue::Int(42)),
+        ]);
+
+        let data = writer.into_bytes();
+        let mut parser = IonParser::new(&data);
+        let value = parser.parse().unwrap();
+        assert_eq!(value.get(10).and_then(|v| v.as_string()), Some("test"));
+        assert_eq!(value.get(20).and_then(|v| v.as_int()), Some(42));
+    }
+
+    #[test]
+    fn test_writer_roundtrip_list() {
+        let mut writer = IonWriter::new();
+        writer.write_bvm();
+        writer.write_list(&[IonValue::Int(1), IonValue::Int(2), IonValue::Int(3)]);
+
+        let data = writer.into_bytes();
+        let mut parser = IonParser::new(&data);
+        let value = parser.parse().unwrap();
+        let list = value.as_list().unwrap();
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0].as_int(), Some(1));
+        assert_eq!(list[1].as_int(), Some(2));
+        assert_eq!(list[2].as_int(), Some(3));
+    }
+
+    #[test]
+    #[allow(clippy::approx_constant)]
+    fn test_writer_roundtrip_float() {
+        let mut writer = IonWriter::new();
+        writer.write_bvm();
+        writer.write_float(3.14159);
+
+        let data = writer.into_bytes();
+        let mut parser = IonParser::new(&data);
+        if let IonValue::Float(f) = parser.parse().unwrap() {
+            assert!((f - 3.14159).abs() < 1e-10);
+        } else {
+            panic!("expected float");
+        }
+    }
+
+    #[test]
+    fn test_writer_roundtrip_symbol() {
+        let mut writer = IonWriter::new();
+        writer.write_bvm();
+        writer.write_symbol(42);
+
+        let data = writer.into_bytes();
+        let mut parser = IonParser::new(&data);
+        assert_eq!(parser.parse().unwrap().as_symbol(), Some(42));
+    }
+
+    #[test]
+    fn test_writer_complex_value() {
+        // Test write_value with a complex nested structure
+        let value = IonValue::Struct(vec![
+            (1, IonValue::String("title".to_string())),
+            (2, IonValue::List(vec![IonValue::Int(1), IonValue::Int(2)])),
+            (3, IonValue::Bool(true)),
+        ]);
+
+        let mut writer = IonWriter::new();
+        writer.write_bvm();
+        writer.write_value(&value);
+
+        let data = writer.into_bytes();
+        let mut parser = IonParser::new(&data);
+        let parsed = parser.parse().unwrap();
+
+        assert_eq!(parsed.get(1).and_then(|v| v.as_string()), Some("title"));
+        assert_eq!(parsed.get(3).and_then(|v| v.as_bool()), Some(true));
+    }
+
+    #[test]
+    fn test_writer_decimal_encoding() {
+        // Test that decimal produces type 5 (0x5X) bytes
+        let mut writer = IonWriter::new();
+        writer.write_decimal("0.833333");
+
+        let data = writer.into_bytes();
+        // First byte should be type 5 (decimal)
+        assert_eq!(
+            data[0] >> 4,
+            5,
+            "Expected type 5 (decimal), got type {}",
+            data[0] >> 4
+        );
+    }
+
+    #[test]
+    fn test_writer_decimal_zero() {
+        let mut writer = IonWriter::new();
+        writer.write_decimal("0");
+
+        let data = writer.into_bytes();
+        // Zero: type 5, length 1, exponent byte 0x80
+        assert_eq!(data[0], 0x51);
+        assert_eq!(data[1], 0x80);
+    }
+
+    #[test]
+    fn test_writer_decimal_whole_number() {
+        let mut writer = IonWriter::new();
+        writer.write_decimal("1.5");
+
+        let data = writer.into_bytes();
+        // Should be type 5
+        assert_eq!(data[0] >> 4, 5);
+    }
+
+    #[test]
+    fn test_decimal_roundtrip() {
+        // Test that we can write and read back decimal values
+        let mut writer = IonWriter::new();
+        writer.write_bvm();
+        writer.write_decimal("1.8");
+
+        let data = writer.into_bytes();
+        let mut parser = IonParser::new(&data);
+        if let IonValue::Decimal(s) = parser.parse().unwrap() {
+            let parsed: f64 = s.parse().unwrap();
+            assert!(
+                (parsed - 1.8).abs() < 0.0001,
+                "expected ~1.8, got {}",
+                parsed
+            );
+        } else {
+            panic!("expected decimal");
+        }
+    }
+
+    #[test]
+    fn test_decimal_negative_exponent() {
+        // Test parsing a decimal with negative exponent (e.g., 0.45)
+        let mut writer = IonWriter::new();
+        writer.write_bvm();
+        writer.write_decimal("0.45");
+
+        let data = writer.into_bytes();
+        let mut parser = IonParser::new(&data);
+        if let IonValue::Decimal(s) = parser.parse().unwrap() {
+            let parsed: f64 = s.parse().unwrap();
+            assert!(
+                (parsed - 0.45).abs() < 0.0001,
+                "expected ~0.45, got {}",
+                parsed
+            );
+        } else {
+            panic!("expected decimal");
+        }
+    }
+}

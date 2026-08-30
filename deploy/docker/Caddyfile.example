@@ -1,0 +1,28 @@
+# Example for a Caddy container on the same Docker network as Kindle Bridge.
+# Replace the hostname, trust Caddy's local CA on every client, and keep this
+# origin reachable only from the household LAN or VPN.
+kindle-bridge.home.arpa {
+  tls internal
+  encode zstd gzip
+  reverse_proxy kindle-bridge:8080 {
+    # The edge owns the complete production policy so two independently
+    # restrictive CSP headers cannot accidentally disable WebAssembly.
+    header_down -Content-Security-Policy
+  }
+
+  request_body {
+    max_size 1MB
+  }
+
+  header {
+    -Server
+    Content-Security-Policy "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; font-src 'self'; manifest-src 'self'; upgrade-insecure-requests"
+    Permissions-Policy "usb=(self)"
+    X-Content-Type-Options "nosniff"
+    X-Frame-Options "DENY"
+    Referrer-Policy "no-referrer"
+    Cross-Origin-Opener-Policy "same-origin"
+    Cross-Origin-Resource-Policy "same-origin"
+    Strict-Transport-Security "max-age=31536000"
+  }
+}

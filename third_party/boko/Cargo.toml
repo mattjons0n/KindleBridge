@@ -1,0 +1,131 @@
+[package]
+name = "boko"
+version = "0.5.0"
+edition = "2024"
+rust-version = "1.91"
+description = "Fast native ebook converter for EPUB, KFX, AZW3, and MOBI — the only KFX writer that needs no Kindle Previewer"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/zacharydenton/boko"
+homepage = "https://github.com/zacharydenton/boko"
+documentation = "https://docs.rs/boko"
+readme = "README.md"
+keywords = ["ebook", "epub", "kfx", "azw3", "kindle"]
+categories = ["parsing", "encoding"]
+# Test fixtures (binary ebooks) and the fuzz harness are only needed to develop
+# boko, not to build it — keep them out of the published crate.
+exclude = ["/tests/fixtures", "/fuzz"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["cli", "parallel"]
+cli = ["dep:clap", "dep:serde", "dep:serde_json", "dep:ion-rs", "optimize-images"]
+# Image shrinking for `Book::optimize` (recompress/transcode raster images).
+# Optional so the wasm build stays small; included in the CLI by default.
+optimize-images = ["dep:image"]
+wasm = ["wasm-bindgen", "console_error_panic_hook"]
+# Parallel chapter compilation via rayon. Native-only: the dependency is
+# declared under the non-wasm target table below, so enabling this feature on
+# wasm32 is a no-op (the code falls back to serial iteration).
+parallel = ["dep:rayon"]
+
+[dependencies]
+wasm-bindgen = { version = "0.2", optional = true }
+console_error_panic_hook = { version = "0.1", optional = true }
+quick-xml = "0.39"
+zip = { version = "8.1", default-features = false, features = ["deflate-flate2"] }
+percent-encoding = "2.3"
+
+# High-performance byte operations (SIMD-accelerated)
+memchr = "2.7"
+bstr = { version = "1.11", default-features = false, features = ["alloc"] }
+
+# Fast, non-DoS-resistant hasher for internal hot-path maps (interned styles,
+# arena ids, symbol tables) whose keys are not attacker-chosen for collision.
+rustc-hash = "2.1"
+
+# Inline storage for small hot collections (KFX token attrs/spans, Ion
+# annotations) so the common case avoids a heap allocation.
+smallvec = "1.15"
+
+# Derive Display/Error/From for the typed error enum (compile-time only).
+thiserror = "2"
+
+# Font parsing for the KVG math typesetting spoke: glyph outlines (TrueType
+# and CFF) plus the OpenType MATH table (typesetting constants, stretchy
+# glyph variants/assemblies).
+ttf-parser = "0.25"
+
+# Raster decode + JPEG encode for the image-shrinking optimize pass.
+# Optional: pulled in by the `optimize-images` feature, excluded from wasm.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"], optional = true }
+
+html5ever = "0.39"
+cssparser = "0.36"
+selectors = "0.35"
+precomputed-hash = "0.1"
+
+# Encoding detection and conversion (UTF-8, CP1252, etc.)
+encoding_rs = "0.8"
+
+# Base64 encoding for KFX raw media
+base64 = "0.22"
+
+# Ion binary format parsing for KFX dump tool (CLI only; the library uses
+# its own hand-rolled reader/writer in src/kfx/ion.rs)
+ion-rs = { version = "1.0.0-rc.11", features = ["experimental-reader-writer"], optional = true }
+
+# SHA1 hashing for KFX content hashes (minimal, WASM-compatible)
+sha1_smol = { version = "1.0", features = ["std"] }
+
+# CLI argument parsing (only for binary)
+clap = { version = "4", features = ["derive"], optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+xml5ever = "0.39.0"
+
+# Native: use fast zlib-rs
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
+# Data-parallel chapter compilation (native only; gated by the `parallel` feature).
+rayon = { version = "1.10", optional = true }
+
+# WASM: use pure-Rust backend
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+js-sys = "0.3"
+
+[dev-dependencies]
+tempfile = "3.14"
+proptest = "1.6"
+criterion = "0.8"
+# Synthesizes image fixtures for the optimize-images tests.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# Obfuscates font fixtures for the deobfuscation tests (IDPF key = SHA-1).
+sha1_smol = { version = "1.0", features = ["std"] }
+
+[[bin]]
+name = "boko"
+path = "src/bin/boko/main.rs"
+required-features = ["cli"]
+
+[[bench]]
+name = "conversion"
+harness = false
+
+[profile.release]
+# Hot paths cross module boundaries (cascade → style_pool → transform, the Ion
+# writer → serialization); thin LTO plus a single codegen unit lets the compiler
+# inline across them for a measurable end-to-end win and a smaller wasm cdylib.
+lto = "thin"
+codegen-units = 1
+# Defense in depth: the parsers do checked arithmetic on untrusted offset/length
+# fields, but keep overflow checks on in release so any missed site aborts
+# loudly instead of silently wrapping to a bogus offset.
+overflow-checks = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

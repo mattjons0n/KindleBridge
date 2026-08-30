@@ -1,0 +1,121 @@
+# Kindle Bridge
+
+Kindle Bridge is a private, self-hosted household ebook library. A platform-agnostic Docker service watches configured read-only directories, indexes EPUB and supported AZW3 metadata and covers into SQLite, and serves a searchable web catalog. In the browser, a household member can connect a Kindle, compare its live inventory with the selected library, and send a missing book in one action.
+
+EPUB conversion remains entirely browser-local through the vendored boko WebAssembly converter. Kindle access remains browser-local through user-initiated WebUSB/MTP. Kindle Bridge does not require Calibre, does not upload books to a cloud converter, and does not mount or manage SMB/NFS shares.
+
+## Current state
+
+The repository now contains the implemented household-library flow:
+
+- a Node.js catalog service with SQLite migrations, persistent profiles and roots, health/readiness endpoints, and a rebuildable cover/search index;
+- bounded metadata extraction, incremental directory watching, scheduled reconciliation, source-health reporting, and server-sent scan events;
+- a real API-backed cover grid with profile selection, search, filters, sorting, pagination, source status, and Settings CRUD;
+- live Kindle inventory, automatic exact-byte self-test after connection, three-state catalog matching, and green checks reserved for strong matches;
+- catalog-driven **Send to Kindle**, including authoritative source validation, browser-local EPUB conversion or AZW3 validation, PDOC preparation, collision-resistant transfer, verification, and delivery recording;
+- a hardened, non-root Docker/OCI image and Compose deployment using ordinary read-only library mounts plus persistent `/data` and rebuildable `/cache` volumes.
+
+The original transfer engine was physically validated on an MTP Kindle with USB IDs `0x1949 / 0x9981`: conversion, MTP connection, exact-byte self-test, transfer, opening, chapter navigation, and library-cover display all succeeded. The expanded integrated catalog/inventory/Send journey still requires a fresh physical Kindle run and acceptance against the real household mounts and intended HTTPS LAN/VPN origin. Automated tests do not replace those checks.
+
+See [`outputs/kindle-bridge-implementation-build-plan.md`](outputs/kindle-bridge-implementation-build-plan.md) for milestone status and [`outputs/kindle-bridge-service-design-plan.md`](outputs/kindle-bridge-service-design-plan.md) for the architecture rationale.
+
+## Architecture
+
+```text
+Host directories exposed to Docker as read-only mounts
+  -> Docker catalog service: scanner + SQLite/FTS + covers + source API
+  -> same-origin web interface
+  -> browser-local boko conversion or AZW3 validation
+  -> browser-local WebUSB/MTP
+  -> Kindle
+```
+
+The host is responsible for making local, NAS-, SMB-, or NFS-backed directories available to Docker. Kindle Bridge sees only their container paths, normally below `/libraries`. It never receives storage credentials and never changes an original book. Conversion and PDOC preparation operate only on an in-browser derivative.
+
+Profiles are organizational views over one or more roots. They are deliberately not access-control boundaries: anyone who can reach a no-login deployment can switch profiles. Keep the service on a trusted LAN/VPN or behind an appropriate private HTTPS access layer; do not publish it unauthenticated to the internet.
+
+## Run the complete stack locally
+
+Requirements are Node.js 24 or newer, npm, and a WebUSB-capable Chromium desktop browser for Kindle access. Calibre and Rust are not required.
+
+```sh
+npm ci
+npm run dev
+```
+
+Open <http://127.0.0.1:5173/>. The development command starts Vite on port 5173 and the catalog API on port 5174, with `/api` proxied by Vite. Development data, cache, and allowed library paths are created under `.kindle-bridge-dev/`.
+
+In **Settings**:
+
+1. Create a household library/profile.
+2. Add the full absolute path of `.kindle-bridge-dev/libraries`, or a directory beneath it; that directory is the development server's allowed root.
+3. Save the root and use **Rescan** if an immediate manual scan is wanted. Watching and scheduled reconciliation continue automatically.
+
+For implementation diagnostics outside Docker (not a supported production deployment):
+
+```sh
+npm run build
+npm start
+```
+
+Set the catalog environment variables described in [`server/README.md`](server/README.md). Production deployment is Docker/OCI only.
+
+## Run with Docker Compose
+
+The canonical deployment artifacts are the repository-root `Dockerfile` and `compose.yaml`.
+
+```sh
+docker compose up --build -d
+```
+
+By default Compose binds the app to <http://127.0.0.1:8080/>, mounts `./library` at `/libraries:ro`, stores durable state in `kindle-bridge-data`, and stores rebuildable covers in `kindle-bridge-cache`. Override the host book path without changing the application:
+
+```sh
+KINDLE_BRIDGE_LIBRARY_HOST_PATH=/path/on/the/docker/host docker compose up --build -d
+```
+
+Settings paths are container paths, such as `/libraries`, `/libraries/husband`, or `/libraries/wife`; they are not host paths or SMB URLs. Add more read-only bind mounts in Compose when the directories cannot share one mounted parent. The application will accept configured roots only beneath `CATALOG_ALLOWED_ROOTS`.
+
+Important service controls include:
+
+- `CATALOG_ALLOWED_HOSTS`, `CATALOG_ALLOWED_ORIGINS`, and `CATALOG_REQUIRE_ORIGIN` for the trusted web origin;
+- `CATALOG_SETTINGS_MODE=read-write|read-only` to enable initial configuration or lock later mutations;
+- `CATALOG_MAX_SOURCE_STREAMS` and `CATALOG_MAX_CONCURRENT_SCANS` for source-download and scan concurrency, plus `CATALOG_SOURCE_RESPONSE_TIMEOUT_MS` and `CATALOG_SCAN_TIMEOUT_MS` for their aggregate deadlines;
+- `CATALOG_COVER_RESPONSE_TIMEOUT_MS`, `CATALOG_SETTINGS_VALIDATION_TIMEOUT_MS`, and `CATALOG_ROOT_POLICY_TIMEOUT_MS` so cache reads, Settings path checks, and startup allowed-root checks cannot retain capacity or resume late database work indefinitely;
+- `CATALOG_METADATA_WORKERS` and `CATALOG_METADATA_TIMEOUT_MS` for the isolated metadata-parser pool;
+- `CATALOG_QUIET_WINDOW_MS`, `CATALOG_STABILITY_WINDOW_MS`, `CATALOG_RECONCILE_MS`, and `CATALOG_DEEP_RECONCILE_MS` for watcher debounce, changed-file stability, frequent bounded-fingerprint reconciliation, and automatic full deep sweeps. Each root's successful deep completion is stored in SQLite, so restarting the container does not reset or postpone its deadline;
+- `CATALOG_MAX_SCAN_ENTRIES` and `CATALOG_MAX_SCAN_DIRECTORIES` for bounded per-root traversal. A timed-out scan preserves prior catalog rows and its durable scan request, reports `scan_timeout`, and retries with bounded backoff without holding a shared scan slot or startup readiness indefinitely;
+- `CATALOG_COVER_RETENTION_MS` and `CATALOG_COVER_PRUNE_MS` for safe cleanup of rebuildable, unreferenced covers;
+- `CATALOG_MAX_BODY_BYTES`, `CATALOG_MAX_CONCURRENT`, and `CATALOG_RATE_PER_MINUTE` for HTTP bounds.
+
+Remote WebUSB use requires a trustworthy HTTPS origin in a supported Chromium desktop browser. Full deployment, reverse-proxy, backup, restore, rollback, mount-loss, and rebuild procedures are in [`deploy/docker/README.md`](deploy/docker/README.md).
+
+## Kindle workflow and safety
+
+1. Click **Connect Kindle** to open the browser's required user-initiated device chooser.
+2. On a clean connection, Kindle Bridge opens one browser-local MTP session, runs the exact-byte create/read/compare/delete self-test, and inventories Documents. If exact cleanup is pending, it permits only read-only recovery inventory first; acknowledgement must be followed by a new self-test, inventory, and reconciliation.
+3. Confirmed matches receive a green check. Ambiguous evidence remains visibly possible and blocks the ordinary Send action until the ambiguity is resolved; unmanaged Kindle-only items are left untouched.
+4. Click **Send to Kindle**. The browser verifies the indexed source size, hash, ETag, and actual format; converts or validates a derivative; checks capacity; transfers without overwrite; verifies the result; and refreshes live reconciliation.
+
+Browser lifecycle safety is deliberately conservative. A page restored from the browser back/forward cache, or a visible return after the page was observed hidden for at least 60 seconds, invalidates the retained WebUSB/MTP session. In-flight device work is aborted, the session is closed after that work drains, inventory becomes **Last seen**, green-check evidence becomes unknown, and reconnect plus the automatic byte self-test is required before Send. This handles observable browser lifecycle and hidden/visible timing; it does not claim to detect every operating-system sleep or hardware suspend event.
+
+Safety invariants include immutable source mounts, a 200 MiB source limit, bounded parsing, no overwrite, collision-resistant managed filenames, a bounded metadata-only recovery journal, exact-handle cleanup, one active browser-wide device lease, and clean USB/session shutdown. DRM-protected ebooks are unsupported.
+
+Direct AZW3 sources are supported when their KF8 text is uncompressed or PalmDOC-compressed. HUFF/CDIC-compressed AZW3 is rejected explicitly because this release does not contain a trustworthy bounded HUFF/CDIC decoder; EPUB remains the preferred source path for browser-local conversion.
+
+Large-library behavior is bounded rather than silently discarded. Catalog facet suggestions are capped for responsiveness, while author, subject, publisher, and series filters also accept an exact typed value that is not in the suggestion list. A connected Kindle inventory retains and pages up to 10,000 readable objects at 100 rows per page. Read-only embedded-metadata enrichment is sequential and separately bounded to 2,000 eligible objects, 200 MiB per object, and 1 GiB total; hitting a bound makes the affected match evidence incomplete instead of turning uncertainty into a green check.
+The complete active-profile match index is likewise fail-closed and never truncated: its non-paginated endpoint accepts up to 20,000 available books, 40,000 delivered-history rows, and 32 MiB of JSON. In the same database snapshot, a bounded fixed-width household claimant summary determines whether metadata evidence is unique across other enabled profiles without downloading their catalogs. An incomplete summary or another possible strong claimant stays yellow; only globally unique or source-scoped managed/delivery evidence can turn green. The browser independently enforces the same response-size ceiling before parsing.
+
+Durable histories are bounded rather than append-only. Settings/direct-profile retry evidence retains 1,000 operation-scoped keys per profile; delivery history retains 40,000 delivered and 10,000 non-delivered records per profile and rejects arbitrary nested result payloads. Healthy scans retire missing rebuildable rows while NAS/mount loss retains last-known unavailable cards. Stable current or delivery-linked identities remain protected; recent unlinked delete/re-add identities use a 20,000-row/32 MiB window per root and survive explicit catalog rebuilds until the replacement scan commits.
+
+## Verification
+
+```sh
+npm run check
+```
+
+This runs the client and server tests, TypeScript validation, and production builds. The suite covers the catalog database/API/scanner/parser, filesystem and large-catalog integration behavior, real API-backed UI/controller flows, conversion, matching, WebUSB/MTP behavior, transfer safety, and deployment contracts. Final release acceptance additionally requires the physical Kindle and real household deployment checks described above.
+
+## Third-party converter
+
+The project vendors boko 0.5.0 browser artifacts and corresponding source under `third_party/boko`. boko is GPL-3.0-or-later. See `THIRD_PARTY_NOTICES.md` and `LICENSE` before redistributing the project.

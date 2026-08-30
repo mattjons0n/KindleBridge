@@ -1,0 +1,33 @@
+{
+  "name": "kindle-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "dev:client": "vite --host 127.0.0.1 --port 5173",
+    "dev:server": "node --watch --watch-preserve-output dist/server/main.js",
+    "typecheck:client": "tsc --noEmit -p tsconfig.json",
+    "build:server": "tsc -p tsconfig.server.json",
+    "build:client": "vite build",
+    "build": "npm run typecheck:client && npm run build:server && npm run build:client",
+    "start": "node dist/server/main.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check": "npm run test && npm run build"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^26.3.0",
+    "jsdom": "^30.0.1",
+    "typescript": "^7.0.2",
+    "vite": "^8.2.2",
+    "vitest": "^4.1.11"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true
+  }
+}

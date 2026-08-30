@@ -1,0 +1,37 @@
+[package]
+name = "boko-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+boko = { path = "..", default-features = false }
+
+[[bin]]
+name = "from_bytes"
+path = "fuzz_targets/from_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ion_roundtrip"
+path = "fuzz_targets/ion_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "container_parse"
+path = "fuzz_targets/container_parse.rs"
+test = false
+doc = false
+bench = false
+
+# Keep the fuzz crate out of the parent workspace/publish.
+[workspace]
+members = ["."]

@@ -1,0 +1,1110 @@
+//! KFX format importer.
+//!
+//! KFX is Amazon's Kindle Format 10, using Ion binary data format.
+//!
+//! This module handles I/O operations for reading KFX containers.
+//! Pure parsing functions are in `crate::kfx::container`.
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::{Arc, OnceLock, RwLock};
+
+use crate::import::{ChapterId, Importer, SpineEntry};
+use crate::io::{ByteSource, FileSource};
+use crate::kfx::container::{
+    self, ContainerError, EntityLoc, extract_doc_symbols, get_field, get_symbol_text,
+    parse_container_header, parse_container_info, parse_index_table, skip_enty_header,
+};
+use crate::kfx::ion::{IonParser, IonValue};
+use crate::kfx::schema::schema;
+use crate::kfx::storyline::parse_storyline_to_ir;
+use crate::kfx::symbols::KfxSymbol;
+use crate::model::Chapter;
+use crate::model::{
+    AnchorTarget, CollectionInfo, Contributor, GlobalNodeId, Landmark, Metadata, TocEntry,
+};
+
+/// Shorthand for getting a KfxSymbol as u32 for field lookups.
+macro_rules! sym {
+    ($variant:ident) => {
+        KfxSymbol::$variant as u64
+    };
+}
+
+/// KFX format importer.
+pub struct KfxImporter {
+    /// Random-access byte source.
+    source: Arc<dyn ByteSource>,
+
+    /// Entity index: maps (type_id, entity_idx) -> EntityLoc
+    entities: Vec<EntityLoc>,
+
+    /// Precomputed asset paths (bcRawMedia entity IDs + font paths).
+    asset_paths: Vec<String>,
+
+    /// Font entity map: font path (e.g., "fonts/font_0000.otf") -> EntityLoc.
+    font_entities: HashMap<String, EntityLoc>,
+
+    /// Document-specific symbols (extended symbol table).
+    doc_symbols: Arc<Vec<String>>,
+
+    /// Book metadata.
+    metadata: Metadata,
+
+    /// Table of contents.
+    toc: Vec<TocEntry>,
+
+    /// Landmarks (structural navigation points).
+    landmarks: Vec<Landmark>,
+
+    /// Reading order (spine).
+    spine: Vec<SpineEntry>,
+
+    /// Section names for spine entries.
+    section_names: Vec<String>,
+
+    /// Cache: section name -> storyline EntityLoc (lazily populated)
+    section_storylines: HashMap<String, EntityLoc>,
+    /// Whether section→storyline mapping has been built
+    section_storylines_indexed: bool,
+
+    /// Resources: name -> EntityLoc (lazily populated)
+    resource_index: OnceLock<HashMap<String, EntityLoc>>,
+
+    /// Content-entity name → location, built once. Without it,
+    /// `load_content_entity` was a linear scan that fully Ion-parsed every
+    /// content entity on each miss — O(C^2) parses per book.
+    content_index: OnceLock<HashMap<String, EntityLoc>>,
+
+    /// Content cache: name -> list of strings (lazily populated)
+    content_cache: RwLock<HashMap<String, Vec<String>>>,
+
+    /// Anchor map: anchor_name -> uri (for external link resolution)
+    anchors: OnceLock<AnchorIndex>,
+
+    /// Style map: style_name -> KFX style properties (for style resolution)
+    styles: OnceLock<Arc<StyleIndex>>,
+
+    // --- Link resolution ---
+    /// Maps element string ID -> GlobalNodeId (built during index_anchors)
+    element_id_map: RwLock<HashMap<String, GlobalNodeId>>,
+}
+
+impl From<ContainerError> for crate::Error {
+    fn from(e: ContainerError) -> Self {
+        crate::Error::Malformed {
+            format: crate::Format::Kfx,
+            context: e.to_string(),
+        }
+    }
+}
+
+impl Importer for KfxImporter {
+    fn open(path: &Path) -> crate::Result<Self> {
+        let file = std::fs::File::open(path)?;
+        let source = Arc::new(FileSource::new(file)?);
+        Self::from_source(source)
+    }
+
+    fn metadata(&self) -> &Metadata {
+        &self.metadata
+    }
+
+    fn toc(&self) -> &[TocEntry] {
+        &self.toc
+    }
+
+    fn landmarks(&self) -> &[Landmark] {
+        &self.landmarks
+    }
+
+    fn spine(&self) -> &[SpineEntry] {
+        &self.spine
+    }
+
+    fn source_id(&self, id: ChapterId) -> Option<&str> {
+        self.section_names.get(id.0 as usize).map(|s| s.as_str())
+    }
+
+    fn load_chapter(&self, id: ChapterId) -> crate::Result<Chapter> {
+        let section_name = self
+            .section_names
+            .get(id.0 as usize)
+            .ok_or_else(|| crate::Error::NotFound {
+                what: format!("chapter {}", id.0),
+            })?
+            .clone();
+
+        // Get storyline location
+        let storyline_loc = self.resolve_section_to_storyline(&section_name)?;
+
+        // Parse storyline entity
+        let storyline_ion = self.parse_entity_ion(storyline_loc)?;
+
+        // Clone Arc handles to avoid borrow conflict with content lookup closure
+        let doc_symbols = Arc::clone(&self.doc_symbols);
+        let anchors = Arc::clone(&self.anchor_index().external);
+        let styles = Arc::clone(self.style_index());
+
+        // Parse storyline and build IR using schema-driven tokenization
+        let mut chapter = parse_storyline_to_ir(
+            &storyline_ion,
+            doc_symbols.as_ref(),
+            Some(anchors.as_ref()),
+            Some(styles.as_ref()),
+            |name, index| self.lookup_content_text(name, index),
+        );
+
+        // Run optimization passes (KFX builds IR directly, not through compile_html)
+        crate::dom::optimize::optimize(&mut chapter);
+
+        Ok(chapter)
+    }
+
+    fn load_raw(&self, id: ChapterId) -> crate::Result<Vec<u8>> {
+        let section_name = self
+            .section_names
+            .get(id.0 as usize)
+            .ok_or_else(|| crate::Error::NotFound {
+                what: format!("chapter {}", id.0),
+            })?
+            .clone();
+
+        // Find section entity and resolve to storyline
+        let storyline_loc = self.resolve_section_to_storyline(&section_name)?;
+        self.read_entity(storyline_loc)
+    }
+
+    fn list_assets(&self) -> &[String] {
+        &self.asset_paths
+    }
+
+    fn load_asset(&self, path: &str) -> crate::Result<Vec<u8>> {
+        // Handle font path lookup (e.g., "fonts/font_0000.otf")
+        if let Some(loc) = self.font_entities.get(path) {
+            return self.read_entity(*loc);
+        }
+
+        // Handle direct entity ID lookup (e.g., "#1102" from list_assets)
+        if let Some(id_str) = path.strip_prefix('#') {
+            if let Ok(id) = id_str.parse::<u32>() {
+                // Find entity by ID
+                if let Some(loc) = self.entities.iter().find(|e| e.id == id) {
+                    return self.read_entity(*loc);
+                }
+            }
+            return Err(crate::Error::NotFound {
+                what: format!("entity {}", path),
+            });
+        }
+
+        let loc = self
+            .resource_index()
+            .get(path)
+            .ok_or_else(|| crate::Error::NotFound {
+                what: format!("asset {}", path),
+            })?;
+
+        self.read_entity(*loc)
+    }
+
+    fn requires_normalized_export(&self) -> bool {
+        // KFX load_raw returns binary Ion data, not HTML
+        true
+    }
+
+    fn index_anchors(&self, chapters: &[(ChapterId, Arc<Chapter>)]) {
+        let mut element_id_map = HashMap::new();
+
+        // Build element_id → GlobalNodeId map from chapters
+        for (chapter_id, chapter) in chapters {
+            for node_id in chapter.iter_dfs() {
+                if let Some(id) = chapter.semantics.id(node_id) {
+                    element_id_map.insert(id.to_string(), GlobalNodeId::new(*chapter_id, node_id));
+                }
+            }
+        }
+
+        if let Ok(mut map) = self.element_id_map.write() {
+            *map = element_id_map;
+        }
+    }
+
+    fn resolve_href(&self, _from_chapter: ChapterId, href: &str) -> Option<AnchorTarget> {
+        let href = href.trim();
+
+        // External URLs
+        if href.starts_with("http://")
+            || href.starts_with("https://")
+            || href.starts_with("mailto:")
+            || href.starts_with("tel:")
+        {
+            return Some(AnchorTarget::External(href.to_string()));
+        }
+
+        // Strip leading # if present for anchor/element lookups
+        let anchor_name = href.strip_prefix('#').unwrap_or(href);
+
+        // Handle #id:offset format (KFX TOC/nav format)
+        let anchor_name = if let Some(colon_pos) = anchor_name.find(':') {
+            &anchor_name[..colon_pos]
+        } else {
+            anchor_name
+        };
+
+        // Check external anchors map (anchor_name → uri)
+        if let Some(uri) = self.anchor_index().external.get(anchor_name) {
+            return Some(AnchorTarget::External(uri.clone()));
+        }
+
+        // Check internal anchors (anchor_name → position.id → element_id)
+        // The position.id in anchor entities references element IDs in storylines
+        if let Some(&(pos_id, _offset)) = self.anchor_index().internal.get(anchor_name) {
+            let id_str = pos_id.to_string();
+            if let Some(target) = self.element_id(&id_str) {
+                return Some(AnchorTarget::Internal(target));
+            }
+        }
+
+        // Try direct element ID lookup (anchor_name might be the numeric ID directly)
+        if let Some(target) = self.element_id(anchor_name) {
+            return Some(AnchorTarget::Internal(target));
+        }
+
+        // Try parsing as numeric ID
+        if let Ok(numeric_id) = anchor_name.parse::<i64>() {
+            let id_str = numeric_id.to_string();
+            if let Some(target) = self.element_id(&id_str) {
+                return Some(AnchorTarget::Internal(target));
+            }
+        }
+
+        // Not found
+        None
+    }
+}
+
+impl KfxImporter {
+    /// Look up an element id in the anchor index built by `index_anchors`.
+    fn element_id(&self, key: &str) -> Option<GlobalNodeId> {
+        self.element_id_map
+            .read()
+            .ok()
+            .and_then(|m| m.get(key).copied())
+    }
+
+    /// Create an importer from a ByteSource.
+    pub fn from_source(source: Arc<dyn ByteSource>) -> crate::Result<Self> {
+        // Read and parse container header (18 bytes)
+        let header_data = source.read_at(0, 18)?;
+        let header = parse_container_header(&header_data)?;
+
+        // Read and parse container info
+        let container_info_data = source.read_at(
+            header.container_info_offset as u64,
+            header.container_info_length,
+        )?;
+        let container_info = parse_container_info(&container_info_data)?;
+
+        // Get index table location (required)
+        let (index_offset, index_length) =
+            container_info
+                .index
+                .ok_or_else(|| crate::Error::Malformed {
+                    format: crate::Format::Kfx,
+                    context: "missing index table in container".into(),
+                })?;
+
+        // Read and parse document symbols (optional)
+        let doc_symbols = if let Some((offset, length)) = container_info.doc_symbols {
+            if length > 0 {
+                let doc_sym_data = source.read_at(offset as u64, length)?;
+                extract_doc_symbols(&doc_sym_data)
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        // Read and parse index table
+        let index_data = source.read_at(index_offset as u64, index_length)?;
+        let entities = parse_index_table(&index_data, header.header_len);
+
+        // Build asset paths: bcRawMedia as entity IDs, bcRawFont as fonts/ paths
+        let mut asset_paths: Vec<String> = entities
+            .iter()
+            .filter(|e| e.type_id == KfxSymbol::Bcrawmedia as u32)
+            .map(|e| format!("#{}", e.id))
+            .collect();
+
+        let mut font_entities = HashMap::new();
+        for (idx, e) in entities
+            .iter()
+            .filter(|e| e.type_id == KfxSymbol::Bcrawfont as u32)
+            .enumerate()
+        {
+            let font_path = format!("fonts/font_{idx:04}.otf");
+            font_entities.insert(font_path.clone(), *e);
+            asset_paths.push(font_path);
+        }
+
+        let mut importer = Self {
+            source,
+            entities,
+            asset_paths,
+            font_entities,
+            doc_symbols: Arc::new(doc_symbols),
+            metadata: Metadata::default(),
+            toc: Vec::new(),
+            landmarks: Vec::new(), // TODO: Parse from KFX landmarks nav_container
+            spine: Vec::new(),
+            section_names: Vec::new(),
+            section_storylines: HashMap::new(),
+            section_storylines_indexed: false,
+            resource_index: OnceLock::new(),
+            content_index: OnceLock::new(),
+            content_cache: RwLock::new(HashMap::new()),
+            anchors: OnceLock::new(),
+            styles: OnceLock::new(),
+            element_id_map: RwLock::new(HashMap::new()),
+        };
+
+        // Parse metadata (only reads needed entities)
+        importer.parse_metadata()?;
+
+        // Parse navigation (TOC)
+        importer.parse_navigation()?;
+
+        // Build section→storyline map (needed for spine sizes and load_raw)
+        importer.index_section_storylines()?;
+
+        // Parse spine from reading order (uses section→storyline map for sizes)
+        importer.parse_spine()?;
+
+        Ok(importer)
+    }
+
+    /// Read an entity's raw data (after ENTY header).
+    fn read_entity(&self, loc: EntityLoc) -> crate::Result<Vec<u8>> {
+        let entity_data = self.source.read_at(loc.offset as u64, loc.length)?;
+
+        // Use pure function to skip ENTY header
+        let payload = skip_enty_header(&entity_data);
+        if payload.len() != entity_data.len() {
+            Ok(payload.to_vec())
+        } else {
+            Ok(entity_data)
+        }
+    }
+
+    /// Parse an entity as Ion and return the parsed value.
+    ///
+    /// Strips any top-level Ion type annotation (e.g. `$490::{ ... }`) so
+    /// callers can rely on the returned value being the entity struct itself,
+    /// matching every other callsite in this importer that does
+    /// `value.as_struct()` directly. Some KFX containers tag entities with an
+    /// annotation indicating their schema type; without this strip, those
+    /// entities silently fall through `get_field()` lookups because the
+    /// outer value is an `Annotated`, not a `Struct`.
+    fn parse_entity_ion(&self, loc: EntityLoc) -> crate::Result<IonValue> {
+        let ion_data = self.read_entity(loc)?;
+        let mut parser = IonParser::new(&ion_data);
+        let parsed = parser.parse().map_err(|e| crate::Error::Malformed {
+            format: crate::Format::Kfx,
+            context: e.to_string(),
+        })?;
+        Ok(match parsed {
+            IonValue::Annotated(_, inner) => *inner,
+            other => other,
+        })
+    }
+
+    /// Get a symbol's text from an IonValue (handles both Symbol and String).
+    fn get_symbol_text<'a>(&'a self, value: &'a IonValue) -> Option<&'a str> {
+        get_symbol_text(value, self.doc_symbols.as_ref())
+    }
+
+    /// Parse book metadata.
+    fn parse_metadata(&mut self) -> crate::Result<()> {
+        // Find book_metadata entity
+        let loc = self
+            .entities
+            .iter()
+            .find(|e| e.type_id == KfxSymbol::BookMetadata as u32)
+            .copied();
+
+        if let Some(loc) = loc {
+            let elem = self.parse_entity_ion(loc)?;
+
+            if let Some(fields) = elem.as_struct()
+                && let Some(list) =
+                    get_field(fields, sym!(CategorisedMetadata)).and_then(|m| m.as_list())
+            {
+                for category_elem in list {
+                    if let Some(cat_fields) = category_elem.as_struct() {
+                        let category = get_field(cat_fields, sym!(Category))
+                            .and_then(|v| self.get_symbol_text(v))
+                            .unwrap_or("");
+
+                        if category == "kindle_title_metadata"
+                            && let Some(metadata_list) =
+                                get_field(cat_fields, sym!(Metadata)).and_then(|v| v.as_list())
+                        {
+                            for meta in metadata_list {
+                                let Some(meta_fields) = meta.as_struct() else {
+                                    continue;
+                                };
+                                let key = get_field(meta_fields, sym!(Key))
+                                    .and_then(|v| v.as_string())
+                                    .unwrap_or("");
+                                let value = get_field(meta_fields, sym!(Value))
+                                    .and_then(|v| v.as_string())
+                                    .unwrap_or("");
+
+                                match key {
+                                    "title" => self.metadata.title = value.to_string(),
+                                    "author" => self.metadata.authors.push(value.to_string()),
+                                    "publisher" => {
+                                        self.metadata.publisher = Some(value.to_string())
+                                    }
+                                    "language" => self.metadata.language = value.to_string(),
+                                    "description" => {
+                                        self.metadata.description = Some(value.to_string())
+                                    }
+                                    "book_id" => self.metadata.identifier = value.to_string(),
+                                    "issue_date" => self.metadata.date = Some(value.to_string()),
+                                    "cover_image" => {
+                                        let value_elem = get_field(meta_fields, sym!(Value));
+                                        if let Some(cover) = self.resolve_cover_value(value_elem) {
+                                            self.metadata.cover_image = Some(cover);
+                                        }
+                                    }
+                                    "modified_date" => {
+                                        self.metadata.modified_date = Some(value.to_string())
+                                    }
+                                    "translator" => self.metadata.contributors.push(Contributor {
+                                        name: value.to_string(),
+                                        file_as: None,
+                                        role: Some("trl".to_string()),
+                                    }),
+                                    "title_pronunciation" => {
+                                        self.metadata.title_sort = Some(value.to_string())
+                                    }
+                                    "author_pronunciation" => {
+                                        self.metadata.author_sort = Some(value.to_string())
+                                    }
+                                    "series_name" => {
+                                        if let Some(ref mut coll) = self.metadata.collection {
+                                            coll.name = value.to_string();
+                                        } else {
+                                            self.metadata.collection = Some(CollectionInfo {
+                                                name: value.to_string(),
+                                                collection_type: Some("series".to_string()),
+                                                position: None,
+                                            });
+                                        }
+                                    }
+                                    "series_position" => {
+                                        if let Ok(pos) = value.parse::<f64>() {
+                                            if let Some(ref mut coll) = self.metadata.collection {
+                                                coll.position = Some(pos);
+                                            } else {
+                                                self.metadata.collection = Some(CollectionInfo {
+                                                    name: String::new(),
+                                                    collection_type: Some("series".to_string()),
+                                                    position: Some(pos),
+                                                });
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Parse book navigation (TOC and landmarks).
+    fn parse_navigation(&mut self) -> crate::Result<()> {
+        // Find book_navigation entity
+        let loc = self
+            .entities
+            .iter()
+            .find(|e| e.type_id == KfxSymbol::BookNavigation as u32)
+            .copied();
+
+        if let Some(loc) = loc {
+            let elem = self.parse_entity_ion(loc)?;
+
+            // book_navigation is a list of reading orders
+            if let Some(list) = elem.as_list() {
+                for reading_order in list {
+                    if let Some(ro_fields) = reading_order.as_struct() {
+                        // Look for nav_containers
+                        if let Some(containers) =
+                            get_field(ro_fields, sym!(NavContainers)).and_then(|v| v.as_list())
+                        {
+                            for container in containers {
+                                // Unwrap annotation if present
+                                let inner = container.unwrap_annotated();
+                                if let Some(container_fields) = inner.as_struct() {
+                                    // Check nav_type
+                                    let nav_type = get_field(container_fields, sym!(NavType))
+                                        .and_then(|v| self.get_symbol_text(v));
+
+                                    match nav_type {
+                                        Some("toc") => {
+                                            self.toc = self.parse_nav_entries(container_fields);
+                                        }
+                                        Some("landmarks") => {
+                                            self.landmarks =
+                                                self.parse_landmark_entries(container_fields);
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Parse landmark entries from a landmarks nav_container.
+    fn parse_landmark_entries(&self, container: &[(u64, IonValue)]) -> Vec<Landmark> {
+        let mut landmarks = Vec::new();
+
+        if let Some(entry_list) = get_field(container, sym!(Entries)).and_then(|v| v.as_list()) {
+            for entry in entry_list {
+                // Unwrap annotation if present
+                let inner = entry.unwrap_annotated();
+                if let Some(entry_fields) = inner.as_struct() {
+                    // Get landmark_type symbol and convert via schema
+                    let landmark_type =
+                        get_field(entry_fields, sym!(LandmarkType)).and_then(|v| match v {
+                            IonValue::Symbol(id) => schema().landmark_from_kfx(*id),
+                            _ => None,
+                        });
+
+                    // Skip unknown landmark types
+                    let Some(landmark_type) = landmark_type else {
+                        continue;
+                    };
+
+                    // Get label from representation.label
+                    let label = get_field(entry_fields, sym!(Representation))
+                        .and_then(|v| v.as_struct())
+                        .and_then(|s| get_field(s, sym!(Label)))
+                        .and_then(|v| v.as_string())
+                        .unwrap_or("")
+                        .to_string();
+
+                    // Get target position (id and offset)
+                    let target_pos =
+                        get_field(entry_fields, sym!(TargetPosition)).and_then(|v| v.as_struct());
+                    let href = if let Some(pos) = target_pos {
+                        let id = get_field(pos, sym!(Id)).and_then(|v| v.as_int());
+                        let offset = get_field(pos, sym!(Offset)).and_then(|v| v.as_int());
+                        match (id, offset) {
+                            (Some(id), Some(off)) if off > 0 => format!("#{}:{}", id, off),
+                            (Some(id), _) => format!("#{}", id),
+                            _ => String::new(),
+                        }
+                    } else {
+                        String::new()
+                    };
+
+                    landmarks.push(Landmark {
+                        landmark_type,
+                        href,
+                        label,
+                    });
+                }
+            }
+        }
+
+        landmarks
+    }
+
+    /// Recursively parse nav entries into a tree structure.
+    fn parse_nav_entries(&self, container: &[(u64, IonValue)]) -> Vec<TocEntry> {
+        let mut entries = Vec::new();
+
+        if let Some(entry_list) = get_field(container, sym!(Entries)).and_then(|v| v.as_list()) {
+            for entry in entry_list {
+                // Unwrap annotation if present (nav_unit::...)
+                let inner = entry.unwrap_annotated();
+                if let Some(entry_fields) = inner.as_struct() {
+                    // Get label (try representation.label first, then direct label)
+                    let label = get_field(entry_fields, sym!(Representation))
+                        .and_then(|v| v.as_struct())
+                        .and_then(|s| get_field(s, sym!(Label)))
+                        .and_then(|v| v.as_string())
+                        .or_else(|| {
+                            get_field(entry_fields, sym!(Label)).and_then(|v| v.as_string())
+                        })
+                        .unwrap_or("Untitled");
+
+                    // Skip placeholder labels
+                    if label == "heading-nav-unit" || label == "Untitled" {
+                        continue;
+                    }
+
+                    // Get target position (includes id and offset for within-section navigation)
+                    let target_pos =
+                        get_field(entry_fields, sym!(TargetPosition)).and_then(|v| v.as_struct());
+                    let href = if let Some(pos) = target_pos {
+                        let id = get_field(pos, sym!(Id)).and_then(|v| v.as_int());
+                        let offset = get_field(pos, sym!(Offset)).and_then(|v| v.as_int());
+                        match (id, offset) {
+                            (Some(id), Some(off)) if off > 0 => format!("#{}:{}", id, off),
+                            (Some(id), _) => format!("#{}", id),
+                            _ => String::new(),
+                        }
+                    } else {
+                        String::new()
+                    };
+
+                    // Recursively parse children
+                    let children = self.parse_nav_entries(entry_fields);
+
+                    entries.push(TocEntry {
+                        title: label.to_string(),
+                        href,
+                        children,
+                        play_order: None,
+                        target: None,
+                    });
+                }
+            }
+        }
+
+        entries
+    }
+
+    /// Parse spine from reading_orders.
+    ///
+    /// Uses the section→storyline cache to get size estimates.
+    fn parse_spine(&mut self) -> crate::Result<()> {
+        let section_names = self.get_reading_order_sections()?;
+
+        for (idx, name) in section_names.into_iter().enumerate() {
+            // Get size from cached storyline location
+            let size_estimate = self
+                .section_storylines
+                .get(&name)
+                .map(|loc| loc.length)
+                .unwrap_or(0);
+
+            self.section_names.push(name);
+            self.spine.push(SpineEntry {
+                id: ChapterId(idx as u32),
+                size_estimate,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Resolve a section name to its storyline entity location.
+    fn resolve_section_to_storyline(&self, section_name: &str) -> crate::Result<EntityLoc> {
+        self.section_storylines
+            .get(section_name)
+            .copied()
+            .ok_or_else(|| crate::Error::NotFound {
+                what: format!("section {}", section_name),
+            })
+    }
+
+    /// Build the section name → storyline location cache.
+    fn index_section_storylines(&mut self) -> crate::Result<()> {
+        if self.section_storylines_indexed {
+            return Ok(());
+        }
+
+        // First, build a map of story_name → storyline EntityLoc
+        let mut storyline_map: HashMap<String, EntityLoc> = HashMap::new();
+        for loc in &self.entities {
+            if loc.type_id == KfxSymbol::Storyline as u32
+                && let Ok(elem) = self.parse_entity_ion(*loc)
+                && let Some(fields) = elem.as_struct()
+                && let Some(name) =
+                    get_field(fields, sym!(StoryName)).and_then(|v| self.get_symbol_text(v))
+            {
+                storyline_map.insert(name.to_string(), *loc);
+            }
+        }
+
+        // Then, map each section to its storyline
+        for loc in &self.entities {
+            if loc.type_id == KfxSymbol::Section as u32
+                && let Ok(elem) = self.parse_entity_ion(*loc)
+                && let Some(fields) = elem.as_struct()
+            {
+                let section_name =
+                    get_field(fields, sym!(SectionName)).and_then(|v| self.get_symbol_text(v));
+
+                let story_name = get_field(fields, sym!(PageTemplates))
+                    .and_then(|v| v.as_list())
+                    .and_then(|templates| templates.first())
+                    .and_then(|t| t.as_struct())
+                    .and_then(|f| get_field(f, sym!(StoryName)))
+                    .and_then(|v| self.get_symbol_text(v));
+
+                if let (Some(sec_name), Some(story_name)) = (section_name, story_name)
+                    && let Some(storyline_loc) = storyline_map.get(story_name)
+                {
+                    self.section_storylines
+                        .insert(sec_name.to_string(), *storyline_loc);
+                }
+            }
+        }
+
+        self.section_storylines_indexed = true;
+        Ok(())
+    }
+
+    /// Extract section names from reading_orders in document_data or metadata.
+    ///
+    /// Prefers the "default" reading order if multiple are present.
+    fn get_reading_order_sections(&self) -> crate::Result<Vec<String>> {
+        // Try document_data ($538) first, then metadata ($258)
+        let doc_data_loc = self
+            .entities
+            .iter()
+            .find(|e| e.type_id == KfxSymbol::DocumentData as u32)
+            .copied();
+
+        let metadata_loc = self
+            .entities
+            .iter()
+            .find(|e| e.type_id == KfxSymbol::Metadata as u32)
+            .copied();
+
+        for loc in [doc_data_loc, metadata_loc].into_iter().flatten() {
+            if let Ok(elem) = self.parse_entity_ion(loc)
+                && let Some(fields) = elem.as_struct()
+                && let Some(orders) =
+                    get_field(fields, sym!(ReadingOrders)).and_then(|v| v.as_list())
+            {
+                // First pass: look for "default" reading order
+                for order in orders {
+                    if let Some(order_fields) = order.as_struct() {
+                        let order_name = get_field(order_fields, sym!(ReadingOrderName))
+                            .and_then(|v| self.get_symbol_text(v));
+
+                        if order_name == Some("default")
+                            && let Some(sections) = self.extract_sections(order_fields)
+                        {
+                            return Ok(sections);
+                        }
+                    }
+                }
+
+                // Second pass: take first reading order with sections
+                for order in orders {
+                    if let Some(order_fields) = order.as_struct()
+                        && let Some(sections) = self.extract_sections(order_fields)
+                    {
+                        return Ok(sections);
+                    }
+                }
+            }
+        }
+
+        Ok(Vec::new())
+    }
+
+    /// Extract section names from a reading order struct.
+    fn extract_sections(&self, order_fields: &[(u64, IonValue)]) -> Option<Vec<String>> {
+        let sections = get_field(order_fields, sym!(Sections))?.as_list()?;
+        let mut section_names = Vec::new();
+        for section in sections {
+            if let Some(name) = self.get_symbol_text(section) {
+                section_names.push(name.to_string());
+            }
+        }
+        if section_names.is_empty() {
+            None
+        } else {
+            Some(section_names)
+        }
+    }
+
+    /// Resolve cover_image value which can be a string or list with symbol/string reference.
+    fn resolve_cover_value(&self, value: Option<&IonValue>) -> Option<String> {
+        let value = value?;
+
+        // Format 1: Direct string
+        if let Some(s) = value.as_string() {
+            return Some(s.to_string());
+        }
+
+        // Format 2: List containing a symbol or string reference
+        if let Some(list) = value.as_list()
+            && let Some(first) = list.first()
+            && let Some(text) = self.get_symbol_text(first)
+        {
+            return Some(text.to_string());
+        }
+
+        None
+    }
+
+    /// Look up text content by name and index.
+    ///
+    /// Lazily loads and caches content entities as needed.
+    fn lookup_content_text(&self, name: &str, index: usize) -> Option<String> {
+        // Check cache first
+        if let Ok(cache) = self.content_cache.read()
+            && let Some(content_list) = cache.get(name)
+        {
+            return content_list.get(index).cloned();
+        }
+
+        // Load and cache the content entity
+        if let Some(content_list) = self.load_content_entity(name) {
+            let result = content_list.get(index).cloned();
+            if let Ok(mut cache) = self.content_cache.write() {
+                cache.insert(name.to_string(), content_list);
+            }
+            return result;
+        }
+
+        None
+    }
+
+    /// Load a content entity by name and return its string list.
+    fn load_content_entity(&self, name: &str) -> Option<Vec<String>> {
+        let loc = *self.content_index().get(name)?;
+        let elem = self.parse_entity_ion(loc).ok()?;
+        let fields = elem.as_struct()?;
+        let list = get_field(fields, sym!(ContentList)).and_then(|v| v.as_list())?;
+        Some(
+            list.iter()
+                .filter_map(|v| v.as_string().map(|s| s.to_string()))
+                .collect(),
+        )
+    }
+
+    /// The content-entity-name → location index, built on first use.
+    fn content_index(&self) -> &HashMap<String, EntityLoc> {
+        self.content_index.get_or_init(|| {
+            let mut index = HashMap::new();
+            for loc in &self.entities {
+                if loc.type_id == KfxSymbol::Content as u32
+                    && let Ok(elem) = self.parse_entity_ion(*loc)
+                    && let Some(fields) = elem.as_struct()
+                    && let Some(entity_name) =
+                        get_field(fields, sym!(Name)).and_then(|v| self.get_symbol_text(v))
+                {
+                    // First occurrence wins, matching the old forward scan.
+                    index.entry(entity_name.to_string()).or_insert(*loc);
+                }
+            }
+            index
+        })
+    }
+
+    /// Index external resources.
+    /// The resource-name → entity-location index, built on first use.
+    fn resource_index(&self) -> &HashMap<String, EntityLoc> {
+        self.resource_index
+            .get_or_init(|| self.build_resource_index())
+    }
+
+    fn build_resource_index(&self) -> HashMap<String, EntityLoc> {
+        let mut resources = HashMap::new();
+        // Build a lookup from resolved bcRawMedia entity names to their binary payload locations.
+        let mut raw_media_by_name: HashMap<String, EntityLoc> = HashMap::new();
+        for raw_loc in self
+            .entities
+            .iter()
+            .filter(|e| e.type_id == KfxSymbol::Bcrawmedia as u32)
+            .copied()
+        {
+            if let Some(name) =
+                container::resolve_symbol(raw_loc.id as u64, self.doc_symbols.as_ref())
+            {
+                raw_media_by_name.insert(name.to_string(), raw_loc);
+                if let Some(rest) = name.strip_prefix("resource/") {
+                    raw_media_by_name.insert(rest.to_string(), raw_loc);
+                } else {
+                    raw_media_by_name.insert(format!("resource/{name}"), raw_loc);
+                }
+            }
+        }
+
+        // Collect entities to process to avoid borrow conflicts
+        let locs: Vec<_> = self
+            .entities
+            .iter()
+            .filter(|e| e.type_id == KfxSymbol::ExternalResource as u32)
+            .copied()
+            .collect();
+
+        for loc in locs {
+            if let Ok(elem) = self.parse_entity_ion(loc)
+                && let Some(fields) = elem.as_struct()
+            {
+                // Use location as key (e.g., "resource/rsrc7")
+                let location = get_field(fields, sym!(Location))
+                    .and_then(|v| v.as_string())
+                    .map(|s| s.to_string());
+
+                // Also index by resource_name (e.g., "eF") for cover lookup
+                let name = get_field(fields, sym!(ResourceName))
+                    .and_then(|v| container::get_symbol_text(v, self.doc_symbols.as_ref()))
+                    .map(|s| s.to_string());
+
+                let resolved_loc = location
+                    .as_ref()
+                    .and_then(|key| raw_media_by_name.get(key).copied())
+                    .or_else(|| {
+                        name.as_ref()
+                            .and_then(|key| raw_media_by_name.get(key).copied())
+                    })
+                    .unwrap_or(loc);
+
+                if let Some(loc_str) = &location
+                    && !loc_str.is_empty()
+                {
+                    resources.insert(loc_str.clone(), resolved_loc);
+                }
+                if let Some(name_str) = &name
+                    && !name_str.is_empty()
+                    && Some(name_str) != location.as_ref()
+                {
+                    resources.insert(name_str.clone(), resolved_loc);
+                }
+            }
+        }
+
+        resources
+    }
+
+    /// The anchor indexes (external uri map + internal position map), built
+    /// on first use. Enables resolution of both external and internal links
+    /// where `link_to` contains an anchor name.
+    fn anchor_index(&self) -> &AnchorIndex {
+        self.anchors.get_or_init(|| self.build_anchor_index())
+    }
+
+    fn build_anchor_index(&self) -> AnchorIndex {
+        // Find all anchor entities (type $266)
+        let locs: Vec<_> = self
+            .entities
+            .iter()
+            .filter(|e| e.type_id == KfxSymbol::Anchor as u32)
+            .copied()
+            .collect();
+
+        let mut new_external = Vec::new();
+        let mut new_internal = Vec::new();
+
+        for loc in locs {
+            if let Ok(elem) = self.parse_entity_ion(loc)
+                && let Some(fields) = elem.as_struct()
+            {
+                // Get anchor_name
+                let anchor_name = get_field(fields, sym!(AnchorName))
+                    .and_then(|v| container::get_symbol_text(v, self.doc_symbols.as_ref()))
+                    .map(|s| s.to_string());
+
+                let Some(name) = anchor_name else {
+                    continue;
+                };
+
+                // Get uri (present for external links)
+                let uri = get_field(fields, sym!(Uri))
+                    .and_then(|v| v.as_string())
+                    .map(|s| s.to_string());
+
+                if let Some(uri) = uri {
+                    // External anchor
+                    new_external.push((name, uri));
+                } else if let Some(position) =
+                    get_field(fields, sym!(Position)).and_then(|v| v.as_struct())
+                {
+                    // Internal anchor with position
+                    let id = get_field(position, sym!(Id)).and_then(|v| v.as_int());
+                    let offset = get_field(position, sym!(Offset))
+                        .and_then(|v| v.as_int())
+                        .unwrap_or(0);
+
+                    if let Some(pos_id) = id {
+                        new_internal.push((name, (pos_id, offset)));
+                    }
+                }
+            }
+        }
+
+        AnchorIndex {
+            external: Arc::new(new_external.into_iter().collect()),
+            internal: Arc::new(new_internal.into_iter().collect()),
+        }
+    }
+
+    /// The style_name → properties index, built on first use. Style entities
+    /// ($157) contain properties like font_weight, text_alignment, margins.
+    fn style_index(&self) -> &Arc<StyleIndex> {
+        self.styles
+            .get_or_init(|| Arc::new(self.build_style_index()))
+    }
+
+    fn build_style_index(&self) -> StyleIndex {
+        // Find all style entities (type $157)
+        let locs: Vec<_> = self
+            .entities
+            .iter()
+            .filter(|e| e.type_id == KfxSymbol::Style as u32)
+            .copied()
+            .collect();
+
+        let mut new_styles = Vec::new();
+
+        for loc in locs {
+            if let Ok(elem) = self.parse_entity_ion(loc)
+                && let Some(fields) = elem.as_struct()
+            {
+                // Get style_name
+                let style_name = get_field(fields, sym!(StyleName))
+                    .and_then(|v| container::get_symbol_text(v, self.doc_symbols.as_ref()))
+                    .map(|s| s.to_string());
+
+                if let Some(name) = style_name {
+                    // Store all fields (cloned) for later interpretation
+                    let props: Vec<(u64, IonValue)> = fields
+                        .iter()
+                        .filter(|(k, _)| *k != sym!(StyleName)) // Exclude the name itself
+                        .map(|(k, v)| (*k, v.clone()))
+                        .collect();
+
+                    new_styles.push((name, props));
+                }
+            }
+        }
+
+        new_styles.into_iter().collect()
+    }
+}
+
+/// style_name → raw Ion property fields, from style entities ($157).
+type StyleIndex = HashMap<String, Vec<(u64, IonValue)>>;
+
+/// Anchor lookup tables built from anchor entities ($266).
+struct AnchorIndex {
+    /// anchor_name → external URI.
+    external: Arc<HashMap<String, String>>,
+    /// anchor_name → (position_id, offset) for internal links.
+    internal: Arc<HashMap<String, (i64, i64)>>,
+}

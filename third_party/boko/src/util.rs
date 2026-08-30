@@ -1,0 +1,739 @@
+//! Utility functions with platform-specific implementations.
+
+use std::borrow::Cow;
+use std::io::{self, Read};
+
+/// Maximum depth for recursive tree walks over parsed (untrusted) document
+/// trees. Mirrors the format-parser depth caps (`MAX_ION_DEPTH`,
+/// `MAX_HUFF_DEPTH`): a hostile ebook can nest elements/navPoints arbitrarily
+/// deep, and every recursive walker would otherwise overflow the stack. 512 is
+/// far beyond any legitimate ebook nesting while staying safe on the small
+/// stacks of the wasm32 target.
+pub const MAX_TREE_DEPTH: usize = 512;
+
+/// Absolute ceiling on the decompressed size of a single archive entry, used to
+/// stop deflate "zip bombs" (a few KB expanding to gigabytes). No legitimate
+/// ebook resource approaches this; a bomb hits the cap and errors cleanly. The
+/// 128 MiB ceiling also leaves room in a browser for the compressed source,
+/// parsed book model, and growing output derivative.
+pub const MAX_DECOMPRESSED_ENTRY: usize = 128 * 1024 * 1024;
+
+/// Inflate raw DEFLATE `compressed` bytes with a hard cap on output size.
+///
+/// The archive's claimed uncompressed size is untrusted, so it is only used
+/// (clamped) to size the initial reservation — never to bound the read. The
+/// `hard_cap` (via [`Read::take`]) is what actually stops a decompression bomb:
+/// output is limited to `hard_cap` bytes and an entry that would exceed it
+/// fails with [`io::ErrorKind::InvalidData`] instead of exhausting memory.
+pub fn bounded_inflate(
+    compressed: &[u8],
+    claimed_len: u64,
+    hard_cap: usize,
+) -> io::Result<Vec<u8>> {
+    // Reserve the claimed size so a normal entry allocates once, but cap the
+    // up-front reservation so a lying header can't trigger a giant allocation
+    // (the `take` below is the real bomb guard; anything past the reservation
+    // just grows the Vec as needed).
+    const MAX_RESERVE: u64 = 16 * 1024 * 1024;
+    let reserve = claimed_len.min(hard_cap as u64).min(MAX_RESERVE) as usize;
+    let mut out = Vec::with_capacity(reserve);
+    let mut reader = flate2::read::DeflateDecoder::new(compressed).take(hard_cap as u64 + 1);
+    reader.read_to_end(&mut out)?;
+    if out.len() > hard_cap {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "decompressed entry exceeds size limit",
+        ));
+    }
+    Ok(out)
+}
+
+/// Get a time-based seed value for pseudo-random number generation.
+///
+/// On native platforms, uses `SystemTime::now()`.
+/// On WASM, uses `js_sys::Date::now()`.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn time_seed_nanos() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(12345)
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn time_seed_nanos() -> u64 {
+    // js_sys::Date::now() returns milliseconds as f64
+    (js_sys::Date::now() * 1_000_000.0) as u64
+}
+
+/// Get current time as seconds since Unix epoch.
+///
+/// On native platforms, uses `SystemTime::now()`.
+/// On WASM, uses `js_sys::Date::now()`.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn time_now_secs() -> u32 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as u32)
+        .unwrap_or(0)
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn time_now_secs() -> u32 {
+    // js_sys::Date::now() returns milliseconds as f64
+    (js_sys::Date::now() / 1000.0) as u32
+}
+
+/// Decode bytes to a string, handling various encodings.
+///
+/// This function:
+/// 1. First tries UTF-8 (handles BOM automatically via encoding_rs)
+/// 2. If malformed, tries the hint encoding (from `<?xml encoding="..."?>`)
+/// 3. Falls back to Windows-1252 (common in old ebooks)
+///
+/// # Arguments
+///
+/// * `bytes` - The raw bytes to decode
+/// * `hint_encoding` - Optional encoding name from XML declaration or document metadata
+///
+/// # Returns
+///
+/// The decoded string. Uses `Cow<str>` to avoid allocation when the input is valid UTF-8.
+///
+/// # Examples
+///
+/// ```ignore
+/// // Valid UTF-8
+/// let utf8_bytes = "Hello, World!".as_bytes();
+/// assert_eq!(decode_text(utf8_bytes, None), "Hello, World!");
+///
+/// // With encoding hint (e.g., from XML declaration)
+/// let bytes = b"Hello";
+/// assert_eq!(decode_text(bytes, Some("utf-8")), "Hello");
+/// ```
+pub fn decode_text<'a>(bytes: &'a [u8], hint_encoding: Option<&str>) -> Cow<'a, str> {
+    // Try UTF-8 first (handles BOM automatically)
+    let (result, _encoding, malformed) = encoding_rs::UTF_8.decode(bytes);
+
+    if !malformed {
+        return result;
+    }
+
+    // If UTF-8 failed, try the hint encoding
+    if let Some(name) = hint_encoding
+        && let Some(encoding) = encoding_rs::Encoding::for_label(name.as_bytes())
+    {
+        let (result, _, _) = encoding.decode(bytes);
+        return result;
+    }
+
+    // Fallback: Windows-1252 (common in old ebooks, superset of ISO-8859-1)
+    let (result, _, _) = encoding_rs::WINDOWS_1252.decode(bytes);
+    result
+}
+
+// ============================================================================
+// Percent Decoding (hrefs)
+// ============================================================================
+
+/// Percent-decode a single href component (path or fragment).
+///
+/// Hrefs in OPF manifests, NCX/nav documents, and chapter content are URLs
+/// (`my%20chapter.xhtml`), while ZIP archive entry names are literal bytes
+/// (`my chapter.xhtml`). Hrefs must be decoded at the parse boundary before
+/// being matched against archive names; archive names themselves are literal
+/// and must never be decoded.
+///
+/// Invalid escape sequences pass through untouched (per the
+/// `percent-encoding` crate) and non-UTF-8 decodes are replaced lossily, so
+/// decoding is safe on already-literal strings without a `%`.
+pub fn percent_decode(s: &str) -> Cow<'_, str> {
+    if !s.contains('%') {
+        return Cow::Borrowed(s);
+    }
+    percent_encoding::percent_decode_str(s).decode_utf8_lossy()
+}
+
+/// Percent-decode an href, treating the fragment separately from the path.
+///
+/// The `#` separating path from fragment is structural and must survive
+/// decoding: path and fragment are decoded independently and re-joined, so an
+/// encoded `%23` inside either component becomes a literal `#` in that
+/// component without being mistaken for the separator downstream (splitting
+/// on the first `#` was already done here).
+pub fn percent_decode_href(href: &str) -> Cow<'_, str> {
+    if !href.contains('%') {
+        return Cow::Borrowed(href);
+    }
+    match href.split_once('#') {
+        Some((path, fragment)) => Cow::Owned(format!(
+            "{}#{}",
+            percent_decode(path),
+            percent_decode(fragment)
+        )),
+        None => percent_decode(href),
+    }
+}
+
+// ============================================================================
+// Image Dimension Extraction
+// ============================================================================
+
+/// Extract image dimensions from raw image data.
+///
+/// Supports PNG, JPEG, and GIF formats by parsing header bytes.
+/// Returns `(width, height)` or `None` if format is unrecognized.
+///
+/// # Examples
+///
+/// ```ignore
+/// let png_data = include_bytes!("../tests/fixtures/image.png");
+/// if let Some((w, h)) = extract_image_dimensions(png_data) {
+///     println!("Image is {}x{}", w, h);
+/// }
+/// ```
+pub fn extract_image_dimensions(data: &[u8]) -> Option<(u32, u32)> {
+    if data.len() < 24 {
+        return None;
+    }
+
+    // PNG: width/height at bytes 16-23 in IHDR chunk
+    if data.len() >= 24 && data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47
+    {
+        let width = u32::from_be_bytes([data[16], data[17], data[18], data[19]]);
+        let height = u32::from_be_bytes([data[20], data[21], data[22], data[23]]);
+        return Some((width, height));
+    }
+
+    // JPEG: Need to parse SOF markers
+    if data.len() >= 2 && data[0] == 0xFF && data[1] == 0xD8 {
+        return extract_jpeg_dimensions(data);
+    }
+
+    // GIF: width/height at bytes 6-9 (little-endian)
+    if data.len() >= 10 && data[0] == 0x47 && data[1] == 0x49 && data[2] == 0x46 {
+        let width = u16::from_le_bytes([data[6], data[7]]) as u32;
+        let height = u16::from_le_bytes([data[8], data[9]]) as u32;
+        return Some((width, height));
+    }
+
+    None
+}
+
+/// Extract dimensions from JPEG data by parsing SOF markers.
+fn extract_jpeg_dimensions(data: &[u8]) -> Option<(u32, u32)> {
+    let mut i = 2;
+    while i + 4 < data.len() {
+        if data[i] != 0xFF {
+            i += 1;
+            continue;
+        }
+
+        let marker = data[i + 1];
+
+        // SOF markers (Start of Frame) - various encoding types
+        if matches!(
+            marker,
+            0xC0 | 0xC1
+                | 0xC2
+                | 0xC3
+                | 0xC5
+                | 0xC6
+                | 0xC7
+                | 0xC9
+                | 0xCA
+                | 0xCB
+                | 0xCD
+                | 0xCE
+                | 0xCF
+        ) && i + 9 < data.len()
+        {
+            let height = u16::from_be_bytes([data[i + 5], data[i + 6]]) as u32;
+            let width = u16::from_be_bytes([data[i + 7], data[i + 8]]) as u32;
+            return Some((width, height));
+        }
+
+        // Skip to next marker
+        if i + 3 < data.len() {
+            let length = u16::from_be_bytes([data[i + 2], data[i + 3]]) as usize;
+            i += 2 + length;
+        } else {
+            break;
+        }
+    }
+    None
+}
+
+// ============================================================================
+// Resource Format Detection
+// ============================================================================
+
+/// Detected resource format.
+///
+/// This enum represents media formats commonly found in ebooks.
+/// Detection is done via file extension or magic bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaFormat {
+    /// JPEG image
+    Jpeg,
+    /// PNG image
+    Png,
+    /// GIF image
+    Gif,
+    /// SVG image (vector)
+    Svg,
+    /// WebP image
+    WebP,
+    /// TrueType font
+    Ttf,
+    /// OpenType font
+    Otf,
+    /// WOFF web font
+    Woff,
+    /// WOFF2 web font
+    Woff2,
+    /// Unknown/binary format
+    Binary,
+}
+
+impl MediaFormat {
+    /// Get the MIME type string for this format.
+    pub fn mime_type(self) -> &'static str {
+        match self {
+            MediaFormat::Jpeg => "image/jpeg",
+            MediaFormat::Png => "image/png",
+            MediaFormat::Gif => "image/gif",
+            MediaFormat::Svg => "image/svg+xml",
+            MediaFormat::WebP => "image/webp",
+            MediaFormat::Ttf => "font/ttf",
+            MediaFormat::Otf => "font/otf",
+            MediaFormat::Woff => "font/woff",
+            MediaFormat::Woff2 => "font/woff2",
+            MediaFormat::Binary => "application/octet-stream",
+        }
+    }
+
+    /// Check if this format represents an image.
+    pub fn is_image(self) -> bool {
+        matches!(
+            self,
+            MediaFormat::Jpeg
+                | MediaFormat::Png
+                | MediaFormat::Gif
+                | MediaFormat::Svg
+                | MediaFormat::WebP
+        )
+    }
+
+    /// Check if this format represents a font.
+    pub fn is_font(self) -> bool {
+        matches!(
+            self,
+            MediaFormat::Ttf | MediaFormat::Otf | MediaFormat::Woff | MediaFormat::Woff2
+        )
+    }
+}
+
+/// Detect resource format from file path and/or raw bytes.
+///
+/// This is a pure function that encapsulates all format detection logic.
+/// It tries extension-based detection first, then falls back to magic bytes.
+///
+/// # Arguments
+///
+/// * `path` - The resource path/href (used for extension detection)
+/// * `data` - The raw resource bytes (used for magic byte detection)
+///
+/// # Returns
+///
+/// The detected `MediaFormat`, or `Binary` if unknown.
+pub fn detect_media_format(path: &str, data: &[u8]) -> MediaFormat {
+    // Try extension-based detection first (faster, most common case)
+    let path_lower = path.to_lowercase();
+
+    if path_lower.ends_with(".jpg") || path_lower.ends_with(".jpeg") {
+        return MediaFormat::Jpeg;
+    }
+    if path_lower.ends_with(".png") {
+        return MediaFormat::Png;
+    }
+    if path_lower.ends_with(".gif") {
+        return MediaFormat::Gif;
+    }
+    if path_lower.ends_with(".svg") {
+        return MediaFormat::Svg;
+    }
+    if path_lower.ends_with(".webp") {
+        return MediaFormat::WebP;
+    }
+    if path_lower.ends_with(".ttf") {
+        return MediaFormat::Ttf;
+    }
+    if path_lower.ends_with(".otf") {
+        return MediaFormat::Otf;
+    }
+    if path_lower.ends_with(".woff") {
+        return MediaFormat::Woff;
+    }
+    if path_lower.ends_with(".woff2") {
+        return MediaFormat::Woff2;
+    }
+
+    // Fallback to magic byte detection
+    if data.len() >= 4 {
+        // JPEG: FF D8 FF
+        if data[0] == 0xFF && data[1] == 0xD8 {
+            return MediaFormat::Jpeg;
+        }
+        // PNG: 89 50 4E 47 (.PNG)
+        if data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47 {
+            return MediaFormat::Png;
+        }
+        // GIF: 47 49 46 (GIF)
+        if data[0] == 0x47 && data[1] == 0x49 && data[2] == 0x46 {
+            return MediaFormat::Gif;
+        }
+        // WOFF: "wOFF", WOFF2: "wOF2"
+        if data.starts_with(b"wOFF") {
+            return MediaFormat::Woff;
+        }
+        if data.starts_with(b"wOF2") {
+            return MediaFormat::Woff2;
+        }
+        // WebP: 52 49 46 46 ... 57 45 42 50 (RIFF...WEBP)
+        if data.len() >= 12
+            && data[0] == 0x52
+            && data[1] == 0x49
+            && data[2] == 0x46
+            && data[3] == 0x46
+            && data[8] == 0x57
+            && data[9] == 0x45
+            && data[10] == 0x42
+            && data[11] == 0x50
+        {
+            return MediaFormat::WebP;
+        }
+    }
+
+    MediaFormat::Binary
+}
+
+/// Guess a media type (MIME) from a file extension.
+///
+/// The single source of truth for extension→MIME mapping used by the EPUB
+/// and AZW3 exporters (previously duplicated, and drifting, in both).
+pub(crate) fn guess_media_type(path: &str) -> &'static str {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    match ext.as_str() {
+        "xhtml" | "html" | "htm" => "application/xhtml+xml",
+        "css" => "text/css",
+        "js" => "application/javascript",
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "webp" => "image/webp",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ncx" => "application/x-dtbncx+xml",
+        "opf" => "application/oebps-package+xml",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Strip invisible formatting characters used in ebooks.
+///
+/// Removes:
+/// - U+00AD SOFT HYPHEN (hyphenation hints)
+/// - U+200B ZERO WIDTH SPACE (word-break hints)
+pub fn strip_ebook_chars(s: &str) -> std::borrow::Cow<'_, str> {
+    // Soft hyphens / zero-width spaces are rare; scan first and borrow the
+    // input unchanged in the common case (this runs per text node on the
+    // markdown hot path), allocating only when there is actually something
+    // to strip.
+    if !s.contains(['\u{00AD}', '\u{200B}']) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c != '\u{00AD}' && c != '\u{200B}' {
+            out.push(c);
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// Detect MIME type from file extension or magic bytes.
+///
+/// Returns a static string like "image/jpeg", "image/png", etc.
+/// Returns `None` if the format is unknown.
+pub fn detect_mime_type(filename: &str, data: &[u8]) -> Option<&'static str> {
+    let format = detect_media_format(filename, data);
+    match format {
+        MediaFormat::Binary => None,
+        other => Some(other.mime_type()),
+    }
+}
+
+// ============================================================================
+// Date Utilities
+// ============================================================================
+
+/// Truncate an ISO date/timestamp to just the date portion (YYYY-MM-DD).
+///
+/// Many ebook formats expect dates in YYYY-MM-DD format, but source metadata
+/// often includes full ISO timestamps like "2022-05-26T16:26:51Z".
+///
+/// # Examples
+///
+/// ```ignore
+/// assert_eq!(truncate_to_date("2022-05-26T16:26:51Z"), "2022-05-26");
+/// assert_eq!(truncate_to_date("2022-05-26"), "2022-05-26");
+/// ```
+pub fn truncate_to_date(s: &str) -> String {
+    if let Some(t_pos) = s.find('T') {
+        s[..t_pos].to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+// ============================================================================
+// Encoding Detection
+// ============================================================================
+
+/// Extract encoding from XML declaration.
+///
+/// Parses `<?xml ... encoding="..." ?>` to extract the encoding name.
+///
+/// # Arguments
+///
+/// * `bytes` - The raw bytes (only the first ~100 bytes are checked)
+///
+/// # Returns
+///
+/// The encoding name if found, or `None`.
+pub fn extract_xml_encoding(bytes: &[u8]) -> Option<&str> {
+    // Only check the first 100 bytes for the XML declaration
+    let check_len = bytes.len().min(100);
+    let prefix = &bytes[..check_len];
+
+    // Look for <?xml
+    let xml_start = prefix.windows(5).position(|w| w == b"<?xml")?;
+    let after_xml = &prefix[xml_start..];
+
+    // Look for encoding="..." or encoding='...'
+    let enc_pos = after_xml
+        .windows(9)
+        .position(|w| w.eq_ignore_ascii_case(b"encoding="))?;
+    let after_enc = &after_xml[enc_pos + 9..];
+
+    if after_enc.is_empty() {
+        return None;
+    }
+
+    let quote = after_enc[0];
+    if quote != b'"' && quote != b'\'' {
+        return None;
+    }
+
+    let value_start = 1;
+    let value_end = after_enc[value_start..].iter().position(|&b| b == quote)? + value_start;
+
+    std::str::from_utf8(&after_enc[value_start..value_end]).ok()
+}
+
+// ============================================================================
+// Image Transcoding
+// ============================================================================
+
+/// Re-encode a raster image (PNG or JPEG) as JPEG at the given quality
+/// (1-100), for shrinking oversized images. Alpha is flattened onto white.
+/// When `max_dimension` is set, images whose long edge exceeds it are
+/// downscaled (Lanczos3) to fit; images at or below it are never resized.
+///
+/// Returns `None` when the input fails to decode; callers keep the original
+/// bytes. Callers are also expected to keep the original when the result is
+/// not (meaningfully) smaller — PNG regularly beats JPEG on line art and
+/// flat-color images, and an already well-compressed JPEG gains nothing, so
+/// a size check, not a format rule, decides.
+#[cfg(feature = "optimize-images")]
+pub fn reencode_image_as_jpeg(
+    data: &[u8],
+    quality: u8,
+    max_dimension: Option<u32>,
+) -> Option<Vec<u8>> {
+    let mut img = image::load_from_memory(data).ok()?;
+
+    if let Some(max) = max_dimension
+        && img.width().max(img.height()) > max
+    {
+        img = img.resize(max, max, image::imageops::FilterType::Lanczos3);
+    }
+
+    // Flatten transparency onto white: JPEG has no alpha, and Kindle pages
+    // are white; compositing beats dropping the channel outright.
+    let rgb = match img {
+        image::DynamicImage::ImageRgb8(rgb) => rgb,
+        other => {
+            let rgba = other.into_rgba8();
+            let mut rgb = image::RgbImage::new(rgba.width(), rgba.height());
+            for (out, px) in rgb.pixels_mut().zip(rgba.pixels()) {
+                let [r, g, b, a] = px.0;
+                let over = |c: u8| ((c as u32 * a as u32 + 255 * (255 - a as u32)) / 255) as u8;
+                out.0 = [over(r), over(g), over(b)];
+            }
+            rgb
+        }
+    };
+
+    let mut out = std::io::Cursor::new(Vec::new());
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality)
+        .encode(
+            rgb.as_raw(),
+            rgb.width(),
+            rgb.height(),
+            image::ExtendedColorType::Rgb8,
+        )
+        .ok()?;
+    Some(out.into_inner())
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_inflate_rejects_oversize_output() {
+        // Deflate a highly compressible payload, then inflate it with a cap far
+        // below its true size: it must error instead of allocating unbounded.
+        use std::io::Write;
+        let raw = vec![0u8; 1 << 20]; // 1 MiB of zeros -> tiny deflate stream
+        let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::best());
+        enc.write_all(&raw).unwrap();
+        let compressed = enc.finish().unwrap();
+        assert!(compressed.len() < 4096, "payload should compress tiny");
+
+        // Lying about the size must not matter: the hard cap is what bounds it.
+        let err = bounded_inflate(&compressed, u64::MAX, 4096).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        // A cap above the true size succeeds and round-trips.
+        let out = bounded_inflate(&compressed, 0, 1 << 21).unwrap();
+        assert_eq!(out, raw);
+    }
+
+    #[test]
+    fn test_percent_decode_basic() {
+        // No escapes: borrowed passthrough.
+        assert!(matches!(percent_decode("plain.xhtml"), Cow::Borrowed(_)));
+        assert_eq!(percent_decode("my%20chapter.xhtml"), "my chapter.xhtml");
+        // Invalid escape sequences pass through untouched.
+        assert_eq!(percent_decode("100%.png"), "100%.png");
+        assert_eq!(percent_decode("bad%zzseq"), "bad%zzseq");
+        // Non-ASCII UTF-8.
+        assert_eq!(percent_decode("caf%C3%A9.xhtml"), "café.xhtml");
+    }
+
+    #[test]
+    fn test_percent_decode_href_fragment_separate() {
+        // No escapes: borrowed passthrough.
+        assert!(matches!(
+            percent_decode_href("ch1.xhtml#sec1"),
+            Cow::Borrowed(_)
+        ));
+        // Path and fragment decoded independently; separator preserved.
+        assert_eq!(
+            percent_decode_href("my%20chapter.xhtml#sec%201"),
+            "my chapter.xhtml#sec 1"
+        );
+        // Encoded %23 in the path becomes a literal '#' in the path component
+        // but the structural separator is the first literal '#'.
+        assert_eq!(percent_decode_href("a%23b.xhtml#frag"), "a#b.xhtml#frag");
+        // Fragment-only href.
+        assert_eq!(percent_decode_href("#note%201"), "#note 1");
+    }
+
+    #[test]
+    fn test_detect_media_format_by_extension() {
+        assert_eq!(detect_media_format("image.jpg", &[]), MediaFormat::Jpeg);
+        assert_eq!(detect_media_format("image.JPEG", &[]), MediaFormat::Jpeg);
+        assert_eq!(detect_media_format("image.png", &[]), MediaFormat::Png);
+        assert_eq!(detect_media_format("image.gif", &[]), MediaFormat::Gif);
+        assert_eq!(detect_media_format("image.svg", &[]), MediaFormat::Svg);
+        assert_eq!(detect_media_format("image.webp", &[]), MediaFormat::WebP);
+        assert_eq!(detect_media_format("font.ttf", &[]), MediaFormat::Ttf);
+        assert_eq!(detect_media_format("font.otf", &[]), MediaFormat::Otf);
+        assert_eq!(detect_media_format("unknown", &[]), MediaFormat::Binary);
+    }
+
+    #[test]
+    fn test_detect_media_format_by_magic_bytes() {
+        // JPEG magic bytes
+        let jpeg_data = [0xFF, 0xD8, 0xFF, 0xE0];
+        assert_eq!(
+            detect_media_format("unknown", &jpeg_data),
+            MediaFormat::Jpeg
+        );
+
+        // PNG magic bytes
+        let png_data = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        assert_eq!(detect_media_format("unknown", &png_data), MediaFormat::Png);
+
+        // GIF magic bytes
+        let gif_data = [0x47, 0x49, 0x46, 0x38, 0x39, 0x61];
+        assert_eq!(detect_media_format("unknown", &gif_data), MediaFormat::Gif);
+    }
+
+    #[test]
+    fn test_media_format_mime_type() {
+        assert_eq!(MediaFormat::Jpeg.mime_type(), "image/jpeg");
+        assert_eq!(MediaFormat::Png.mime_type(), "image/png");
+        assert_eq!(MediaFormat::Gif.mime_type(), "image/gif");
+        assert_eq!(MediaFormat::Svg.mime_type(), "image/svg+xml");
+        assert_eq!(MediaFormat::Ttf.mime_type(), "font/ttf");
+        assert_eq!(MediaFormat::Binary.mime_type(), "application/octet-stream");
+    }
+
+    #[test]
+    fn test_media_format_classification() {
+        assert!(MediaFormat::Jpeg.is_image());
+        assert!(MediaFormat::Png.is_image());
+        assert!(!MediaFormat::Ttf.is_image());
+        assert!(!MediaFormat::Binary.is_image());
+
+        assert!(MediaFormat::Ttf.is_font());
+        assert!(MediaFormat::Otf.is_font());
+        assert!(!MediaFormat::Jpeg.is_font());
+    }
+
+    #[test]
+    fn test_detect_mime_type() {
+        assert_eq!(detect_mime_type("image.jpg", &[]), Some("image/jpeg"));
+        assert_eq!(detect_mime_type("image.png", &[]), Some("image/png"));
+        assert_eq!(detect_mime_type("unknown", &[]), None);
+    }
+
+    #[test]
+    fn test_truncate_to_date() {
+        // Full ISO timestamp -> date only
+        assert_eq!(truncate_to_date("2022-05-26T16:26:51Z"), "2022-05-26");
+        // Already just a date
+        assert_eq!(truncate_to_date("2022-05-26"), "2022-05-26");
+        // With timezone offset
+        assert_eq!(truncate_to_date("2022-05-26T16:26:51+00:00"), "2022-05-26");
+    }
+}

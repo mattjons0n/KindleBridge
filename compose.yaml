@@ -1,0 +1,72 @@
+services:
+  kindle-bridge:
+    build:
+      context: .
+      args:
+        APP_VERSION: "${KINDLE_BRIDGE_VERSION:-local}"
+        BUILD_DATE: "${KINDLE_BRIDGE_BUILD_DATE:-unknown}"
+        VCS_REF: "${KINDLE_BRIDGE_VCS_REF:-unknown}"
+        SOURCE_URL: "${KINDLE_BRIDGE_SOURCE_URL:-local}"
+    image: "${KINDLE_BRIDGE_IMAGE:-kindle-bridge:local}"
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    user: "1000:1000"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    ports:
+      # Loopback is deliberate: use a trusted HTTPS reverse proxy or VPN to
+      # reach the service from another computer.
+      - "${KINDLE_BRIDGE_BIND_ADDRESS:-127.0.0.1}:${KINDLE_BRIDGE_HTTP_PORT:-8080}:8080"
+    environment:
+      CATALOG_ALLOWED_ROOTS: /libraries
+      CATALOG_ALLOWED_ORIGINS: "${CATALOG_ALLOWED_ORIGINS:-http://127.0.0.1:8080}"
+      CATALOG_ALLOWED_HOSTS: "${CATALOG_ALLOWED_HOSTS:-127.0.0.1:8080,localhost:8080}"
+      CATALOG_REQUIRE_ORIGIN: "${CATALOG_REQUIRE_ORIGIN:-true}"
+      CATALOG_SETTINGS_MODE: "${CATALOG_SETTINGS_MODE:-read-write}"
+      CATALOG_MAX_BODY_BYTES: "${CATALOG_MAX_BODY_BYTES:-1048576}"
+      CATALOG_MAX_CONCURRENT: "${CATALOG_MAX_CONCURRENT:-64}"
+      CATALOG_MAX_SOURCE_STREAMS: "${CATALOG_MAX_SOURCE_STREAMS:-4}"
+      CATALOG_SOURCE_RESPONSE_TIMEOUT_MS: "${CATALOG_SOURCE_RESPONSE_TIMEOUT_MS:-600000}"
+      CATALOG_COVER_RESPONSE_TIMEOUT_MS: "${CATALOG_COVER_RESPONSE_TIMEOUT_MS:-30000}"
+      CATALOG_SETTINGS_VALIDATION_TIMEOUT_MS: "${CATALOG_SETTINGS_VALIDATION_TIMEOUT_MS:-10000}"
+      CATALOG_ROOT_POLICY_TIMEOUT_MS: "${CATALOG_ROOT_POLICY_TIMEOUT_MS:-10000}"
+      CATALOG_RATE_PER_MINUTE: "${CATALOG_RATE_PER_MINUTE:-600}"
+      CATALOG_SHUTDOWN_TIMEOUT_MS: "${CATALOG_SHUTDOWN_TIMEOUT_MS:-20000}"
+      CATALOG_QUIET_WINDOW_MS: "${CATALOG_QUIET_WINDOW_MS:-750}"
+      CATALOG_STABILITY_WINDOW_MS: "${CATALOG_STABILITY_WINDOW_MS:-2000}"
+      CATALOG_MAX_CONCURRENT_SCANS: "${CATALOG_MAX_CONCURRENT_SCANS:-2}"
+      CATALOG_SCAN_TIMEOUT_MS: "${CATALOG_SCAN_TIMEOUT_MS:-600000}"
+      CATALOG_MAX_SCAN_ENTRIES: "${CATALOG_MAX_SCAN_ENTRIES:-1000000}"
+      CATALOG_MAX_SCAN_DIRECTORIES: "${CATALOG_MAX_SCAN_DIRECTORIES:-50000}"
+      CATALOG_METADATA_WORKERS: "${CATALOG_METADATA_WORKERS:-2}"
+      CATALOG_METADATA_TIMEOUT_MS: "${CATALOG_METADATA_TIMEOUT_MS:-15000}"
+      CATALOG_RECONCILE_MS: "${CATALOG_RECONCILE_MS:-900000}"
+      CATALOG_DEEP_RECONCILE_MS: "${CATALOG_DEEP_RECONCILE_MS:-86400000}"
+      CATALOG_COVER_RETENTION_MS: "${CATALOG_COVER_RETENTION_MS:-604800000}"
+      CATALOG_COVER_PRUNE_MS: "${CATALOG_COVER_PRUNE_MS:-86400000}"
+    volumes:
+      - "${KINDLE_BRIDGE_LIBRARY_HOST_PATH:-./library}:/libraries:ro"
+      - kindle-bridge-data:/data
+      - kindle-bridge-cache:/cache
+    healthcheck:
+      test: ["CMD", "node", "/usr/local/lib/kindle-bridge/healthcheck.mjs"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  kindle-bridge-data:
+    name: "${KINDLE_BRIDGE_DATA_VOLUME:-kindle-bridge-data}"
+  kindle-bridge-cache:
+    name: "${KINDLE_BRIDGE_CACHE_VOLUME:-kindle-bridge-cache}"

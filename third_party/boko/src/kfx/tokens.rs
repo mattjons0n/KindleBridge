@@ -1,0 +1,378 @@
+//! KFX token stream for bidirectional conversion.
+//!
+//! The token stream is an intermediate representation that abstracts away
+//! the nested Ion structure. Both import and export work through tokens:
+//!
+//! Import: Ion → TokenStream → IR
+//! Export: IR → TokenStream → Ion
+//!
+//! ## Key Design: Generic Semantic Storage
+//!
+//! Tokens use `HashMap<SemanticTarget, String>` for semantic attributes,
+//! not typed fields like `link_target` or `resource`. This keeps the token
+//! layer format-agnostic - all format-specific logic lives in the schema.
+
+use crate::kfx::schema::SemanticTarget;
+use crate::model::{NodeId, Role};
+use smallvec::SmallVec;
+use std::collections::HashMap;
+
+/// Pre-transformed KFX element/span attributes: `(field_id, value_string)`.
+/// Most elements carry 0–2 of these (href, src, alt, a table span, …), so an
+/// inline-2 SmallVec keeps the common case off the heap.
+pub type KfxAttrs = SmallVec<[(u64, String); 2]>;
+
+/// A token in the KFX content stream.
+#[derive(Debug, Clone, PartialEq)]
+pub enum KfxToken {
+    /// Start of an element (container, paragraph, etc.)
+    StartElement(ElementStart),
+    /// End of an element
+    EndElement,
+    /// Text content
+    Text(String),
+    /// Start of an inline style span
+    StartSpan(SpanStart),
+    /// End of an inline style span
+    EndSpan,
+    /// A math equation exported as a KVG-bearing container (typeset shapes
+    /// plus mathml/alt_text annotations), or a text-child container when
+    /// the equation declined typesetting (`Raw` content).
+    MathKvg(Box<MathKvgToken>),
+    /// A math container imported from KFX: content references to its
+    /// `mathml` and `alt_text` annotation strings. The IR builder resolves
+    /// and parses them into a `Role::Math` node + `Math` AST (import-only;
+    /// export builds math from the IR side-table directly).
+    MathImport(Box<MathImportToken>),
+}
+
+/// Payload for an exported math container.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MathKvgToken {
+    /// Typeset KVG equation; `None` when the equation declined (falls back
+    /// to a text child, no mathml annotation).
+    pub kvg: Option<crate::math::kvg::KvgEquation>,
+    /// Serialized MathML (annotation; only emitted alongside KVG).
+    pub mathml: String,
+    /// Spoken alt text (annotation).
+    pub alttext: String,
+    /// Unicode linearization (text child when kvg is None).
+    pub text: String,
+    /// Display (block) vs inline math.
+    pub display: bool,
+    /// KFX style symbol for the container.
+    pub style_symbol: Option<u64>,
+    /// Original IR node id.
+    pub node_id: Option<NodeId>,
+}
+
+/// Content references carried by an imported KFX math container.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MathImportToken {
+    /// Ref to the serialized `<math>` source ($690 annotation).
+    pub mathml_ref: Option<ContentRef>,
+    /// Ref to the spoken alt text ($584 annotation).
+    pub alttext_ref: Option<ContentRef>,
+    /// KFX element id.
+    pub id: Option<i64>,
+    /// Style name for IR style lookup.
+    pub style_name: Option<String>,
+}
+
+/// Information about an element start.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ElementStart {
+    /// The resolved IR role for this element.
+    pub role: Role,
+    /// Original IR node ID (for anchor creation during export).
+    pub node_id: Option<NodeId>,
+    /// KFX element ID (for anchors/links).
+    pub id: Option<i64>,
+    /// Semantic attributes (generic map, not typed fields).
+    pub semantics: HashMap<SemanticTarget, String>,
+    /// Content reference (for text lookup).
+    pub content_ref: Option<ContentRef>,
+    /// Inline style events (spans within text content).
+    pub style_events: Vec<SpanStart>,
+    /// Pre-transformed KFX attributes (field_id, value_string).
+    /// Populated during export by schema.export_attributes().
+    pub kfx_attrs: KfxAttrs,
+    /// KFX style symbol ID for this element.
+    /// Populated during export after registering the node's style.
+    pub style_symbol: Option<u64>,
+    /// Style name reference (for import lookup).
+    /// Populated during import from the element's `style` field.
+    pub style_name: Option<String>,
+    /// Whether this element needs a container wrapper for borders to render.
+    /// KFX requires block elements with borders to be `type: container` with
+    /// nested `type: text` for content. Set during export by checking IR style.
+    pub needs_container_wrapper: bool,
+    /// Whether this table cell is a header cell (`<th>`). Set on import from
+    /// legacy marker cells or the enclosing header section; on export the
+    /// distinction is carried structurally (cells inside `type: header`).
+    pub is_header_cell: bool,
+    /// Table-level formatting for `type: table` elements, computed during
+    /// export (reference output bakes column widths and border collapsing
+    /// into the table element; the device's table renderer lays out columns
+    /// from `column_format`).
+    pub table_format: Option<Box<TableFormat>>,
+    /// Whether this is a `<caption>` directly inside a table — carries
+    /// `yj.classification: caption` like reference output.
+    pub is_table_caption: bool,
+}
+
+/// Table-element formatting attributes emitted on `type: table` ($278).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TableFormat {
+    /// Per-column widths as percentages (empty = omit column_format).
+    pub column_widths_pct: Vec<f64>,
+    /// The table's CSS `border-collapse: collapse`.
+    pub border_collapse: bool,
+}
+
+impl ElementStart {
+    /// Create a new element start with just a role.
+    pub fn new(role: Role) -> Self {
+        Self {
+            role,
+            node_id: None,
+            id: None,
+            semantics: HashMap::new(),
+            content_ref: None,
+            style_events: Vec::new(),
+            kfx_attrs: KfxAttrs::new(),
+            style_symbol: None,
+            style_name: None,
+            needs_container_wrapper: false,
+            is_header_cell: false,
+            table_format: None,
+            is_table_caption: false,
+        }
+    }
+
+    /// Get a semantic attribute value.
+    pub fn get_semantic(&self, target: SemanticTarget) -> Option<&str> {
+        self.semantics.get(&target).map(|s| s.as_str())
+    }
+
+    /// Set a semantic attribute value.
+    pub fn set_semantic(&mut self, target: SemanticTarget, value: String) {
+        self.semantics.insert(target, value);
+    }
+}
+
+/// Reference to text in a content entity.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContentRef {
+    pub name: String,
+    pub index: usize,
+}
+
+/// Information about an inline span start.
+///
+/// The role and semantics are determined by the schema based on which fields are present.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpanStart {
+    /// IR Role determined by schema (Link, Inline, etc.)
+    pub role: Role,
+    /// Original IR node ID (for anchor creation during export).
+    pub node_id: Option<NodeId>,
+    /// Semantic attributes (generic map).
+    pub semantics: HashMap<SemanticTarget, String>,
+    /// Byte offset in parent text (for reconstruction).
+    /// For import: populated from KFX style_event.
+    /// For export: calculated during tokens_to_ion.
+    pub offset: usize,
+    /// Length in bytes.
+    /// For import: populated from KFX style_event.
+    /// For export: calculated during tokens_to_ion.
+    pub length: usize,
+    /// KFX style symbol ID (for export).
+    /// Populated during ir_to_tokens from the node's registered style.
+    pub style_symbol: Option<u64>,
+    /// Pre-transformed KFX attributes (field_id, value_string).
+    /// Populated during export by schema.export_attributes().
+    pub kfx_attrs: KfxAttrs,
+}
+
+impl SpanStart {
+    /// Create a new span start.
+    pub fn new(role: Role, offset: usize, length: usize) -> Self {
+        Self {
+            role,
+            node_id: None,
+            semantics: HashMap::new(),
+            offset,
+            length,
+            style_symbol: None,
+            kfx_attrs: KfxAttrs::new(),
+        }
+    }
+
+    /// Get a semantic attribute value.
+    pub fn get_semantic(&self, target: SemanticTarget) -> Option<&str> {
+        self.semantics.get(&target).map(|s| s.as_str())
+    }
+
+    /// Set a semantic attribute value.
+    pub fn set_semantic(&mut self, target: SemanticTarget, value: String) {
+        self.semantics.insert(target, value);
+    }
+}
+
+/// A stream of KFX tokens with iterator support.
+#[derive(Debug, Default)]
+pub struct TokenStream {
+    tokens: Vec<KfxToken>,
+}
+
+impl TokenStream {
+    pub fn new() -> Self {
+        Self { tokens: Vec::new() }
+    }
+
+    pub fn push(&mut self, token: KfxToken) {
+        self.tokens.push(token);
+    }
+
+    pub fn start_element(&mut self, role: Role) {
+        self.tokens
+            .push(KfxToken::StartElement(ElementStart::new(role)));
+    }
+
+    pub fn start_element_with(
+        &mut self,
+        role: Role,
+        id: Option<i64>,
+        semantics: HashMap<SemanticTarget, String>,
+        content_ref: Option<ContentRef>,
+        style_events: Vec<SpanStart>,
+    ) {
+        self.tokens.push(KfxToken::StartElement(ElementStart {
+            role,
+            node_id: None,
+            id,
+            semantics,
+            content_ref,
+            style_events,
+            kfx_attrs: KfxAttrs::new(),
+            style_symbol: None,
+            style_name: None,
+            needs_container_wrapper: false,
+            is_header_cell: false,
+            table_format: None,
+            is_table_caption: false,
+        }));
+    }
+
+    pub fn end_element(&mut self) {
+        self.tokens.push(KfxToken::EndElement);
+    }
+
+    pub fn text(&mut self, s: impl Into<String>) {
+        self.tokens.push(KfxToken::Text(s.into()));
+    }
+
+    pub fn start_span(&mut self, role: Role, semantics: HashMap<SemanticTarget, String>) {
+        self.tokens.push(KfxToken::StartSpan(SpanStart {
+            role,
+            node_id: None,
+            semantics,
+            offset: 0,
+            length: 0,
+            style_symbol: None,
+            kfx_attrs: KfxAttrs::new(),
+        }));
+    }
+
+    pub fn end_span(&mut self) {
+        self.tokens.push(KfxToken::EndSpan);
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &KfxToken> {
+        self.tokens.iter()
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn into_iter(self) -> impl Iterator<Item = KfxToken> {
+        self.tokens.into_iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.tokens.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tokens.is_empty()
+    }
+}
+
+impl IntoIterator for TokenStream {
+    type Item = KfxToken;
+    type IntoIter = std::vec::IntoIter<KfxToken>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.tokens.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a TokenStream {
+    type Item = &'a KfxToken;
+    type IntoIter = std::slice::Iter<'a, KfxToken>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.tokens.iter()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_token_stream_basic() {
+        let mut stream = TokenStream::new();
+        stream.start_element(Role::Paragraph);
+        stream.text("Hello");
+        stream.end_element();
+
+        assert_eq!(stream.len(), 3);
+    }
+
+    #[test]
+    fn test_token_stream_with_spans() {
+        let mut stream = TokenStream::new();
+        stream.start_element(Role::Paragraph);
+        stream.text("Click ");
+
+        let mut semantics = HashMap::new();
+        semantics.insert(SemanticTarget::Href, "http://example.com".to_string());
+        stream.start_span(Role::Link, semantics);
+        stream.text("here");
+        stream.end_span();
+        stream.end_element();
+
+        assert_eq!(stream.len(), 6);
+    }
+
+    #[test]
+    fn test_element_semantics() {
+        let mut elem = ElementStart::new(Role::Image);
+        elem.set_semantic(SemanticTarget::Src, "cover.jpg".to_string());
+        elem.set_semantic(SemanticTarget::Alt, "Cover image".to_string());
+
+        assert_eq!(elem.get_semantic(SemanticTarget::Src), Some("cover.jpg"));
+        assert_eq!(elem.get_semantic(SemanticTarget::Alt), Some("Cover image"));
+        assert_eq!(elem.get_semantic(SemanticTarget::Href), None);
+    }
+
+    #[test]
+    fn test_span_semantics() {
+        let mut span = SpanStart::new(Role::Link, 10, 5);
+        span.set_semantic(SemanticTarget::Href, "chapter2".to_string());
+
+        assert_eq!(span.get_semantic(SemanticTarget::Href), Some("chapter2"));
+        assert_eq!(span.offset, 10);
+        assert_eq!(span.length, 5);
+    }
+}
