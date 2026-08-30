@@ -17,7 +17,11 @@ import {
   type PendingObjectCleanup,
 } from "../../client/src/state";
 import type { UsbDeviceLike } from "../../client/src/usb";
-import { acquireKindleDeviceLease, createManagedFilenameToken } from "../../client/src/kindle";
+import {
+  acquireKindleDeviceLease,
+  createManagedFilenameToken,
+  type KindleInventorySnapshot,
+} from "../../client/src/kindle";
 import { readPendingDeliveries } from "../../client/src/delivery-journal";
 import { METADATA_CLAIM_BITMAP_BYTES } from "../../shared/catalog-contracts";
 
@@ -305,6 +309,126 @@ describe("AppController local conversion flow", () => {
       device: { kind: "ready" },
       selfTest: { kind: "passed", byteLength: 1037 },
     });
+  });
+
+  it("logs only whitelisted aggregate Kindle metadata-cache diagnostics", async () => {
+    const app = harness();
+    const diagnosticInventory = {
+      ...app.connection.latestInventory!,
+      metadataCacheDiagnostics: {
+        evidence: {
+          candidateObjectCount: 81,
+          validModificationDateObjectCount: 0,
+          unusableModificationDateObjectCount: 81,
+          missingModificationDateObjectCount: 81,
+          invalidModificationDateObjectCount: 0,
+          metadataAdjustedObjectCount: 0,
+          emptyPathObjectCount: 0,
+          ambiguousPathObjectCount: 0,
+          reusableEvidenceObjectCount: 0,
+          relativePath: "Documents/private-book.azw3",
+        },
+        hits: { deviceObjectCount: 0, browserObjectCount: 0 },
+        portable: {
+          available: true,
+          candidateObjectCount: 0,
+          pathMissObjectCount: 0,
+          sizeMismatchObjectCount: 0,
+          formatMismatchObjectCount: 0,
+          modificationDateMismatchObjectCount: 0,
+          metadataConflictObjectCount: 0,
+          relativePath: "Documents/private-book.azw3",
+        },
+        browser: {
+          available: true,
+          lookupOutcome: "not-needed",
+          lookupCandidateObjectCount: 0,
+          writeOutcome: "no-candidates",
+          writeCandidateObjectCount: 0,
+          writeAttemptedObjectCount: 0,
+          writeAcceptedObjectCount: 0,
+          cacheKey: "private-cache-key",
+        },
+        device: {
+          mode: "read-write",
+          loadOutcome: "loaded",
+          rootHandleCount: 2,
+          unreadableRootObjectCount: 0,
+          slots: {
+            a: { outcome: "loaded", entryCount: 0, title: "Private title" },
+            b: { outcome: "absent", entryCount: 0 },
+          },
+          activeEntryCount: 0,
+          generationAmbiguous: false,
+          writeCandidateEntryCount: 0,
+          writeOutcome: "unchanged",
+          writtenEntryCount: 0,
+          cachePayloadByteCount: 167,
+          rawError: "device-supplied private error",
+        },
+      },
+    } as unknown as KindleInventorySnapshot;
+    vi.mocked(app.connection.refreshInventory).mockResolvedValueOnce(diagnosticInventory);
+
+    await app.controller.connect();
+
+    const entry = app.controller.log.entries.find(({ message }) => (
+      message === "Kindle metadata cache diagnostics"
+    ));
+    expect(entry?.context).toEqual({
+      schemaVersion: 1,
+      evidence: {
+        candidateObjects: 81,
+        validModificationDates: 0,
+        unusableModificationDates: 81,
+        missingModificationDates: 81,
+        invalidModificationDates: 0,
+        adjustedPaths: 0,
+        emptyPaths: 0,
+        ambiguousPaths: 0,
+        reusableEvidence: 0,
+      },
+      hits: { device: 0, browser: 0 },
+      portable: {
+        available: true,
+        candidates: 0,
+        pathMisses: 0,
+        sizeMismatches: 0,
+        formatMismatches: 0,
+        modificationDateMismatches: 0,
+        metadataConflicts: 0,
+      },
+      browser: {
+        available: true,
+        lookupOutcome: "not-needed",
+        lookupCandidates: 0,
+        writeOutcome: "no-candidates",
+        writeCandidates: 0,
+        writeAttempts: 0,
+        writeAccepted: 0,
+      },
+      device: {
+        mode: "read-write",
+        loadOutcome: "loaded",
+        rootHandles: 2,
+        unreadableRootObjects: 0,
+        slots: {
+          a: { outcome: "loaded", entries: 0 },
+          b: { outcome: "absent", entries: 0 },
+        },
+        activeEntries: 0,
+        generationAmbiguous: false,
+        writeOutcome: "unchanged",
+        writeCandidates: 0,
+        writtenEntries: 0,
+        cachePayloadBytes: 167,
+      },
+    });
+    const formatted = app.controller.log.format();
+    expect(formatted).not.toContain("private-book.azw3");
+    expect(formatted).not.toContain("private-cache-key");
+    expect(formatted).not.toContain("Private title");
+    expect(formatted).not.toContain("device-supplied private error");
   });
 
   it("journals an interrupted root-cache write and reruns the safe sequence after acknowledgement", async () => {

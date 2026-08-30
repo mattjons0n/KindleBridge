@@ -224,6 +224,7 @@ describe("Kindle-resident metadata cache", () => {
   it.each([
     {
       evidence: "path",
+      diagnostic: "pathMissObjectCount",
       change: (entry: KindleBridgeDeviceMetadataCacheEntry) => ({
         ...entry,
         relativePath: "different.azw3",
@@ -231,6 +232,7 @@ describe("Kindle-resident metadata cache", () => {
     },
     {
       evidence: "size",
+      diagnostic: "sizeMismatchObjectCount",
       change: (entry: KindleBridgeDeviceMetadataCacheEntry) => ({
         ...entry,
         size: entry.size + 1,
@@ -238,6 +240,7 @@ describe("Kindle-resident metadata cache", () => {
     },
     {
       evidence: "modification timestamp",
+      diagnostic: "modificationDateMismatchObjectCount",
       change: (entry: KindleBridgeDeviceMetadataCacheEntry) => ({
         ...entry,
         modificationDate: "20260830T120001Z",
@@ -245,12 +248,13 @@ describe("Kindle-resident metadata cache", () => {
     },
     {
       evidence: "object format",
+      diagnostic: "formatMismatchObjectCount",
       change: (entry: KindleBridgeDeviceMetadataCacheEntry) => ({
         ...entry,
         objectFormat: 0x3004,
       }),
     },
-  ])("falls back to a bounded live read when portable $evidence differs", async ({ change }) => {
+  ])("falls back to a bounded live read when portable $evidence differs", async ({ change, diagnostic }) => {
     const store = new FakeKindleObjectStore();
     const book = makeKindleBookFixture({
       exthTitle: "Fresh live metadata",
@@ -276,6 +280,11 @@ describe("Kindle-resident metadata cache", () => {
       budgetedByteCount: book.byteLength,
     });
     expect(inventory.bookMetadata).not.toHaveProperty("deviceCacheHitObjectCount");
+    expect(inventory.metadataCacheDiagnostics?.portable).toMatchObject({
+      available: true,
+      candidateObjectCount: 1,
+      [diagnostic]: 1,
+    });
     expect(store.readRequests.filter(({ handle }) => handle === 11)).toEqual([
       { handle: 11, maxBytes: book.byteLength },
     ]);
@@ -369,6 +378,13 @@ describe("Kindle-resident metadata cache", () => {
     const plan = planKindleBridgeDeviceMetadataCacheWrite(loaded);
 
     expect(loaded.generationAmbiguous).toBe(false);
+    expect(loaded).toMatchObject({
+      rootDiscoveryOutcome: "complete",
+      slotDiagnostics: {
+        a: { outcome: "loaded", entryCount: 1 },
+        b: { outcome: "loaded", entryCount: 1 },
+      },
+    });
     expect(loaded.active).toMatchObject({
       slot: "b",
       snapshot: { info: { handle: 21 }, cache: { generation: 4 } },
@@ -396,6 +412,10 @@ describe("Kindle-resident metadata cache", () => {
     const loaded = await loadKindleBridgeDeviceMetadataCache(store, target(store));
 
     expect(loaded.generationAmbiguous).toBe(true);
+    expect(loaded.slotDiagnostics).toEqual({
+      a: { outcome: "loaded", entryCount: 1 },
+      b: { outcome: "loaded", entryCount: 1 },
+    });
     expect(loaded.active).toBeUndefined();
     expect(loaded.context).toBeUndefined();
     expect(planKindleBridgeDeviceMetadataCacheWrite(loaded)).toBeUndefined();
@@ -416,6 +436,10 @@ describe("Kindle-resident metadata cache", () => {
 
     expect(loaded.active?.slot).toBe("b");
     expect(loaded.blockedSlots.has("a")).toBe(true);
+    expect(loaded.slotDiagnostics).toEqual({
+      a: { outcome: "blocked", entryCount: 0 },
+      b: { outcome: "loaded", entryCount: 1 },
+    });
     expect(planKindleBridgeDeviceMetadataCacheWrite(loaded)).toBeUndefined();
     expect(store.deletedHandles).toEqual([]);
     expect(store.createRequests).toEqual([]);
@@ -435,8 +459,27 @@ describe("Kindle-resident metadata cache", () => {
 
     expect(loaded.snapshotsBySlot.has("a")).toBe(false);
     expect(loaded.blockedSlots.has("a")).toBe(true);
+    expect(loaded.slotDiagnostics.a).toEqual({ outcome: "blocked", entryCount: 0 });
     expect(planKindleBridgeDeviceMetadataCacheWrite(loaded)).toBeUndefined();
     expect(store.deletedHandles).toEqual([]);
+  });
+
+  it("reports a bounded unavailable state for a nonfatal root discovery failure", async () => {
+    const store = new FakeKindleObjectStore();
+    store.listObjectHandles = vi.fn().mockRejectedValue(new Error("private device failure"));
+
+    const loaded = await loadKindleBridgeDeviceMetadataCache(store, target(store));
+
+    expect(loaded).toMatchObject({
+      rootDiscoveryOutcome: "unavailable",
+      rootHandleCount: 0,
+      unreadableRootObjectCount: 0,
+      slotDiagnostics: {
+        a: { outcome: "unavailable", entryCount: 0 },
+        b: { outcome: "unavailable", entryCount: 0 },
+      },
+    });
+    expect(loaded.context).toBeUndefined();
   });
 
   it("propagates a wrapped fatal session failure instead of treating cache discovery as optional", async () => {

@@ -15,7 +15,9 @@ import {
 } from "./filenames";
 import {
   buildKindleInventory,
+  type KindleDeviceMetadataCacheWriteOutcome,
   type KindleInventoryFolderSeed,
+  type KindleInventoryDeviceMetadataCacheDiagnostics,
   type KindleInventoryMetadataCacheContext,
   type KindleInventoryOptions,
   type KindleInventorySnapshot,
@@ -30,6 +32,7 @@ import {
 } from "./device-metadata-cache";
 import {
   encodeKindleBridgeDeviceMetadataCache,
+  type KindleBridgeDeviceMetadataCacheSlot,
 } from "./device-metadata-cache-codec";
 import { KINDLE_SELF_TEST_PAYLOAD } from "./self-test-payload";
 import {
@@ -85,6 +88,20 @@ interface ObjectExpectation {
   filename: string;
   size: number;
 }
+
+interface DeviceMetadataCacheWriteResult {
+  readonly outcome: KindleDeviceMetadataCacheWriteOutcome;
+  readonly candidateEntryCount: number;
+  readonly writtenEntryCount: number;
+  readonly byteCount: number;
+  readonly slot?: KindleBridgeDeviceMetadataCacheSlot;
+}
+
+type RootFilenamePreflight =
+  | { readonly outcome: "available" }
+  | { readonly outcome: "name-conflict" }
+  | { readonly outcome: "capacity" }
+  | { readonly outcome: "unavailable" };
 
 interface GeneratedFilenamePreflight {
   readonly filename: string;
@@ -170,6 +187,74 @@ function isAbort(error: unknown, signal: AbortSignal | undefined): boolean {
   if (error instanceof DOMException && error.name === "AbortError") return true;
   if (!error || typeof error !== "object") return false;
   return Reflect.get(error, "code") === "MTP_OPERATION_ABORTED";
+}
+
+function cacheWriteResult(
+  outcome: KindleDeviceMetadataCacheWriteOutcome,
+  candidateEntryCount: number,
+  options: {
+    readonly writtenEntryCount?: number;
+    readonly byteCount?: number;
+    readonly slot?: KindleBridgeDeviceMetadataCacheSlot;
+  } = {},
+): DeviceMetadataCacheWriteResult {
+  return Object.freeze({
+    outcome,
+    candidateEntryCount,
+    writtenEntryCount: options.writtenEntryCount ?? 0,
+    byteCount: options.byteCount ?? 0,
+    ...(options.slot === undefined ? {} : { slot: options.slot }),
+  });
+}
+
+function deviceCacheDiagnostics(
+  mode: KindleInventoryDeviceMetadataCacheDiagnostics["mode"],
+  loaded: LoadedKindleBridgeDeviceMetadataCache | undefined,
+  write: DeviceMetadataCacheWriteResult,
+): KindleInventoryDeviceMetadataCacheDiagnostics {
+  if (mode === "disabled" || loaded === undefined) {
+    return Object.freeze({
+      mode,
+      loadOutcome: "disabled",
+      rootHandleCount: 0,
+      unreadableRootObjectCount: 0,
+      slots: Object.freeze({
+        a: Object.freeze({ outcome: "disabled", entryCount: 0 }),
+        b: Object.freeze({ outcome: "disabled", entryCount: 0 }),
+      }),
+      activeEntryCount: 0,
+      generationAmbiguous: false,
+      writeCandidateEntryCount: write.candidateEntryCount,
+      writeOutcome: write.outcome,
+      writtenEntryCount: write.writtenEntryCount,
+      cachePayloadByteCount: write.byteCount,
+      ...(write.slot === undefined ? {} : { writeSlot: write.slot }),
+    });
+  }
+  const loadOutcome: KindleInventoryDeviceMetadataCacheDiagnostics["loadOutcome"] =
+    loaded.rootDiscoveryOutcome === "unavailable"
+      ? "root-unavailable"
+      : loaded.generationAmbiguous
+        ? "generation-conflict"
+        : loaded.active !== undefined
+          ? "loaded"
+          : loaded.blockedSlots.size > 0
+            ? "blocked"
+            : "none";
+  return Object.freeze({
+    mode,
+    loadOutcome,
+    rootHandleCount: loaded.rootHandleCount,
+    unreadableRootObjectCount: loaded.unreadableRootObjectCount,
+    slots: loaded.slotDiagnostics,
+    activeEntryCount: loaded.active?.snapshot.cache.entries.length ?? 0,
+    generationAmbiguous: loaded.generationAmbiguous,
+    writeCandidateEntryCount: write.candidateEntryCount,
+    writeOutcome: write.outcome,
+    writtenEntryCount: write.writtenEntryCount,
+    cachePayloadByteCount: write.byteCount,
+    ...(write.slot === undefined ? {} : { writeSlot: write.slot }),
+  });
 }
 
 export class KindleDevice {
@@ -392,6 +477,12 @@ export class KindleDevice {
   async inventory(
     options: KindleInventoryOptions = {},
   ): Promise<KindleInventorySnapshot> {
+    const cacheMode: KindleInventoryDeviceMetadataCacheDiagnostics["mode"] =
+      options.deviceMetadataCache === false
+        ? "disabled"
+        : options.deviceMetadataCache === "read-write"
+          ? "read-write"
+          : "read-only";
     const target = await this.ensureTarget(0, options);
     const folderSeed = this.inventoryFolderSeed;
     this.inventoryFolderSeed = undefined;
@@ -410,6 +501,7 @@ export class KindleDevice {
       this.inventoryMetadataCacheContext,
       loadedDeviceCache?.context,
     );
+    let cacheWrite = cacheWriteResult("not-requested", 0);
     if (
       options.deviceMetadataCache === "read-write"
       && this.selfTestPassed
@@ -418,14 +510,35 @@ export class KindleDevice {
       && inventory.bookMetadata?.status !== "disabled"
       && loadedDeviceCache !== undefined
     ) {
-      await this.updateDeviceMetadataCache(
+      cacheWrite = await this.updateDeviceMetadataCache(
         target,
         inventory,
         loadedDeviceCache,
         options,
       );
+    } else if (options.deviceMetadataCache === "read-write") {
+      const outcome: KindleDeviceMetadataCacheWriteOutcome =
+        !this.selfTestPassed || options.onObjectState === undefined
+          ? "not-authorized"
+          : inventory.status !== "complete"
+            ? "skipped-incomplete-inventory"
+            : inventory.bookMetadata?.status === "disabled"
+              ? "skipped-metadata-disabled"
+              : "skipped-cache-load-unavailable";
+      cacheWrite = cacheWriteResult(outcome, 0);
     }
-    return inventory;
+    const diagnostics = deviceCacheDiagnostics(cacheMode, loadedDeviceCache, cacheWrite);
+    return Object.freeze({
+      ...inventory,
+      ...(inventory.metadataCacheDiagnostics === undefined
+        ? {}
+        : {
+            metadataCacheDiagnostics: Object.freeze({
+              ...inventory.metadataCacheDiagnostics,
+              device: diagnostics,
+            }),
+          }),
+    });
   }
 
   async sendAzW3(
@@ -536,7 +649,7 @@ export class KindleDevice {
     inventory: KindleInventorySnapshot,
     loaded: LoadedKindleBridgeDeviceMetadataCache,
     options: KindleInventoryOptions,
-  ): Promise<void> {
+  ): Promise<DeviceMetadataCacheWriteResult> {
     const entries = kindleInventoryToDeviceMetadataCacheEntries(inventory);
     if (loaded.active) {
       try {
@@ -547,17 +660,21 @@ export class KindleDevice {
           ),
         );
         options.signal?.throwIfAborted();
-        if (equalBytes(unchanged, loaded.active.snapshot.data)) return;
+        if (equalBytes(unchanged, loaded.active.snapshot.data)) {
+          return cacheWriteResult("unchanged", entries.length, {
+            byteCount: unchanged.byteLength,
+          });
+        }
       } catch (error) {
         if (isAbort(error, options.signal)) throw error;
         // Encoding is optional acceleration. Live inventory remains valid and
         // no device mutation has begun.
-        return;
+        return cacheWriteResult("skipped-encode-failed", entries.length);
       }
     }
 
     const plan = planKindleBridgeDeviceMetadataCacheWrite(loaded);
-    if (!plan) return;
+    if (!plan) return cacheWriteResult("skipped-no-safe-slot", entries.length);
     let bytes: Uint8Array;
     try {
       bytes = await encodeKindleBridgeDeviceMetadataCache(
@@ -566,7 +683,7 @@ export class KindleDevice {
       options.signal?.throwIfAborted();
     } catch (error) {
       if (isAbort(error, options.signal)) throw error;
-      return;
+      return cacheWriteResult("skipped-encode-failed", entries.length, { slot: plan.slot });
     }
 
     let refreshedStorage: KindleTarget["storage"];
@@ -577,14 +694,28 @@ export class KindleDevice {
       if (isKindleDeviceMetadataCacheTransportFailure(error)) throw error;
       // The live inventory remains valid when the selected storage cannot be
       // refreshed for this optional auxiliary write.
-      return;
+      return cacheWriteResult("skipped-storage-unavailable", entries.length, {
+        byteCount: bytes.byteLength,
+        slot: plan.slot,
+      });
     }
-    if (
-      !this.selfTestPassed
-      || refreshedStorage.accessCapability !== MTP_ACCESS_READ_WRITE
-      || refreshedStorage.freeSpaceInBytes < bigintSize(bytes.byteLength)
-    ) {
-      return;
+    if (!this.selfTestPassed) {
+      return cacheWriteResult("not-authorized", entries.length, {
+        byteCount: bytes.byteLength,
+        slot: plan.slot,
+      });
+    }
+    if (refreshedStorage.accessCapability !== MTP_ACCESS_READ_WRITE) {
+      return cacheWriteResult("skipped-storage-read-only", entries.length, {
+        byteCount: bytes.byteLength,
+        slot: plan.slot,
+      });
+    }
+    if (refreshedStorage.freeSpaceInBytes < bigintSize(bytes.byteLength)) {
+      return cacheWriteResult("skipped-insufficient-space", entries.length, {
+        byteCount: bytes.byteLength,
+        slot: plan.slot,
+      });
     }
 
     // Rotate A/B slots. If the inactive slot still contains a fully validated
@@ -597,7 +728,10 @@ export class KindleDevice {
       } catch (error) {
         if (isAbort(error, options.signal)) throw error;
         if (isKindleDeviceMetadataCacheTransportFailure(error)) throw error;
-        return;
+        return cacheWriteResult("skipped-replacement-failed", entries.length, {
+          byteCount: bytes.byteLength,
+          slot: plan.slot,
+        });
       }
     }
 
@@ -606,7 +740,18 @@ export class KindleDevice {
       plan.filename,
       options,
     );
-    if (rootPreflight.filenameExists || rootPreflight.atCapacity) return;
+    if (rootPreflight.outcome !== "available") {
+      const outcome: KindleDeviceMetadataCacheWriteOutcome =
+        rootPreflight.outcome === "name-conflict"
+          ? "skipped-root-name-conflict"
+          : rootPreflight.outcome === "capacity"
+            ? "skipped-root-capacity"
+            : "skipped-root-unavailable";
+      return cacheWriteResult(outcome, entries.length, {
+        byteCount: bytes.byteLength,
+        slot: plan.slot,
+      });
+    }
 
     let created: KindleCreatedObject | undefined;
     try {
@@ -661,12 +806,20 @@ export class KindleDevice {
         filename: plan.filename,
         size: bytes.byteLength,
       });
+      return cacheWriteResult("written", entries.length, {
+        writtenEntryCount: entries.length,
+        byteCount: bytes.byteLength,
+        slot: plan.slot,
+      });
     } catch (error) {
       const partial = partialUploadOutcome(error);
       if (partial?.cleanupSucceeded) {
         if (isAbort(error, options.signal)) throw error;
         if (isKindleDeviceMetadataCacheTransportFailure(error)) throw error;
-        return;
+        return cacheWriteResult("create-failed-cleaned", entries.length, {
+          byteCount: bytes.byteLength,
+          slot: plan.slot,
+        });
       }
       if (partial?.cleanupAttempted) {
         throw this.cleanupFailure(
@@ -687,6 +840,10 @@ export class KindleDevice {
       if (isKindleDeviceMetadataCacheTransportFailure(error)) throw error;
       // The new cache was removed exactly. Keep the live inventory and the
       // still-valid prior slot rather than failing the connection.
+      return cacheWriteResult("create-failed-cleaned", entries.length, {
+        byteCount: bytes.byteLength,
+        slot: plan.slot,
+      });
     }
   }
 
@@ -694,7 +851,7 @@ export class KindleDevice {
     storageId: number,
     filename: string,
     options: KindleOperationOptions,
-  ): Promise<{ readonly filenameExists: boolean; readonly atCapacity: boolean }> {
+  ): Promise<RootFilenamePreflight> {
     let handles: readonly number[];
     try {
       handles = await this.store.listObjectHandles({
@@ -705,17 +862,16 @@ export class KindleDevice {
       for (const handle of handles) {
         const info = await this.store.getObjectInfo(handle, options);
         if (filenamesEqual(info.filename, filename)) {
-          return { filenameExists: true, atCapacity: handles.length >= MAX_ROOT_OBJECT_HANDLES };
+          return { outcome: "name-conflict" };
         }
       }
-      return {
-        filenameExists: false,
-        atCapacity: handles.length >= MAX_ROOT_OBJECT_HANDLES,
-      };
+      return handles.length >= MAX_ROOT_OBJECT_HANDLES
+        ? { outcome: "capacity" }
+        : { outcome: "available" };
     } catch (error) {
       if (isAbort(error, options.signal)) throw error;
       if (isKindleDeviceMetadataCacheTransportFailure(error)) throw error;
-      return { filenameExists: true, atCapacity: true };
+      return { outcome: "unavailable" };
     }
   }
 

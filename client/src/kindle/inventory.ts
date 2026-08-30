@@ -152,6 +152,116 @@ export interface KindleInventoryMetadataSummary {
   readonly truncationReasons: readonly KindleMetadataTruncationReason[];
 }
 
+export type KindleBrowserMetadataCacheLookupOutcome =
+  | "disabled"
+  | "not-needed"
+  | "completed"
+  | "failed";
+
+export type KindleBrowserMetadataCacheWriteOutcome =
+  | "disabled"
+  | "no-candidates"
+  | "accepted-all"
+  | "accepted-partial"
+  | "failed";
+
+export type KindleDeviceMetadataCacheSlotLoadOutcome =
+  | "disabled"
+  | "absent"
+  | "loaded"
+  | "blocked"
+  | "unavailable";
+
+export type KindleDeviceMetadataCacheLoadOutcome =
+  | "disabled"
+  | "root-unavailable"
+  | "none"
+  | "loaded"
+  | "blocked"
+  | "generation-conflict";
+
+export type KindleDeviceMetadataCacheWriteOutcome =
+  | "not-requested"
+  | "not-authorized"
+  | "skipped-incomplete-inventory"
+  | "skipped-metadata-disabled"
+  | "skipped-cache-load-unavailable"
+  | "unchanged"
+  | "written"
+  | "skipped-no-safe-slot"
+  | "skipped-encode-failed"
+  | "skipped-storage-unavailable"
+  | "skipped-storage-read-only"
+  | "skipped-insufficient-space"
+  | "skipped-replacement-failed"
+  | "skipped-root-name-conflict"
+  | "skipped-root-capacity"
+  | "skipped-root-unavailable"
+  | "create-failed-cleaned";
+
+export interface KindleInventoryDeviceMetadataCacheDiagnostics {
+  readonly mode: "disabled" | "read-only" | "read-write";
+  readonly loadOutcome: KindleDeviceMetadataCacheLoadOutcome;
+  readonly rootHandleCount: number;
+  readonly unreadableRootObjectCount: number;
+  readonly slots: Readonly<Record<"a" | "b", {
+    readonly outcome: KindleDeviceMetadataCacheSlotLoadOutcome;
+    readonly entryCount: number;
+  }>>;
+  readonly activeEntryCount: number;
+  readonly generationAmbiguous: boolean;
+  readonly writeCandidateEntryCount: number;
+  readonly writeOutcome: KindleDeviceMetadataCacheWriteOutcome;
+  readonly writtenEntryCount: number;
+  /** Encoded cache payload size; zero when encoding was not reached. */
+  readonly cachePayloadByteCount: number;
+  readonly writeSlot?: "a" | "b";
+}
+
+/**
+ * Aggregate, privacy-safe cache telemetry. Counts can diagnose optional-cache
+ * misses without retaining paths, timestamps, book metadata, identities, or
+ * device handles in the debug log.
+ */
+export interface KindleInventoryMetadataCacheDiagnostics {
+  readonly evidence: {
+    /** Supported, unmanaged Kindle-book objects considered for parsed metadata reuse. */
+    readonly candidateObjectCount: number;
+    readonly validModificationDateObjectCount: number;
+    readonly unusableModificationDateObjectCount: number;
+    readonly missingModificationDateObjectCount: number;
+    readonly invalidModificationDateObjectCount: number;
+    /** Exclusion counts can overlap; reusableEvidenceObjectCount passes every guard. */
+    readonly metadataAdjustedObjectCount: number;
+    readonly emptyPathObjectCount: number;
+    readonly ambiguousPathObjectCount: number;
+    readonly reusableEvidenceObjectCount: number;
+  };
+  readonly hits: {
+    readonly deviceObjectCount: number;
+    readonly browserObjectCount: number;
+  };
+  readonly portable: {
+    readonly available: boolean;
+    readonly candidateObjectCount: number;
+    readonly pathMissObjectCount: number;
+    readonly sizeMismatchObjectCount: number;
+    readonly formatMismatchObjectCount: number;
+    readonly modificationDateMismatchObjectCount: number;
+    readonly metadataConflictObjectCount: number;
+  };
+  readonly browser: {
+    readonly available: boolean;
+    readonly lookupOutcome: KindleBrowserMetadataCacheLookupOutcome;
+    readonly lookupCandidateObjectCount: number;
+    readonly writeOutcome: KindleBrowserMetadataCacheWriteOutcome;
+    readonly writeCandidateObjectCount: number;
+    readonly writeAttemptedObjectCount: number;
+    readonly writeAcceptedObjectCount: number;
+  };
+  readonly device?: KindleInventoryDeviceMetadataCacheDiagnostics;
+}
+
 export interface KindleInventorySnapshot {
   readonly status: KindleInventoryStatus;
   readonly storageId: number;
@@ -163,6 +273,7 @@ export interface KindleInventorySnapshot {
   readonly scannedObjectCount: number;
   /** Separate from hierarchy `status`; metadata failures never prove a book absent. */
   readonly bookMetadata?: KindleInventoryMetadataSummary;
+  readonly metadataCacheDiagnostics?: KindleInventoryMetadataCacheDiagnostics;
 }
 
 /**
@@ -414,6 +525,10 @@ interface MetadataCounters {
   cached: number;
   deviceCached: number;
   browserCached: number;
+  browserWriteCandidates: number;
+  browserWriteAttempts: number;
+  browserWriteAccepted: number;
+  browserWriteFailed: boolean;
   readBytes: number;
   budgetedBytes: number;
 }
@@ -502,6 +617,13 @@ interface InventoryMetadataCacheHit {
   readonly metadata: KindleBookMetadata;
 }
 
+interface CachedMetadataHitsResult {
+  readonly hits: ReadonlyMap<number, InventoryMetadataCacheHit>;
+  readonly portableDiagnostics: KindleInventoryMetadataCacheDiagnostics["portable"];
+  readonly browserLookupOutcome: KindleBrowserMetadataCacheLookupOutcome;
+  readonly browserLookupCandidateObjectCount: number;
+}
+
 function deviceCacheEvidenceKey(
   relativePath: string,
   objectFormat: number,
@@ -527,6 +649,60 @@ function liveCachePathCounts(
   return counts;
 }
 
+function isMetadataCacheDiagnosticCandidate(object: KindleInventoryObject): boolean {
+  return isEligibleBookObject(object)
+    && hasSupportedEmbeddedMetadata(object.filename)
+    && (object.managedToken === undefined || object.metadataAdjusted);
+}
+
+function cacheEvidenceDiagnostics(
+  objects: readonly KindleInventoryObject[],
+  livePathCounts: ReadonlyMap<string, number>,
+  modificationDates: {
+    readonly missingObjectCount: number;
+    readonly invalidObjectCount: number;
+  },
+): KindleInventoryMetadataCacheDiagnostics["evidence"] {
+  let candidateObjectCount = 0;
+  let validModificationDateObjectCount = 0;
+  let unusableModificationDateObjectCount = 0;
+  let metadataAdjustedObjectCount = 0;
+  let emptyPathObjectCount = 0;
+  let ambiguousPathObjectCount = 0;
+  let reusableEvidenceObjectCount = 0;
+  for (const object of objects) {
+    if (!isMetadataCacheDiagnosticCandidate(object)) continue;
+    candidateObjectCount += 1;
+    if (object.modificationDate === undefined) unusableModificationDateObjectCount += 1;
+    else validModificationDateObjectCount += 1;
+    if (object.metadataAdjusted) metadataAdjustedObjectCount += 1;
+    if (object.relativePath.length === 0) emptyPathObjectCount += 1;
+    const uniquePath = object.relativePath.length > 0
+      && livePathCounts.get(portablePathKey(object.relativePath)) === 1;
+    if (!object.metadataAdjusted && object.relativePath.length > 0 && !uniquePath) {
+      ambiguousPathObjectCount += 1;
+    }
+    if (
+      !object.metadataAdjusted
+      && object.modificationDate !== undefined
+      && uniquePath
+    ) {
+      reusableEvidenceObjectCount += 1;
+    }
+  }
+  return Object.freeze({
+    candidateObjectCount,
+    validModificationDateObjectCount,
+    unusableModificationDateObjectCount,
+    missingModificationDateObjectCount: modificationDates.missingObjectCount,
+    invalidModificationDateObjectCount: modificationDates.invalidObjectCount,
+    metadataAdjustedObjectCount,
+    emptyPathObjectCount,
+    ambiguousPathObjectCount,
+    reusableEvidenceObjectCount,
+  });
+}
+
 function equalBookMetadata(left: KindleBookMetadata, right: KindleBookMetadata): boolean {
   return left.title === right.title
     && left.language === right.language
@@ -536,16 +712,38 @@ function equalBookMetadata(left: KindleBookMetadata, right: KindleBookMetadata):
     && left.identifiers.every((value, index) => value === right.identifiers[index]);
 }
 
+interface PortableMetadataHitsResult {
+  readonly hits: ReadonlyMap<number, InventoryMetadataCacheHit>;
+  readonly diagnostics: KindleInventoryMetadataCacheDiagnostics["portable"];
+}
+
 function portableMetadataHits(
   objects: readonly KindleInventoryObject[],
   maximum: number,
   context: KindleInventoryDeviceMetadataCacheContext | undefined,
   livePathCounts: ReadonlyMap<string, number>,
-): ReadonlyMap<number, InventoryMetadataCacheHit> {
-  if (!context || context.caches.length === 0) return new Map();
+): PortableMetadataHitsResult {
+  if (!context || context.caches.length === 0) {
+    return Object.freeze({
+      hits: new Map(),
+      diagnostics: Object.freeze({
+        available: false,
+        candidateObjectCount: 0,
+        pathMissObjectCount: 0,
+        sizeMismatchObjectCount: 0,
+        formatMismatchObjectCount: 0,
+        modificationDateMismatchObjectCount: 0,
+        metadataConflictObjectCount: 0,
+      }),
+    });
+  }
   const entries = new Map<string, KindleBridgeDeviceMetadataCacheEntry | null>();
+  const entriesByPath = new Map<string, KindleBridgeDeviceMetadataCacheEntry[]>();
   for (const cache of context.caches) {
     for (const entry of cache.entries) {
+      const pathEntries = entriesByPath.get(entry.relativePath) ?? [];
+      pathEntries.push(entry);
+      entriesByPath.set(entry.relativePath, pathEntries);
       const key = deviceCacheEvidenceKey(
         entry.relativePath,
         entry.objectFormat,
@@ -563,6 +761,12 @@ function portableMetadataHits(
   }
 
   const hits = new Map<number, InventoryMetadataCacheHit>();
+  let candidateObjectCount = 0;
+  let pathMissObjectCount = 0;
+  let sizeMismatchObjectCount = 0;
+  let formatMismatchObjectCount = 0;
+  let modificationDateMismatchObjectCount = 0;
+  let metadataConflictObjectCount = 0;
   for (const object of objects) {
     if (
       hits.size >= maximum
@@ -576,20 +780,58 @@ function portableMetadataHits(
     ) {
       continue;
     }
+    candidateObjectCount += 1;
+    const pathEntries = entriesByPath.get(object.relativePath) ?? [];
+    if (pathEntries.length === 0) {
+      pathMissObjectCount += 1;
+      continue;
+    }
+    const sizeEntries = pathEntries.filter((entry) => entry.size === object.size);
+    if (sizeEntries.length === 0) {
+      sizeMismatchObjectCount += 1;
+      continue;
+    }
+    const formatEntries = sizeEntries.filter((entry) => entry.objectFormat === object.objectFormat);
+    if (formatEntries.length === 0) {
+      formatMismatchObjectCount += 1;
+      continue;
+    }
+    const modificationDateEntries = formatEntries.filter((entry) => (
+      entry.modificationDate === object.modificationDate
+    ));
+    if (modificationDateEntries.length === 0) {
+      modificationDateMismatchObjectCount += 1;
+      continue;
+    }
     const entry = entries.get(deviceCacheEvidenceKey(
       object.relativePath,
       object.objectFormat,
       object.size,
       object.modificationDate,
     ));
-    if (!entry) continue;
+    if (entry === null) {
+      metadataConflictObjectCount += 1;
+      continue;
+    }
+    if (entry === undefined) continue;
     hits.set(object.handle, Object.freeze({
       provenance: "device-metadata-cache",
       authoritative: false,
       metadata: entry.metadata,
     }));
   }
-  return hits;
+  return Object.freeze({
+    hits,
+    diagnostics: Object.freeze({
+      available: true,
+      candidateObjectCount,
+      pathMissObjectCount,
+      sizeMismatchObjectCount,
+      formatMismatchObjectCount,
+      modificationDateMismatchObjectCount,
+      metadataConflictObjectCount,
+    }),
+  });
 }
 
 async function cachedMetadataHits(
@@ -599,14 +841,30 @@ async function cachedMetadataHits(
   deviceContext: KindleInventoryDeviceMetadataCacheContext | undefined,
   livePathCounts: ReadonlyMap<string, number>,
   signal: AbortSignal | undefined,
-): Promise<ReadonlyMap<number, InventoryMetadataCacheHit>> {
-  const byHandle = new Map(portableMetadataHits(
+): Promise<CachedMetadataHitsResult> {
+  const portable = portableMetadataHits(
     objects,
     maximum,
     deviceContext,
     livePathCounts,
-  ));
-  if (!context || byHandle.size >= maximum) return byHandle;
+  );
+  const byHandle = new Map(portable.hits);
+  if (!context) {
+    return Object.freeze({
+      hits: byHandle,
+      portableDiagnostics: portable.diagnostics,
+      browserLookupOutcome: "disabled",
+      browserLookupCandidateObjectCount: 0,
+    });
+  }
+  if (byHandle.size >= maximum) {
+    return Object.freeze({
+      hits: byHandle,
+      portableDiagnostics: portable.diagnostics,
+      browserLookupOutcome: "not-needed",
+      browserLookupCandidateObjectCount: 0,
+    });
+  }
   const handles: number[] = [];
   const evidence: KindleMetadataCacheEvidence[] = [];
   for (const object of objects) {
@@ -624,7 +882,14 @@ async function cachedMetadataHits(
     handles.push(object.handle);
     evidence.push(candidate);
   }
-  if (evidence.length === 0) return byHandle;
+  if (evidence.length === 0) {
+    return Object.freeze({
+      hits: byHandle,
+      portableDiagnostics: portable.diagnostics,
+      browserLookupOutcome: "not-needed",
+      browserLookupCandidateObjectCount: 0,
+    });
+  }
   try {
     const hits = await context.cache.lookupMany(evidence);
     signal?.throwIfAborted();
@@ -632,12 +897,22 @@ async function cachedMetadataHits(
       const hit = hits[index];
       if (hit?.authoritative === false) byHandle.set(handles[index]!, hit);
     }
-    return byHandle;
+    return Object.freeze({
+      hits: byHandle,
+      portableDiagnostics: portable.diagnostics,
+      browserLookupOutcome: "completed",
+      browserLookupCandidateObjectCount: evidence.length,
+    });
   } catch (error) {
     if (isAbort(error, signal)) throw error;
     // The cache is an optional acceleration only. Corrupt, unavailable, or
     // quota-blocked browser storage must fall back to live bounded reads.
-    return byHandle;
+    return Object.freeze({
+      hits: byHandle,
+      portableDiagnostics: portable.diagnostics,
+      browserLookupOutcome: "failed",
+      browserLookupCandidateObjectCount: evidence.length,
+    });
   }
 }
 
@@ -649,9 +924,14 @@ async function enrichBookMetadata(
   signal: AbortSignal | undefined,
   cacheContext?: KindleInventoryMetadataCacheContext,
   deviceCacheContext?: KindleInventoryDeviceMetadataCacheContext,
+  modificationDates: {
+    readonly missingObjectCount: number;
+    readonly invalidObjectCount: number;
+  } = { missingObjectCount: 0, invalidObjectCount: 0 },
 ): Promise<{
   readonly objects: readonly KindleInventoryObject[];
   readonly summary: KindleInventoryMetadataSummary;
+  readonly cacheDiagnostics: KindleInventoryMetadataCacheDiagnostics;
 }> {
   const eligibleObjectCount = objects.filter(isEligibleBookObject).length;
   const counters: MetadataCounters = {
@@ -665,19 +945,51 @@ async function enrichBookMetadata(
     cached: 0,
     deviceCached: 0,
     browserCached: 0,
+    browserWriteCandidates: 0,
+    browserWriteAttempts: 0,
+    browserWriteAccepted: 0,
+    browserWriteFailed: false,
     readBytes: 0,
     budgetedBytes: 0,
   };
   const reasons = new Set<KindleMetadataTruncationReason>();
+  const livePathCounts = liveCachePathCounts(objects);
+  const evidenceDiagnostics = cacheEvidenceDiagnostics(
+    objects,
+    livePathCounts,
+    modificationDates,
+  );
   if (limits === false) {
     return {
       objects,
       summary: metadataSummary(false, eligibleObjectCount, counters, reasons),
+      cacheDiagnostics: Object.freeze({
+        evidence: evidenceDiagnostics,
+        hits: Object.freeze({ deviceObjectCount: 0, browserObjectCount: 0 }),
+        portable: Object.freeze({
+          available: deviceCacheContext !== undefined
+            && deviceCacheContext.caches.length > 0,
+          candidateObjectCount: 0,
+          pathMissObjectCount: 0,
+          sizeMismatchObjectCount: 0,
+          formatMismatchObjectCount: 0,
+          modificationDateMismatchObjectCount: 0,
+          metadataConflictObjectCount: 0,
+        }),
+        browser: Object.freeze({
+          available: cacheContext !== undefined,
+          lookupOutcome: cacheContext === undefined ? "disabled" : "not-needed",
+          lookupCandidateObjectCount: 0,
+          writeOutcome: cacheContext === undefined ? "disabled" : "no-candidates",
+          writeCandidateObjectCount: 0,
+          writeAttemptedObjectCount: 0,
+          writeAcceptedObjectCount: 0,
+        }),
+      }),
     };
   }
 
-  const livePathCounts = liveCachePathCounts(objects);
-  const cacheHits = await cachedMetadataHits(
+  const cacheLookup = await cachedMetadataHits(
     objects,
     limits.maxObjects,
     cacheContext,
@@ -685,6 +997,7 @@ async function enrichBookMetadata(
     livePathCounts,
     signal,
   );
+  const cacheHits = cacheLookup.hits;
   const cacheEntries: KindleMetadataCacheEntry[] = [];
   let cacheWritesEnabled = cacheContext !== undefined;
   const flushCacheEntries = async (force = false): Promise<void> => {
@@ -698,14 +1011,17 @@ async function enrichBookMetadata(
     }
     signal?.throwIfAborted();
     const batch = cacheEntries.splice(0, METADATA_CACHE_WRITE_BATCH_SIZE);
+    counters.browserWriteAttempts += batch.length;
     try {
       const accepted = await cacheContext.cache.rememberMany(batch);
       signal?.throwIfAborted();
+      counters.browserWriteAccepted += accepted;
       if (accepted !== batch.length) cacheWritesEnabled = false;
     } catch (error) {
       if (isAbort(error, signal)) throw error;
       // Disable writes for the remainder of this inventory. The cache is an
       // optional accelerator and must not repeatedly delay live device work.
+      counters.browserWriteFailed = true;
       cacheWritesEnabled = false;
     }
   };
@@ -739,9 +1055,12 @@ async function enrichBookMetadata(
       enrichedObjects.push(enrichedObject);
       if (cacheHit.provenance === "device-metadata-cache") {
         const evidence = cacheEvidenceFor(object, cacheContext, livePathCounts);
-        if (cacheWritesEnabled && evidence !== undefined) {
-          cacheEntries.push({ evidence, metadata: cacheHit.metadata });
-          await flushCacheEntries();
+        if (evidence !== undefined) {
+          counters.browserWriteCandidates += 1;
+          if (cacheWritesEnabled) {
+            cacheEntries.push({ evidence, metadata: cacheHit.metadata });
+            await flushCacheEntries();
+          }
         }
       }
       continue;
@@ -795,9 +1114,12 @@ async function enrichBookMetadata(
       }
       enrichedObjects.push(enrichedObject);
       const evidence = cacheEvidenceFor(object, cacheContext, livePathCounts);
-      if (cacheWritesEnabled && evidence !== undefined) {
-        cacheEntries.push({ evidence, metadata });
-        await flushCacheEntries();
+      if (evidence !== undefined) {
+        counters.browserWriteCandidates += 1;
+        if (cacheWritesEnabled) {
+          cacheEntries.push({ evidence, metadata });
+          await flushCacheEntries();
+        }
       }
     } catch (error) {
       if (isAbort(error, signal)) throw error;
@@ -808,9 +1130,36 @@ async function enrichBookMetadata(
   }
 
   await flushCacheEntries(true);
+  const browserWriteOutcome: KindleBrowserMetadataCacheWriteOutcome = cacheContext === undefined
+    ? "disabled"
+    : counters.browserWriteCandidates === 0
+      ? "no-candidates"
+      : counters.browserWriteFailed
+        ? "failed"
+        : counters.browserWriteAccepted === counters.browserWriteAttempts
+          && counters.browserWriteAttempts === counters.browserWriteCandidates
+          ? "accepted-all"
+          : "accepted-partial";
   return {
     objects: Object.freeze(enrichedObjects),
     summary: metadataSummary(true, eligibleObjectCount, counters, reasons),
+    cacheDiagnostics: Object.freeze({
+      evidence: evidenceDiagnostics,
+      hits: Object.freeze({
+        deviceObjectCount: counters.deviceCached,
+        browserObjectCount: counters.browserCached,
+      }),
+      portable: cacheLookup.portableDiagnostics,
+      browser: Object.freeze({
+        available: cacheContext !== undefined,
+        lookupOutcome: cacheLookup.browserLookupOutcome,
+        lookupCandidateObjectCount: cacheLookup.browserLookupCandidateObjectCount,
+        writeOutcome: browserWriteOutcome,
+        writeCandidateObjectCount: counters.browserWriteCandidates,
+        writeAttemptedObjectCount: counters.browserWriteAttempts,
+        writeAcceptedObjectCount: counters.browserWriteAccepted,
+      }),
+    }),
   };
 }
 
@@ -836,6 +1185,8 @@ export async function buildKindleInventory(
   };
   const objects: KindleInventoryObject[] = [];
   const issues: KindleInventoryIssue[] = [];
+  let missingModificationDateObjectCount = 0;
+  let invalidModificationDateObjectCount = 0;
   const seenHandles = new Set<number>([target.documentsHandle]);
   const queue: FolderWork[] = [{
     handle: target.documentsHandle,
@@ -992,6 +1343,10 @@ export async function buildKindleInventory(
         ...(managedToken === undefined ? {} : { managedToken }),
         metadataAdjusted,
       });
+      if (isMetadataCacheDiagnosticCandidate(object) && modificationDate === undefined) {
+        if (info.modificationDate.length === 0) missingModificationDateObjectCount += 1;
+        else invalidModificationDateObjectCount += 1;
+      }
       objects.push(object);
       if (kind === "folder" && !isKindleSidecarFolderFilename(info.filename)) {
         queue.push({
@@ -1012,6 +1367,10 @@ export async function buildKindleInventory(
     options.signal,
     cacheContext,
     deviceCacheContext,
+    {
+      missingObjectCount: missingModificationDateObjectCount,
+      invalidObjectCount: invalidModificationDateObjectCount,
+    },
   );
   return Object.freeze({
     status: issueCount === 0 ? "complete" : "partial",
@@ -1022,5 +1381,6 @@ export async function buildKindleInventory(
     issueCount,
     scannedObjectCount: objects.length,
     bookMetadata: enrichment.summary,
+    metadataCacheDiagnostics: enrichment.cacheDiagnostics,
   });
 }

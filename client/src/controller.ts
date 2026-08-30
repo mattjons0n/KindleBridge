@@ -748,6 +748,7 @@ export class AppController {
               this.#dependencies.connectInventoryTimeoutMs ?? DEFAULT_CONNECT_INVENTORY_TIMEOUT_MS,
           });
           if (this.#isActiveConnection(epoch, connection)) {
+            this.#logKindleMetadataCacheDiagnostics(inventory);
             this.#commit({ ...this.#state, postConnectStage: "reconciliation" });
             await this.#withCatalogDeadline(
               (catalogSignal) => this.#reconcileCatalogInventory(inventory, connection, catalogSignal),
@@ -1265,6 +1266,9 @@ export class AppController {
           onObjectState: this.#objectStateHandler("metadata-cache", undefined, connection.details),
         },
       );
+      if (sent.inventory !== undefined) {
+        this.#logKindleMetadataCacheDiagnostics(sent.inventory);
+      }
       const inventory = sent.inventory?.objects.some((object) => object.handle === sent.transfer.handle)
         ? sent.inventory
         : this.#inventoryAfterVerifiedTransfer(
@@ -1740,6 +1744,7 @@ export class AppController {
       }
       if (!this.#isActiveConnection(epoch, connection)) return;
       if (inventory) {
+        this.#logKindleMetadataCacheDiagnostics(inventory);
         this.#commit({ ...this.#state, postConnectStage: "reconciliation" });
         try {
           await this.#withCatalogDeadline(
@@ -1804,6 +1809,73 @@ export class AppController {
         this.#commit({ ...this.#state, postConnectStage: "idle" });
       }
     }
+  }
+
+  #logKindleMetadataCacheDiagnostics(inventory: KindleInventorySnapshot): void {
+    const diagnostics = inventory.metadataCacheDiagnostics;
+    if (diagnostics === undefined) return;
+    const device = diagnostics.device;
+    this.log.info("Kindle metadata cache diagnostics", {
+      schemaVersion: 1,
+      evidence: {
+        candidateObjects: diagnostics.evidence.candidateObjectCount,
+        validModificationDates: diagnostics.evidence.validModificationDateObjectCount,
+        unusableModificationDates: diagnostics.evidence.unusableModificationDateObjectCount,
+        missingModificationDates: diagnostics.evidence.missingModificationDateObjectCount,
+        invalidModificationDates: diagnostics.evidence.invalidModificationDateObjectCount,
+        adjustedPaths: diagnostics.evidence.metadataAdjustedObjectCount,
+        emptyPaths: diagnostics.evidence.emptyPathObjectCount,
+        ambiguousPaths: diagnostics.evidence.ambiguousPathObjectCount,
+        reusableEvidence: diagnostics.evidence.reusableEvidenceObjectCount,
+      },
+      hits: {
+        device: diagnostics.hits.deviceObjectCount,
+        browser: diagnostics.hits.browserObjectCount,
+      },
+      portable: {
+        available: diagnostics.portable.available,
+        candidates: diagnostics.portable.candidateObjectCount,
+        pathMisses: diagnostics.portable.pathMissObjectCount,
+        sizeMismatches: diagnostics.portable.sizeMismatchObjectCount,
+        formatMismatches: diagnostics.portable.formatMismatchObjectCount,
+        modificationDateMismatches: diagnostics.portable.modificationDateMismatchObjectCount,
+        metadataConflicts: diagnostics.portable.metadataConflictObjectCount,
+      },
+      browser: {
+        available: diagnostics.browser.available,
+        lookupOutcome: diagnostics.browser.lookupOutcome,
+        lookupCandidates: diagnostics.browser.lookupCandidateObjectCount,
+        writeOutcome: diagnostics.browser.writeOutcome,
+        writeCandidates: diagnostics.browser.writeCandidateObjectCount,
+        writeAttempts: diagnostics.browser.writeAttemptedObjectCount,
+        writeAccepted: diagnostics.browser.writeAcceptedObjectCount,
+      },
+      ...(device === undefined ? {} : {
+        device: {
+          mode: device.mode,
+          loadOutcome: device.loadOutcome,
+          rootHandles: device.rootHandleCount,
+          unreadableRootObjects: device.unreadableRootObjectCount,
+          slots: {
+            a: {
+              outcome: device.slots.a.outcome,
+              entries: device.slots.a.entryCount,
+            },
+            b: {
+              outcome: device.slots.b.outcome,
+              entries: device.slots.b.entryCount,
+            },
+          },
+          activeEntries: device.activeEntryCount,
+          generationAmbiguous: device.generationAmbiguous,
+          writeOutcome: device.writeOutcome,
+          writeCandidates: device.writeCandidateEntryCount,
+          writtenEntries: device.writtenEntryCount,
+          cachePayloadBytes: device.cachePayloadByteCount,
+          ...(device.writeSlot === undefined ? {} : { writeSlot: device.writeSlot }),
+        },
+      }),
+    });
   }
 
   async #reconcileCatalogInventory(
@@ -1946,6 +2018,8 @@ export class AppController {
       metadataStatus: inventory.bookMetadata?.status,
       metadataReads: inventory.bookMetadata?.attemptedObjectCount,
       metadataCacheHits: inventory.bookMetadata?.cacheHitObjectCount ?? 0,
+      metadataDeviceCacheHits: inventory.bookMetadata?.deviceCacheHitObjectCount ?? 0,
+      metadataBrowserCacheHits: inventory.bookMetadata?.browserCacheHitObjectCount ?? 0,
       managedMetadataSkips: inventory.bookMetadata?.managedObjectCount ?? 0,
       metadataReadBytes: inventory.bookMetadata?.readByteCount,
     });

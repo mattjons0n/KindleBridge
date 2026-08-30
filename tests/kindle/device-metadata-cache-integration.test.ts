@@ -90,10 +90,11 @@ describe("KindleDevice on-device metadata cache integration", () => {
   it("requires both a successful current-session self-test and a recovery callback before writing", async () => {
     const withoutSelfTest = new FakeKindleObjectStore();
     installBook(withoutSelfTest, "No self-test");
-    await kindle(withoutSelfTest).inventory({
+    const noSelfTest = await kindle(withoutSelfTest).inventory({
       deviceMetadataCache: "read-write",
       onObjectState: vi.fn(),
     });
+    expect(noSelfTest.metadataCacheDiagnostics?.device?.writeOutcome).toBe("not-authorized");
     expect(cacheCreateRequests(withoutSelfTest)).toEqual([]);
 
     const withoutCallback = new FakeKindleObjectStore();
@@ -102,7 +103,8 @@ describe("KindleDevice on-device metadata cache integration", () => {
     await testedDevice.runSelfTest({ onObjectState: vi.fn() });
     const createsAfterSelfTest = withoutCallback.createRequests.length;
     const deletesAfterSelfTest = withoutCallback.deletedHandles.length;
-    await testedDevice.inventory({ deviceMetadataCache: "read-write" });
+    const noCallback = await testedDevice.inventory({ deviceMetadataCache: "read-write" });
+    expect(noCallback.metadataCacheDiagnostics?.device?.writeOutcome).toBe("not-authorized");
     expect(withoutCallback.createRequests).toHaveLength(createsAfterSelfTest);
     expect(withoutCallback.deletedHandles).toHaveLength(deletesAfterSelfTest);
     expect(cacheCreateRequests(withoutCallback)).toEqual([]);
@@ -115,10 +117,11 @@ describe("KindleDevice on-device metadata cache integration", () => {
     });
     afterFailedSelfTest.corruptReadback = false;
     const createsAfterFailure = afterFailedSelfTest.createRequests.length;
-    await failedDevice.inventory({
+    const afterFailure = await failedDevice.inventory({
       deviceMetadataCache: "read-write",
       onObjectState: vi.fn(),
     });
+    expect(afterFailure.metadataCacheDiagnostics?.device?.writeOutcome).toBe("not-authorized");
     expect(afterFailedSelfTest.createRequests).toHaveLength(createsAfterFailure);
     expect(cacheCreateRequests(afterFailedSelfTest)).toEqual([]);
   });
@@ -146,6 +149,7 @@ describe("KindleDevice on-device metadata cache integration", () => {
     });
 
     expect(inventory.status).toBe("complete");
+    expect(inventory.metadataCacheDiagnostics?.device?.writeOutcome).toBe("skipped-storage-read-only");
     expect(storageReadCount).toBe(3);
     expect(cacheCreateRequests(store)).toEqual([]);
   });
@@ -165,11 +169,13 @@ describe("KindleDevice on-device metadata cache integration", () => {
     const onObjectState = vi.fn();
 
     await device.runSelfTest({ onObjectState });
-    await expect(device.inventory({
+    const inventory = await device.inventory({
       deviceMetadataCache: "read-write",
       onObjectState,
-    })).resolves.toMatchObject({ status: "complete" });
+    });
 
+    expect(inventory.status).toBe("complete");
+    expect(inventory.metadataCacheDiagnostics?.device?.writeOutcome).toBe("skipped-insufficient-space");
     expect(cacheCreateRequests(store)).toEqual([]);
     expect(store.objects.has(BOOK_HANDLE)).toBe(true);
   });
@@ -188,11 +194,13 @@ describe("KindleDevice on-device metadata cache integration", () => {
     const onObjectState = vi.fn();
 
     await device.runSelfTest({ onObjectState });
-    await expect(device.inventory({
+    const inventory = await device.inventory({
       deviceMetadataCache: "read-write",
       onObjectState,
-    })).resolves.toMatchObject({ status: "complete" });
+    });
 
+    expect(inventory.status).toBe("complete");
+    expect(inventory.metadataCacheDiagnostics?.device?.writeOutcome).toBe("skipped-root-capacity");
     expect([...store.objects.values()].filter(({ parentHandle }) => parentHandle === 0)).toHaveLength(256);
     expect(cacheCreateRequests(store)).toEqual([]);
     expect(store.objects.has(BOOK_HANDLE)).toBe(true);
@@ -220,6 +228,7 @@ describe("KindleDevice on-device metadata cache integration", () => {
       .find((state) => state.stage === "handle-assigned"
         && parseKindleBridgeDeviceMetadataCacheFilename(state.filename) !== null);
     expect(inventory.status).toBe("complete");
+    expect(inventory.metadataCacheDiagnostics?.device?.writeOutcome).toBe("create-failed-cleaned");
     expect(assigned).toBeDefined();
     expect(store.deletedHandles).toContain(assigned!.handle);
     expect(cacheObjects(store)).toEqual([]);
@@ -243,6 +252,27 @@ describe("KindleDevice on-device metadata cache integration", () => {
     });
 
     expect(inventory.status).toBe("complete");
+    expect(inventory.metadataCacheDiagnostics).toMatchObject({
+      evidence: {
+        candidateObjectCount: 1,
+        validModificationDateObjectCount: 1,
+        unusableModificationDateObjectCount: 0,
+        reusableEvidenceObjectCount: 1,
+      },
+      device: {
+        mode: "read-write",
+        loadOutcome: "none",
+        slots: {
+          a: { outcome: "absent", entryCount: 0 },
+          b: { outcome: "absent", entryCount: 0 },
+        },
+        activeEntryCount: 0,
+        writeCandidateEntryCount: 1,
+        writeOutcome: "written",
+        writtenEntryCount: 1,
+        writeSlot: "a",
+      },
+    });
     expect(cacheCreateRequests(store)).toHaveLength(1);
     const cacheRequest = cacheCreateRequests(store)[0]!;
     expect(cacheRequest).toMatchObject({
@@ -302,6 +332,21 @@ describe("KindleDevice on-device metadata cache integration", () => {
         attemptedObjectCount: 0,
         readByteCount: 0,
       },
+      metadataCacheDiagnostics: {
+        hits: { deviceObjectCount: 1, browserObjectCount: 0 },
+        device: {
+          mode: "read-write",
+          loadOutcome: "loaded",
+          slots: {
+            a: { outcome: "loaded", entryCount: 1 },
+            b: { outcome: "absent", entryCount: 0 },
+          },
+          activeEntryCount: 1,
+          writeCandidateEntryCount: 1,
+          writeOutcome: "unchanged",
+          writtenEntryCount: 0,
+        },
+      },
     });
     expect(inventory.objects[0]).toMatchObject({ title: "Unchanged cached metadata" });
     expect(store.readRequests.filter(({ handle }) => handle === BOOK_HANDLE)).toEqual([]);
@@ -309,6 +354,81 @@ describe("KindleDevice on-device metadata cache integration", () => {
     expect(store.createRequests).toHaveLength(createCount);
     expect(store.deletedHandles).toHaveLength(deleteCount);
     expect(cacheObjects(store)).toHaveLength(1);
+  });
+
+  it("reports a verified but empty portable cache when MTP timestamps are unusable", async () => {
+    const store = new FakeKindleObjectStore();
+    const book = installBook(store, "No stable timestamp", "");
+    const firstDevice = kindle(store);
+    const firstCallback = vi.fn();
+    await firstDevice.runSelfTest({ onObjectState: firstCallback });
+    const first = await firstDevice.inventory({
+      deviceMetadataCache: "read-write",
+      onObjectState: firstCallback,
+    });
+    const slotA = await readCacheSlot(store, "a");
+
+    expect(slotA.cache.entries).toEqual([]);
+    expect(first).toMatchObject({
+      bookMetadata: {
+        attemptedObjectCount: 1,
+        readByteCount: book.byteLength,
+      },
+      metadataCacheDiagnostics: {
+        evidence: {
+          candidateObjectCount: 1,
+          validModificationDateObjectCount: 0,
+          unusableModificationDateObjectCount: 1,
+          reusableEvidenceObjectCount: 0,
+        },
+        hits: { deviceObjectCount: 0, browserObjectCount: 0 },
+        device: {
+          loadOutcome: "none",
+          writeCandidateEntryCount: 0,
+          writeOutcome: "written",
+          writtenEntryCount: 0,
+          writeSlot: "a",
+        },
+      },
+    });
+
+    const secondDevice = kindle(store);
+    const secondCallback = vi.fn();
+    await secondDevice.runSelfTest({ onObjectState: secondCallback });
+    store.readRequests.length = 0;
+    const second = await secondDevice.inventory({
+      deviceMetadataCache: "read-write",
+      onObjectState: secondCallback,
+    });
+
+    expect(second).toMatchObject({
+      bookMetadata: {
+        attemptedObjectCount: 1,
+        readByteCount: book.byteLength,
+      },
+      metadataCacheDiagnostics: {
+        evidence: {
+          candidateObjectCount: 1,
+          validModificationDateObjectCount: 0,
+          unusableModificationDateObjectCount: 1,
+          reusableEvidenceObjectCount: 0,
+        },
+        hits: { deviceObjectCount: 0, browserObjectCount: 0 },
+        device: {
+          loadOutcome: "loaded",
+          slots: {
+            a: { outcome: "loaded", entryCount: 0 },
+            b: { outcome: "absent", entryCount: 0 },
+          },
+          activeEntryCount: 0,
+          writeCandidateEntryCount: 0,
+          writeOutcome: "unchanged",
+          writtenEntryCount: 0,
+        },
+      },
+    });
+    expect(second.bookMetadata).not.toHaveProperty("cacheHitObjectCount");
+    expect(store.readRequests).toContainEqual({ handle: BOOK_HANDLE, maxBytes: book.byteLength });
   });
 
   it("rotates changed metadata from slot A to B without modifying or deleting the book", async () => {
@@ -359,6 +479,10 @@ describe("KindleDevice on-device metadata cache integration", () => {
       onObjectState: readOnlyCallback,
     });
     expect(complete.status).toBe("complete");
+    expect(complete.metadataCacheDiagnostics?.device).toMatchObject({
+      mode: "read-only",
+      writeOutcome: "not-requested",
+    });
     expect(readOnlyStore.createRequests).toHaveLength(readOnlyCreateCount);
     expect(readOnlyStore.deletedHandles).toHaveLength(readOnlyDeleteCount);
     expect(cacheCreateRequests(readOnlyStore)).toEqual([]);
@@ -377,6 +501,9 @@ describe("KindleDevice on-device metadata cache integration", () => {
       onObjectState: partialCallback,
     });
     expect(partial.status).toBe("partial");
+    expect(partial.metadataCacheDiagnostics?.device?.writeOutcome).toBe(
+      "skipped-incomplete-inventory",
+    );
     expect(partialStore.createRequests).toHaveLength(partialCreateCount);
     expect(partialStore.deletedHandles).toHaveLength(partialDeleteCount);
     expect(cacheCreateRequests(partialStore)).toEqual([]);

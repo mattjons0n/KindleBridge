@@ -18,6 +18,7 @@ import {
 } from "./device-metadata-cache-codec";
 import { filenamesEqual } from "./filenames";
 import type {
+  KindleDeviceMetadataCacheSlotLoadOutcome,
   KindleInventoryDeviceMetadataCacheContext,
   KindleInventorySnapshot,
 } from "./inventory";
@@ -27,6 +28,13 @@ import { isFatalTransportFailure } from "../error-diagnostics";
 const MAX_ROOT_OBJECT_HANDLES = 256;
 
 export interface LoadedKindleBridgeDeviceMetadataCache {
+  readonly rootDiscoveryOutcome: "complete" | "unavailable";
+  readonly rootHandleCount: number;
+  readonly unreadableRootObjectCount: number;
+  readonly slotDiagnostics: Readonly<Record<KindleBridgeDeviceMetadataCacheSlot, {
+    readonly outcome: KindleDeviceMetadataCacheSlotLoadOutcome;
+    readonly entryCount: number;
+  }>>;
   readonly rootObjects: readonly KindleStoredObjectInfo[];
   readonly snapshotsBySlot: ReadonlyMap<
     KindleBridgeDeviceMetadataCacheSlot,
@@ -100,6 +108,13 @@ export async function loadKindleBridgeDeviceMetadataCache(
   } catch (error) {
     if (isAbort(error, options.signal) || isTransportFailure(error)) throw error;
     return Object.freeze({
+      rootDiscoveryOutcome: "unavailable",
+      rootHandleCount: 0,
+      unreadableRootObjectCount: 0,
+      slotDiagnostics: Object.freeze({
+        a: Object.freeze({ outcome: "unavailable", entryCount: 0 }),
+        b: Object.freeze({ outcome: "unavailable", entryCount: 0 }),
+      }),
       rootObjects: Object.freeze([]),
       snapshotsBySlot: new Map(),
       blockedSlots: new Set(KINDLE_BRIDGE_DEVICE_METADATA_CACHE_SLOTS),
@@ -111,6 +126,7 @@ export async function loadKindleBridgeDeviceMetadataCache(
   const seedMatches = seedByHandle.size === handles.length
     && handles.every((handle) => seedByHandle.has(handle));
   const rootObjects: KindleStoredObjectInfo[] = [];
+  let unreadableRootObjectCount = 0;
   if (seedMatches) {
     for (const handle of handles) rootObjects.push(seedByHandle.get(handle)!);
   } else {
@@ -121,6 +137,7 @@ export async function loadKindleBridgeDeviceMetadataCache(
         if (isAbort(error, options.signal) || isTransportFailure(error)) throw error;
         // A disappearing or malformed unrelated root object disables neither
         // the live Documents hierarchy nor a separately validated cache slot.
+        unreadableRootObjectCount += 1;
       }
     }
   }
@@ -136,11 +153,19 @@ export async function loadKindleBridgeDeviceMetadataCache(
     KindleBridgeMetadataCacheObjectSnapshot
   >();
   const blockedSlots = new Set<KindleBridgeDeviceMetadataCacheSlot>();
+  const slotDiagnostics: Record<KindleBridgeDeviceMetadataCacheSlot, {
+    outcome: KindleDeviceMetadataCacheSlotLoadOutcome;
+    entryCount: number;
+  }> = {
+    a: { outcome: "absent", entryCount: 0 },
+    b: { outcome: "absent", entryCount: 0 },
+  };
   for (const slot of KINDLE_BRIDGE_DEVICE_METADATA_CACHE_SLOTS) {
     const candidates = slotCandidates.get(slot) ?? [];
     if (candidates.length === 0) continue;
     if (candidates.length !== 1 || exactSlotForFilename(candidates[0]!.filename) !== slot) {
       blockedSlots.add(slot);
+      slotDiagnostics[slot] = { outcome: "blocked", entryCount: 0 };
       continue;
     }
     try {
@@ -156,12 +181,18 @@ export async function loadKindleBridgeDeviceMetadataCache(
         || exactSlotForFilename(snapshot.info.filename) !== slot
       ) {
         blockedSlots.add(slot);
+        slotDiagnostics[slot] = { outcome: "blocked", entryCount: 0 };
         continue;
       }
       snapshotsBySlot.set(slot, snapshot);
+      slotDiagnostics[slot] = {
+        outcome: "loaded",
+        entryCount: snapshot.cache.entries.length,
+      };
     } catch (error) {
       if (isAbort(error, options.signal) || isTransportFailure(error)) throw error;
       blockedSlots.add(slot);
+      slotDiagnostics[slot] = { outcome: "blocked", entryCount: 0 };
     }
   }
 
@@ -185,6 +216,13 @@ export async function loadKindleBridgeDeviceMetadataCache(
     : Object.freeze({ caches: Object.freeze(valid.map(([, snapshot]) => snapshot.cache)) });
 
   return Object.freeze({
+    rootDiscoveryOutcome: "complete",
+    rootHandleCount: handles.length,
+    unreadableRootObjectCount,
+    slotDiagnostics: Object.freeze({
+      a: Object.freeze({ ...slotDiagnostics.a }),
+      b: Object.freeze({ ...slotDiagnostics.b }),
+    }),
     rootObjects: Object.freeze(rootObjects.slice()),
     snapshotsBySlot,
     blockedSlots,

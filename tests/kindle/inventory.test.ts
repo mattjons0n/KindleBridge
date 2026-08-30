@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   KindleDevice,
   MTP_OBJECT_FORMAT_ASSOCIATION,
@@ -38,6 +38,19 @@ function cacheEnabledDevice(
     },
     { cache, identity: cacheIdentity },
   );
+}
+
+function metadataCacheDouble(
+  lookupMany: KindleMetadataCache["lookupMany"],
+  rememberMany: KindleMetadataCache["rememberMany"],
+): KindleMetadataCache {
+  return {
+    lookup: async () => undefined,
+    lookupMany,
+    remember: async () => false,
+    rememberMany,
+    clear: async () => undefined,
+  };
 }
 
 describe("recursive Kindle Documents inventory", () => {
@@ -345,6 +358,24 @@ describe("recursive Kindle Documents inventory", () => {
       parsedObjectCount: 1,
       readByteCount: book.byteLength,
     });
+    expect(first.metadataCacheDiagnostics).toMatchObject({
+      evidence: {
+        candidateObjectCount: 1,
+        validModificationDateObjectCount: 1,
+        unusableModificationDateObjectCount: 0,
+        reusableEvidenceObjectCount: 1,
+      },
+      hits: { deviceObjectCount: 0, browserObjectCount: 0 },
+      browser: {
+        available: true,
+        lookupOutcome: "completed",
+        lookupCandidateObjectCount: 1,
+        writeOutcome: "accepted-all",
+        writeCandidateObjectCount: 1,
+        writeAttemptedObjectCount: 1,
+        writeAcceptedObjectCount: 1,
+      },
+    });
     expect(store.readRequests).toHaveLength(1);
 
     store.readRequests.length = 0;
@@ -371,7 +402,178 @@ describe("recursive Kindle Documents inventory", () => {
       readByteCount: 0,
       budgetedByteCount: 0,
     });
+    expect(second.metadataCacheDiagnostics).toMatchObject({
+      evidence: {
+        candidateObjectCount: 1,
+        validModificationDateObjectCount: 1,
+        unusableModificationDateObjectCount: 0,
+        reusableEvidenceObjectCount: 1,
+      },
+      hits: { deviceObjectCount: 0, browserObjectCount: 1 },
+      browser: {
+        available: true,
+        lookupOutcome: "completed",
+        lookupCandidateObjectCount: 1,
+        writeOutcome: "no-candidates",
+        writeCandidateObjectCount: 0,
+        writeAttemptedObjectCount: 0,
+        writeAcceptedObjectCount: 0,
+      },
+    });
     expect(store.readRequests).toEqual([]);
+  });
+
+  it.each([
+    { kind: "missing", modificationDate: "", missing: 1, invalid: 0 },
+    { kind: "malformed", modificationDate: "not-an-mtp-date", missing: 0, invalid: 1 },
+  ])("diagnoses $kind MTP modification dates when a same-page cache cannot retain evidence", async ({
+    modificationDate,
+    missing,
+    invalid,
+  }) => {
+    const store = new FakeKindleObjectStore();
+    const book = makeKindleBookFixture({
+      exthTitle: "Timestamp-free cache miss",
+      authors: ["Known Author"],
+    });
+    store.objects.set(11, objectInfo(11, {
+      parentHandle: 10,
+      filename: "timestamp-free.azw3",
+      compressedSize: book.byteLength,
+      modificationDate,
+    }));
+    store.objectData.set(11, book);
+    const cache = createKindleMetadataCache({ persistence: null, now: () => 1_250 });
+
+    const first = await cacheEnabledDevice(store, cache).inventory();
+    store.readRequests.length = 0;
+    const second = await cacheEnabledDevice(store, cache).inventory();
+
+    for (const inventory of [first, second]) {
+      expect(inventory.bookMetadata).toMatchObject({
+        attemptedObjectCount: 1,
+        readByteCount: book.byteLength,
+      });
+      expect(inventory.bookMetadata).not.toHaveProperty("cacheHitObjectCount");
+      expect(inventory.metadataCacheDiagnostics).toMatchObject({
+        evidence: {
+          candidateObjectCount: 1,
+          validModificationDateObjectCount: 0,
+          unusableModificationDateObjectCount: 1,
+          missingModificationDateObjectCount: missing,
+          invalidModificationDateObjectCount: invalid,
+          reusableEvidenceObjectCount: 0,
+        },
+        hits: { deviceObjectCount: 0, browserObjectCount: 0 },
+        browser: {
+          available: true,
+          lookupOutcome: "not-needed",
+          lookupCandidateObjectCount: 0,
+          writeOutcome: "no-candidates",
+          writeCandidateObjectCount: 0,
+          writeAttemptedObjectCount: 0,
+          writeAcceptedObjectCount: 0,
+        },
+      });
+    }
+    expect(store.readRequests).toEqual([{ handle: 11, maxBytes: book.byteLength }]);
+  });
+
+  it("reports a failed browser-cache lookup while preserving the live inventory", async () => {
+    const store = new FakeKindleObjectStore();
+    const book = makeKindleBookFixture({ exthTitle: "Lookup fallback" });
+    store.objects.set(11, objectInfo(11, {
+      parentHandle: 10,
+      filename: "lookup-fallback.azw3",
+      compressedSize: book.byteLength,
+      modificationDate: "20260829T120000Z",
+    }));
+    store.objectData.set(11, book);
+    const lookupMany = vi.fn<KindleMetadataCache["lookupMany"]>()
+      .mockRejectedValue(new Error("private lookup failure"));
+    const rememberMany = vi.fn<KindleMetadataCache["rememberMany"]>()
+      .mockImplementation(async (entries) => entries.length);
+
+    const inventory = await cacheEnabledDevice(
+      store,
+      metadataCacheDouble(lookupMany, rememberMany),
+    ).inventory();
+
+    expect(inventory.bookMetadata).toMatchObject({
+      attemptedObjectCount: 1,
+      parsedObjectCount: 1,
+      readByteCount: book.byteLength,
+    });
+    expect(inventory.metadataCacheDiagnostics?.browser).toEqual({
+      available: true,
+      lookupOutcome: "failed",
+      lookupCandidateObjectCount: 1,
+      writeOutcome: "accepted-all",
+      writeCandidateObjectCount: 1,
+      writeAttemptedObjectCount: 1,
+      writeAcceptedObjectCount: 1,
+    });
+  });
+
+  it("reports a partially accepted browser-cache write without failing inventory", async () => {
+    const store = new FakeKindleObjectStore();
+    const book = makeKindleBookFixture({ exthTitle: "Partial write fallback" });
+    store.objects.set(11, objectInfo(11, {
+      parentHandle: 10,
+      filename: "partial-write.azw3",
+      compressedSize: book.byteLength,
+      modificationDate: "20260829T120000Z",
+    }));
+    store.objectData.set(11, book);
+    const cache = metadataCacheDouble(
+      vi.fn<KindleMetadataCache["lookupMany"]>()
+        .mockImplementation(async (evidence) => evidence.map(() => undefined)),
+      vi.fn<KindleMetadataCache["rememberMany"]>().mockResolvedValue(0),
+    );
+
+    const inventory = await cacheEnabledDevice(store, cache).inventory();
+
+    expect(inventory.status).toBe("complete");
+    expect(inventory.metadataCacheDiagnostics?.browser).toMatchObject({
+      writeOutcome: "accepted-partial",
+      writeCandidateObjectCount: 1,
+      writeAttemptedObjectCount: 1,
+      writeAcceptedObjectCount: 0,
+    });
+  });
+
+  it("counts later browser-cache candidates after the first write batch fails", async () => {
+    const store = new FakeKindleObjectStore();
+    const book = makeKindleBookFixture({ exthTitle: "Failed write fallback" });
+    for (let index = 0; index < 257; index += 1) {
+      const handle = 11 + index;
+      store.objects.set(handle, objectInfo(handle, {
+        parentHandle: 10,
+        filename: `failed-write-${index}.azw3`,
+        compressedSize: book.byteLength,
+        modificationDate: "20260829T120000Z",
+      }));
+      store.objectData.set(handle, book);
+    }
+    const rememberMany = vi.fn<KindleMetadataCache["rememberMany"]>()
+      .mockRejectedValue(new Error("private write failure"));
+    const cache = metadataCacheDouble(
+      vi.fn<KindleMetadataCache["lookupMany"]>()
+        .mockImplementation(async (evidence) => evidence.map(() => undefined)),
+      rememberMany,
+    );
+
+    const inventory = await cacheEnabledDevice(store, cache).inventory();
+
+    expect(inventory.status).toBe("complete");
+    expect(inventory.bookMetadata).toMatchObject({ attemptedObjectCount: 257 });
+    expect(inventory.metadataCacheDiagnostics?.browser).toMatchObject({
+      writeOutcome: "failed",
+      writeCandidateObjectCount: 257,
+      writeAttemptedObjectCount: 256,
+      writeAcceptedObjectCount: 0,
+    });
+    expect(rememberMany).toHaveBeenCalledOnce();
   });
 
   it("counts cache hits against the bounded metadata-object envelope", async () => {
