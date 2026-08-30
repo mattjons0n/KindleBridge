@@ -356,7 +356,7 @@ describe("recursive Kindle Documents inventory", () => {
       parentHandle: 10,
       filename: "unmanaged-cache-hit.azw3",
       compressedSize: book.byteLength,
-      modificationDate: "20260829T120000Z",
+      modificationDate: "20260829T120000.",
     }));
     store.objectData.set(11, book);
     const cache = createKindleMetadataCache({ persistence: null, now: () => 1_000 });

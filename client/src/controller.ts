@@ -1865,6 +1865,7 @@ export class AppController {
           },
           shapes: {
             canonicalMtp: modificationDateProbe.shapes.canonicalMtp,
+            kindleEmptyFraction: modificationDateProbe.shapes.kindleEmptyFraction,
             basicColonOffset: modificationDateProbe.shapes.basicColonOffset,
             extendedIso: modificationDateProbe.shapes.extendedIso,
             extendedIsoSpace: modificationDateProbe.shapes.extendedIsoSpace,

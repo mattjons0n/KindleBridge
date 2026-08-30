@@ -57,7 +57,7 @@ function evidence(
     relativePath,
     metadataAdjusted: false,
     size: 12_345,
-    modificationDate: "20260830T120000Z",
+    modificationDate: "20260830T120000.",
     ...overrides,
   };
 }
@@ -144,6 +144,8 @@ describe("browser-local Kindle metadata cache", () => {
     const invalidInputs = [
       evidence("Book.azw3", { modificationDate: "" }),
       evidence("Book.azw3", { modificationDate: "not-a-date" }),
+      evidence("Book.azw3", { modificationDate: "20260830T120000.." }),
+      evidence("Book.azw3", { modificationDate: "20260830T120000.Z" }),
       evidence("../Book.azw3"),
       evidence("/Book.azw3"),
       evidence("Book.azw3", { size: -1 }),

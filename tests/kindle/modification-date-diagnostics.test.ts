@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   classifyKindleModificationDate,
   createKindleModificationDateProbe,
+  isCacheableKindleModificationDate,
 } from "../../client/src/kindle/modification-date-diagnostics";
 
 const identity = "d".repeat(64);
@@ -30,6 +31,7 @@ function candidate(
 describe("Kindle modification-date diagnostics", () => {
   it("classifies fixed timestamp shapes without returning raw values", () => {
     expect(classifyKindleModificationDate("20260830T123456Z")).toBe("canonical-mtp");
+    expect(classifyKindleModificationDate("20260830T123456.")).toBe("kindle-empty-fraction");
     expect(classifyKindleModificationDate("20260830T123456+02:00")).toBe("basic-colon-offset");
     expect(classifyKindleModificationDate("2026-08-30T12:34:56Z")).toBe("extended-iso");
     expect(classifyKindleModificationDate("2026-08-30 12:34:56Z")).toBe("extended-iso-space");
@@ -37,6 +39,15 @@ describe("Kindle modification-date diagnostics", () => {
     expect(classifyKindleModificationDate(" 20260830T123456Z ")).toBe("surrounding-whitespace");
     expect(classifyKindleModificationDate("20260830T123456Z\0")).toBe("trailing-null");
     expect(classifyKindleModificationDate("1725021296000")).toBe("digits-only");
+  });
+
+  it("accepts the observed Kindle empty-fraction token exactly and rejects near misses", () => {
+    expect(isCacheableKindleModificationDate("20260830T123456Z")).toBe(true);
+    expect(isCacheableKindleModificationDate("20260830T123456.")).toBe(true);
+    expect(isCacheableKindleModificationDate("20260830T123456..")).toBe(false);
+    expect(isCacheableKindleModificationDate("20260830T123456.Z")).toBe(false);
+    expect(isCacheableKindleModificationDate(" 20260830T123456. ")).toBe(false);
+    expect(isCacheableKindleModificationDate("2026-08-30T12:34:56Z")).toBe(false);
   });
 
   it("reports exact raw values, their code units, and reconnect stability", () => {

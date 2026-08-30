@@ -22,7 +22,7 @@ function entry(
   return {
     relativePath,
     size: 12_345,
-    modificationDate: "20260830T120000Z",
+    modificationDate: "20260830T120000.",
     objectFormat: 0xb00a,
     metadata: {
       title: "A portable title",
@@ -279,12 +279,16 @@ describe("portable on-device Kindle metadata cache codec", () => {
         "KINDLE_DEVICE_CACHE_INVALID_SCHEMA",
       );
     }
-    await expectCodecError(
-      encodeKindleBridgeDeviceMetadataCache(cache([entry("Book.azw3", {
-        modificationDate: "not-an-mtp-date",
-      })])),
-      "KINDLE_DEVICE_CACHE_INVALID_SCHEMA",
-    );
+    for (const modificationDate of [
+      "not-an-mtp-date",
+      "20260830T120000..",
+      "20260830T120000.Z",
+    ]) {
+      await expectCodecError(
+        encodeKindleBridgeDeviceMetadataCache(cache([entry("Book.azw3", { modificationDate })])),
+        "KINDLE_DEVICE_CACHE_INVALID_SCHEMA",
+      );
+    }
     await expectCodecError(
       encodeKindleBridgeDeviceMetadataCache(cache([entry("Book.azw3", {
         metadata: {

@@ -1,5 +1,6 @@
 import type { KindleBookMetadata } from "./book-metadata";
 import type { PseudonymousKindleIdentity } from "./device-identity";
+import { isCacheableKindleModificationDate } from "./modification-date-diagnostics";
 
 const DATABASE_NAME = "kindle-bridge-kindle-metadata-cache";
 const DATABASE_VERSION = 1;
@@ -24,7 +25,6 @@ const MAX_METADATA_VALUES = 64;
 const MAX_METADATA_TEXT_LENGTH = 16_384;
 const FUTURE_CLOCK_TOLERANCE_MS = 5 * 60 * 1_000;
 const UINT32_MAX = 0xffff_ffff;
-const MTP_DATE_TIME_PATTERN = /^\d{8}T\d{6}(?:\.\d{1,9})?(?:Z|[+-]\d{4})?$/u;
 
 export const KINDLE_METADATA_CACHE_RECORD_VERSION = CACHE_RECORD_VERSION;
 
@@ -187,7 +187,7 @@ function validModificationDate(value: unknown): value is string {
   return typeof value === "string"
     && value.length > 0
     && value.length <= MAX_MODIFICATION_DATE_LENGTH
-    && MTP_DATE_TIME_PATTERN.test(value);
+    && isCacheableKindleModificationDate(value);
 }
 
 function validEvidence(evidence: unknown): evidence is KindleMetadataCacheEvidence {

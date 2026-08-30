@@ -21,7 +21,7 @@ import type {
   KindleMetadataCacheEvidence,
 } from "./metadata-cache";
 import {
-  isCanonicalMtpModificationDate,
+  isCacheableKindleModificationDate,
   type KindleModificationDateProbe,
   type KindleModificationDateProbeCandidate,
   type KindleModificationDateProbeSummary,
@@ -466,7 +466,7 @@ function safeRelativePath(parent: string, filename: string, maxLength: number): 
 }
 
 function safeModificationDate(value: string): string | undefined {
-  return isCanonicalMtpModificationDate(value) ? value : undefined;
+  return isCacheableKindleModificationDate(value) ? value : undefined;
 }
 
 function metadataIsConsistent(

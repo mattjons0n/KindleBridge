@@ -1,4 +1,5 @@
 const CANONICAL_MTP_PATTERN = /^\d{8}T\d{6}(?:\.\d{1,9})?(?:Z|[+-]\d{4})?$/u;
+const KINDLE_EMPTY_FRACTION_PATTERN = /^\d{8}T\d{6}\.$/u;
 const BASIC_COLON_OFFSET_PATTERN = /^\d{8}T\d{6}(?:\.\d{1,9})?[+-]\d{2}:\d{2}$/u;
 const EXTENDED_ISO_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:?\d{2})?$/u;
 const EXTENDED_ISO_SPACE_PATTERN = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:?\d{2})?$/u;
@@ -7,6 +8,7 @@ const MAX_DEVICE_SNAPSHOTS = 8;
 
 export type KindleModificationDateShape =
   | "canonical-mtp"
+  | "kindle-empty-fraction"
   | "basic-colon-offset"
   | "extended-iso"
   | "extended-iso-space"
@@ -20,6 +22,7 @@ export type KindleModificationDateShape =
 
 export interface KindleModificationDateShapeCounts {
   readonly canonicalMtp: number;
+  readonly kindleEmptyFraction: number;
   readonly basicColonOffset: number;
   readonly extendedIso: number;
   readonly extendedIsoSpace: number;
@@ -113,6 +116,7 @@ interface ProbeState {
 function zeroShapeCounts(): Record<keyof KindleModificationDateShapeCounts, number> {
   return {
     canonicalMtp: 0,
+    kindleEmptyFraction: 0,
     basicColonOffset: 0,
     extendedIso: 0,
     extendedIsoSpace: 0,
@@ -143,8 +147,14 @@ export function isCanonicalMtpModificationDate(value: string): boolean {
   return CANONICAL_MTP_PATTERN.test(value);
 }
 
+/** Exact live-token grammars accepted as cache-change evidence. */
+export function isCacheableKindleModificationDate(value: string): boolean {
+  return CANONICAL_MTP_PATTERN.test(value) || KINDLE_EMPTY_FRACTION_PATTERN.test(value);
+}
+
 export function classifyKindleModificationDate(value: string): KindleModificationDateShape {
   if (CANONICAL_MTP_PATTERN.test(value)) return "canonical-mtp";
+  if (KINDLE_EMPTY_FRACTION_PATTERN.test(value)) return "kindle-empty-fraction";
   if (BASIC_COLON_OFFSET_PATTERN.test(value)) return "basic-colon-offset";
   if (EXTENDED_ISO_PATTERN.test(value)) return "extended-iso";
   if (EXTENDED_ISO_SPACE_PATTERN.test(value)) return "extended-iso-space";
@@ -174,6 +184,7 @@ function shapeCountKey(
 ): keyof KindleModificationDateShapeCounts {
   switch (shape) {
     case "canonical-mtp": return "canonicalMtp";
+    case "kindle-empty-fraction": return "kindleEmptyFraction";
     case "basic-colon-offset": return "basicColonOffset";
     case "extended-iso": return "extendedIso";
     case "extended-iso-space": return "extendedIsoSpace";

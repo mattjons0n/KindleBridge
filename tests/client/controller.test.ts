@@ -379,6 +379,7 @@ describe("AppController local conversion flow", () => {
           maximumCodeUnitLength: 24,
           shapes: {
             canonicalMtp: 0,
+            kindleEmptyFraction: 0,
             basicColonOffset: 0,
             extendedIso: 81,
             extendedIsoSpace: 0,
@@ -486,6 +487,7 @@ describe("AppController local conversion flow", () => {
         codeUnitLength: { minimum: 20, maximum: 24 },
         shapes: {
           canonicalMtp: 0,
+          kindleEmptyFraction: 0,
           basicColonOffset: 0,
           extendedIso: 81,
           extendedIsoSpace: 0,

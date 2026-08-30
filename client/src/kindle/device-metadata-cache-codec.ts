@@ -1,4 +1,5 @@
 import type { KindleBookMetadata } from "./book-metadata";
+import { isCacheableKindleModificationDate } from "./modification-date-diagnostics";
 
 /**
  * Reserved only for Kindle Bridge-owned cache objects. Future codec versions
@@ -28,7 +29,6 @@ const MAX_METADATA_VALUE_BYTES = 4_096;
 const MAX_LANGUAGE_BYTES = 128;
 const MAX_METADATA_VALUES = 64;
 const MAX_METADATA_TEXT_BYTES = 16_384;
-const MTP_DATE_TIME_PATTERN = /^\d{8}T\d{6}(?:\.\d{1,9})?(?:Z|[+-]\d{4})?$/u;
 const LOWERCASE_SHA256_PATTERN = /^[a-f0-9]{64}$/u;
 const CACHE_FILENAME_V1_PATTERN =
   /^\.kindle-bridge-device-metadata-cache-v1-([ab])\.json$/u;
@@ -393,7 +393,7 @@ function canonicalEntries(
       MAX_MODIFICATION_DATE_BYTES,
       `Entry ${index} modificationDate`,
     );
-    if (!MTP_DATE_TIME_PATTERN.test(modificationDate.value)) {
+    if (!isCacheableKindleModificationDate(modificationDate.value)) {
       throw codecError("KINDLE_DEVICE_CACHE_INVALID_SCHEMA", `Entry ${index} has an invalid MTP modification date.`);
     }
     const parsedMetadata = canonicalMetadata(candidate.metadata, index);
