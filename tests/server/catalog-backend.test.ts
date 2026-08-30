@@ -2198,6 +2198,14 @@ describe("scanner and HTTP integration", () => {
     const cache = new CoverCache(path.join(directory, "cache"));
     const snapshots = vi.spyOn(cache, "createSourceSnapshot");
     let extractionCount = 0;
+    let replacementExtractionStarted!: () => void;
+    const replacementExtractionStart = new Promise<void>((resolve) => {
+      replacementExtractionStarted = resolve;
+    });
+    let releaseReplacementExtraction!: () => void;
+    const replacementExtractionBlocked = new Promise<void>((resolve) => {
+      releaseReplacementExtraction = resolve;
+    });
     const indexer = new CatalogIndexer(
       database,
       await AllowedRootPolicy.create([allowed]),
@@ -2214,8 +2222,18 @@ describe("scanner and HTTP integration", () => {
       },
       async (filename) => {
         extractionCount += 1;
+        if (extractionCount === 2) {
+          replacementExtractionStarted();
+          await replacementExtractionBlocked;
+        }
         return extractEpubMetadata(await readFile(filename), path.basename(filename));
       },
+    );
+    const enqueueDurableScan = vi.spyOn(
+      indexer as unknown as {
+        enqueueDurableScan(rootId: string, reason: string, forceNewGeneration?: boolean): void;
+      },
+      "enqueueDurableScan",
     );
 
     await indexer.start();
@@ -2269,6 +2287,14 @@ describe("scanner and HTTP integration", () => {
     database.database
       .prepare("UPDATE library_roots SET last_deep_scan_at = ? WHERE id = ?")
       .run(new Date(Date.now() - 120_000).toISOString(), root.id);
+    await replacementExtractionStart;
+    const activeDeepRequest = database.rootScanRequest(root.id);
+    expect(activeDeepRequest?.reason).toBe("deep-reconciliation");
+    enqueueDurableScan.mockClear();
+    await waitUntil(() => enqueueDurableScan.mock.calls.some(([, reason]) => reason === "reconciliation"));
+    const requestAfterRoutineTick = database.rootScanRequest(root.id);
+    releaseReplacementExtraction();
+    expect(requestAfterRoutineTick).toEqual(activeDeepRequest);
     await waitUntil(() => database.listBooks(profile.id).items[0]?.contentHash !== original.contentHash);
     expect(database.listBooks(profile.id).items[0]).toMatchObject({ id: original.id });
     expect(extractionCount).toBe(2);

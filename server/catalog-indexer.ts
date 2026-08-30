@@ -471,6 +471,14 @@ export class CatalogIndexer {
 
   private enqueueDurableScan(rootId: string, reason: string, forceNewGeneration = false): void {
     try {
+      if (reason === "reconciliation" && this.running.has(rootId)) {
+        // A cadence tick carries no new source evidence. Advancing the active
+        // generation here can repeatedly fence a slower deep scan before it
+        // commits, causing duplicate full snapshots/parses or starvation.
+        // Watcher, configuration, manual, and due-deep requests still retain
+        // their existing supersession semantics.
+        return;
+      }
       const pendingRequest = this.database.rootScanRequest(rootId);
       const pendingGeneration = pendingRequest?.generation ?? null;
       const activeGeneration = this.activeRequestGenerations.get(rootId);
