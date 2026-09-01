@@ -23,6 +23,8 @@ export const MAX_MATCH_INDEX_RESPONSE_BYTES = 32 * 1024 * 1024;
 export const MAX_MATCH_INDEX_ENTRIES = 20_000;
 /** Hard delivered-history ceiling before match-index generation fails closed. */
 export const MAX_MATCH_INDEX_DELIVERIES = 40_000;
+/** Bounded prior presentation identities retained per active catalog book. */
+export const MAX_STALE_MANAGED_TOKENS_PER_BOOK = 16;
 /** Fixed bitmap width for cross-profile metadata-claim collisions. */
 export const METADATA_CLAIM_BITMAP_BYTES = Math.ceil(MAX_MATCH_INDEX_ENTRIES / 8);
 export const METADATA_CLAIM_BITMAP_BASE64_LENGTH = 4 * Math.ceil(METADATA_CLAIM_BITMAP_BYTES / 3);
@@ -93,11 +95,16 @@ export interface CatalogBook {
   publisher: string | null;
   publishedAt: string | null;
   series: string | null;
+  seriesIndex: number | null;
+  description: string | null;
   subjects: string[];
   identifiers: string[];
   format: BookFormat;
   size: number;
   contentHash: string;
+  /** Source bytes plus the active metadata/cover overlay. A changed value
+   * requires a fresh browser-local derivative without changing contentHash. */
+  presentationVersion: string;
   sourceFilename: string;
   addedAt: string;
   updatedAt: string;
@@ -105,6 +112,87 @@ export interface CatalogBook {
   available: boolean;
   coverUrl: string | null;
   sourceUrl: string;
+  metadataEdited: boolean;
+  coverEdited: boolean;
+  metadataRevision: number;
+}
+
+export interface EditableBookMetadata {
+  title: string;
+  authors: string[];
+  authorSort: string | null;
+  language: string | null;
+  publisher: string | null;
+  publishedAt: string | null;
+  series: string | null;
+  seriesIndex: number | null;
+  description: string | null;
+  subjects: string[];
+  identifiers: string[];
+}
+
+export type EditableMetadataField = keyof EditableBookMetadata;
+
+export type BookMetadataOverrides = Partial<EditableBookMetadata>;
+
+export interface BookCoverOverride {
+  assetKey: string;
+  mediaType: "image/jpeg" | "image/png" | "image/webp";
+  byteLength: number;
+  width: number;
+  height: number;
+  sourceKind: "upload" | "provider";
+  provider: CoverProvider | null;
+  providerReference: string | null;
+  sourceUrl: string | null;
+}
+
+export interface BookMetadataState {
+  book: CatalogBook;
+  sourceMetadata: EditableBookMetadata;
+  sourceCoverUrl: string | null;
+  overrides: BookMetadataOverrides;
+  revision: number;
+  basedOnContentHash: string;
+  sourceChanged: boolean;
+  coverOverride: BookCoverOverride | null;
+}
+
+export interface BookMetadataPatchInput {
+  expectedRevision: number;
+  expectedContentHash: string;
+  changes: BookMetadataOverrides;
+}
+
+export interface BookMetadataResetInput {
+  expectedRevision: number;
+  expectedContentHash: string;
+  /** Omit to reset every metadata field while retaining a custom cover. */
+  fields?: EditableMetadataField[];
+}
+
+export type CoverProvider = "google-books" | "open-library";
+
+export interface CoverSearchCandidate {
+  candidateId: string;
+  title: string;
+  authors: string[];
+  publishedAt: string | null;
+  identifiers: string[];
+  /** Same-origin, bounded proxy URL; never a third-party hotlink. */
+  thumbnailUrl: string;
+}
+
+export interface CoverSearchResult {
+  provider: CoverProvider;
+  items: CoverSearchCandidate[];
+}
+
+export interface CoverImportInput {
+  expectedRevision: number;
+  expectedContentHash: string;
+  provider: CoverProvider;
+  candidateId: string;
 }
 
 export interface BookPage {
@@ -240,8 +328,10 @@ export interface MatchIndexEntry {
   sourceFormat: BookFormat;
   sourceSize: number;
   contentHash: string;
+  presentationVersion: string;
   sourceFilename: string;
   managedToken: string;
+  staleManagedTokens: string[];
   deliveries: Array<{
     deviceKey: string;
     filename: string | null;

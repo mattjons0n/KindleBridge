@@ -15,15 +15,24 @@ import {
   MAX_MATCH_INDEX_DELIVERIES,
   MAX_MATCH_INDEX_ENTRIES,
   MAX_MATCH_INDEX_RESPONSE_BYTES,
+  MAX_STALE_MANAGED_TOKENS_PER_BOOK,
   type BookFormat,
+  type BookCoverOverride,
+  type BookMetadataOverrides,
+  type BookMetadataPatchInput,
+  type BookMetadataResetInput,
+  type BookMetadataState,
   type BookPage,
   type BookSetQuery,
   type CatalogBook,
   type CatalogFilters,
   type CatalogProfile,
   type CatalogRoot,
+  type CoverProvider,
   type DeliveryInput,
   type DeliveryRecord,
+  type EditableBookMetadata,
+  type EditableMetadataField,
   type MatchIndexEntry,
   type MetadataClaimSummary,
   type ProfileInput,
@@ -61,6 +70,8 @@ export interface ExtractedBookInput {
   publisher: string | null;
   publishedAt: string | null;
   series: string | null;
+  seriesIndex?: number | null;
+  description?: string | null;
   subjects: string[];
   identifiers: string[];
   metadataComplete: boolean;
@@ -104,6 +115,27 @@ export interface BookSourceRecord {
   relativePath: string;
   coverKey: string | null;
   coverMediaType: string | null;
+  coverStorage: "cache" | "override";
+  sourceCoverKey: string | null;
+  sourceCoverMediaType: string | null;
+}
+
+export interface MetadataCoverAssetInput {
+  assetKey: string;
+  checksum: string;
+  mediaType: "image/jpeg" | "image/png" | "image/webp";
+  byteLength: number;
+  width: number;
+  height: number;
+  sourceKind: "upload" | "provider";
+  provider: CoverProvider | null;
+  providerReference: string | null;
+  sourceUrl: string | null;
+}
+
+export interface CoverMutationResult {
+  state: BookMetadataState;
+  unreferencedAssetKey: string | null;
 }
 
 export interface ScanRoot {
@@ -171,6 +203,7 @@ interface MatchBookRow extends Row {
   format: string;
   size: number;
   content_hash: string;
+  presentation_version: string;
   relative_path: string;
 }
 
@@ -184,6 +217,11 @@ interface MatchDeliveryRow extends Row {
   managed_token: string | null;
   status: string;
   updated_at: string;
+}
+
+interface MatchStaleManagedTokenRow extends Row {
+  book_id: string;
+  managed_token: string;
 }
 
 interface MatchDeliveryRetentionRow extends MatchDeliveryRow {
@@ -274,6 +312,10 @@ function stringOrNull(value: unknown): string | null {
   return typeof value === "string" ? value : null;
 }
 
+function numberOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
 function parseStringArray(value: unknown): string[] {
   if (typeof value !== "string") {
     return [];
@@ -343,11 +385,14 @@ function mapBook(row: Row): CatalogBook {
     publisher: stringOrNull(row.publisher),
     publishedAt: stringOrNull(row.published_at),
     series: stringOrNull(row.series),
+    seriesIndex: numberOrNull(row.series_index),
+    description: stringOrNull(row.description),
     subjects: parseStringArray(row.subjects_json),
     identifiers: parseStringArray(row.identifiers_json),
     format: String(row.format) as BookFormat,
     size: Number(row.size),
     contentHash: String(row.content_hash),
+    presentationVersion: stringOrNull(row.presentation_version) ?? String(row.content_hash),
     sourceFilename: String(row.relative_path).split(/[\\/]/u).at(-1) ?? String(row.relative_path),
     addedAt: String(row.added_at),
     updatedAt: String(row.updated_at),
@@ -357,6 +402,111 @@ function mapBook(row: Row): CatalogBook {
       ? `/api/profiles/${encodeURIComponent(profileId)}/books/${encodeURIComponent(id)}/cover?v=${encodeURIComponent(String(row.cover_cache_key))}`
       : null,
     sourceUrl: `/api/profiles/${encodeURIComponent(profileId)}/books/${encodeURIComponent(id)}/source`,
+    metadataEdited: bool(row.metadata_edited),
+    coverEdited: bool(row.cover_edited),
+    metadataRevision: Number(row.metadata_revision ?? 0),
+  };
+}
+
+const EDITABLE_METADATA_FIELDS: readonly EditableMetadataField[] = [
+  "title",
+  "authors",
+  "authorSort",
+  "language",
+  "publisher",
+  "publishedAt",
+  "series",
+  "seriesIndex",
+  "description",
+  "subjects",
+  "identifiers",
+];
+
+const OVERRIDE_COLUMNS: Readonly<Record<EditableMetadataField, { set: string; value: string }>> = {
+  title: { set: "title_set", value: "title" },
+  authors: { set: "authors_set", value: "authors_json" },
+  authorSort: { set: "author_sort_set", value: "author_sort" },
+  language: { set: "language_set", value: "language" },
+  publisher: { set: "publisher_set", value: "publisher" },
+  publishedAt: { set: "published_at_set", value: "published_at" },
+  series: { set: "series_set", value: "series" },
+  seriesIndex: { set: "series_index_set", value: "series_index" },
+  description: { set: "description_set", value: "description" },
+  subjects: { set: "subjects_set", value: "subjects_json" },
+  identifiers: { set: "identifiers_set", value: "identifiers_json" },
+};
+
+function editableMetadataFromRow(row: Row): EditableBookMetadata {
+  return {
+    title: String(row.title),
+    authors: parseStringArray(row.authors_json),
+    authorSort: stringOrNull(row.author_sort),
+    language: stringOrNull(row.language),
+    publisher: stringOrNull(row.publisher),
+    publishedAt: stringOrNull(row.published_at),
+    series: stringOrNull(row.series),
+    seriesIndex: numberOrNull(row.series_index),
+    description: stringOrNull(row.description),
+    subjects: parseStringArray(row.subjects_json),
+    identifiers: parseStringArray(row.identifiers_json),
+  };
+}
+
+function overridesFromRow(row: Row | undefined): BookMetadataOverrides {
+  if (!row) return {};
+  const overrides: BookMetadataOverrides = {};
+  for (const field of EDITABLE_METADATA_FIELDS) {
+    const columns = OVERRIDE_COLUMNS[field];
+    if (!bool(row[columns.set])) continue;
+    const raw = row[columns.value];
+    if (field === "authors" || field === "subjects" || field === "identifiers") {
+      (overrides as Record<string, unknown>)[field] = parseStringArray(raw);
+    } else if (field === "seriesIndex") {
+      overrides.seriesIndex = numberOrNull(raw);
+    } else if (field === "title") {
+      overrides.title = String(raw);
+    } else {
+      (overrides as Record<string, unknown>)[field] = stringOrNull(raw);
+    }
+  }
+  return overrides;
+}
+
+function mergeMetadata(source: EditableBookMetadata, overrides: BookMetadataOverrides): EditableBookMetadata {
+  return { ...source, ...overrides };
+}
+
+function presentationVersionFor(
+  sourceHash: string,
+  metadata: EditableBookMetadata,
+  metadataEdited: boolean,
+  coverAssetKey: string | null,
+): string {
+  if (!metadataEdited && !coverAssetKey) return sourceHash;
+  return createHash("sha256")
+    .update(stableJson({ version: 1, sourceHash: sourceHash.toLocaleLowerCase(), metadata, coverAssetKey }))
+    .digest("hex");
+}
+
+function mapCoverOverride(row: Row | undefined): BookCoverOverride | null {
+  const assetKey = stringOrNull(row?.asset_present);
+  const mediaType = stringOrNull(row?.asset_media_type);
+  if (!assetKey || (mediaType !== "image/jpeg" && mediaType !== "image/png" && mediaType !== "image/webp")) {
+    return null;
+  }
+  const sourceKind = stringOrNull(row?.asset_source_kind);
+  if (sourceKind !== "upload" && sourceKind !== "provider") return null;
+  const provider = stringOrNull(row?.asset_provider);
+  return {
+    assetKey,
+    mediaType,
+    byteLength: Number(row?.asset_byte_length),
+    width: Number(row?.asset_width),
+    height: Number(row?.asset_height),
+    sourceKind,
+    provider: provider === "google-books" || provider === "open-library" ? provider : null,
+    providerReference: stringOrNull(row?.asset_provider_reference),
+    sourceUrl: stringOrNull(row?.asset_source_url),
   };
 }
 
@@ -386,8 +536,9 @@ const BOOK_SELECT = `
 
 const BOOK_PAGE_SELECT = `
   SELECT b.id, b.root_id, b.title, b.authors_json, b.author_sort, b.language, b.publisher,
-    b.published_at, b.series, b.subjects_json, b.identifiers_json, b.metadata_complete,
+    b.published_at, b.series, b.series_index, b.description, b.subjects_json, b.identifiers_json, b.metadata_complete,
     b.available, b.added_at, b.updated_at, b.cover_cache_key,
+    b.presentation_version, b.metadata_edited, b.cover_edited, b.metadata_revision,
     (b.cover_media_type IS NOT NULL) AS cover_media_present,
     pr.profile_id, sf.format, sf.size, sf.content_hash, sf.relative_path
   FROM books b
@@ -426,6 +577,7 @@ export class CatalogDatabase {
     if (this.schemaVersion !== CATALOG_SCHEMA_VERSION) {
       throw new CatalogDatabaseError("invalid_state", "The catalog database schema is not supported.");
     }
+    this.bootstrapSourceMetadata();
     // Supported databases created before retention was enforced may already
     // exceed the live ceilings. Normalize them atomically before callers can
     // request a match index; otherwise the fail-closed index preflight could
@@ -453,7 +605,7 @@ export class CatalogDatabase {
                ON pr.root_id = b.root_id AND pr.profile_id = d.profile_id AND pr.enabled = 1
              JOIN profiles p ON p.id = pr.profile_id AND p.enabled = 1
              WHERE d.status = 'delivered' AND b.available = 1 AND sf.available = 1
-               AND d.managed_token = kindle_bridge_managed_token(b.id, sf.content_hash)
+               AND d.managed_token = kindle_bridge_managed_token(b.id, b.presentation_version)
              ORDER BY d.profile_id LIMIT ?`,
           )
           .all(MAX_CATALOG_PROFILES) as Row[];
@@ -472,6 +624,21 @@ export class CatalogDatabase {
 
   close(): void {
     this.database.close();
+  }
+
+  private bootstrapSourceMetadata(): void {
+    this.database.exec(`
+      INSERT INTO book_source_metadata(
+        book_id, title, authors_json, author_sort, language, publisher, published_at,
+        series, series_index, description, subjects_json, identifiers_json,
+        metadata_complete, cover_media_type, cover_cache_key, cover_expected, updated_at
+      )
+      SELECT b.id, b.title, b.authors_json, b.author_sort, b.language, b.publisher, b.published_at,
+        b.series, b.series_index, b.description, b.subjects_json, b.identifiers_json,
+        b.metadata_complete, b.cover_media_type, b.cover_cache_key, b.cover_expected, b.updated_at
+      FROM books b
+      WHERE NOT EXISTS (SELECT 1 FROM book_source_metadata sm WHERE sm.book_id = b.id);
+    `);
   }
 
   private transaction<T>(operation: () => T): T {
@@ -1366,8 +1533,10 @@ export class CatalogDatabase {
     const row = this.database
       .prepare(
         `SELECT sf.id, sf.size, sf.mtime_ms, sf.content_hash, sf.quick_fingerprint, sf.available, b.id AS book_id,
-           sf.last_error_code, b.cover_cache_key, b.cover_expected
+           sf.last_error_code, coalesce(sm.cover_cache_key, b.cover_cache_key) AS cover_cache_key,
+           coalesce(sm.cover_expected, b.cover_expected) AS cover_expected
          FROM source_files sf LEFT JOIN books b ON b.source_file_id = sf.id
+         LEFT JOIN book_source_metadata sm ON sm.book_id = b.id
          WHERE sf.root_id = ? AND sf.relative_path = ?`,
       )
       .get(rootId, relativePath) as Row | undefined;
@@ -1508,22 +1677,71 @@ export class CatalogDatabase {
       }
 
       const metadata = input.metadata;
+      const sourceMetadata: EditableBookMetadata = {
+        title: metadata.title,
+        authors: metadata.authors,
+        authorSort: metadata.authorSort,
+        language: metadata.language,
+        publisher: metadata.publisher,
+        publishedAt: metadata.publishedAt,
+        series: metadata.series,
+        seriesIndex: metadata.seriesIndex ?? null,
+        description: metadata.description ?? null,
+        subjects: metadata.subjects,
+        identifiers: metadata.identifiers,
+      };
+      const overrideRow = this.database
+        .prepare(
+          `SELECT o.*, a.media_type AS override_cover_media_type
+           FROM book_metadata_overrides o
+           LEFT JOIN metadata_cover_assets a ON a.asset_key = o.cover_asset_key
+           WHERE o.book_id = ?`,
+        )
+        .get(bookId) as Row | undefined;
+      const activeOverride = overrideRow && String(overrideRow.source_content_hash) === input.contentHash
+        ? overrideRow
+        : undefined;
+      const overrides = overridesFromRow(activeOverride);
+      const effectiveMetadata = mergeMetadata(sourceMetadata, overrides);
+      const metadataEdited = Object.keys(overrides).length > 0;
+      const overrideCoverKey = activeOverride ? stringOrNull(activeOverride.cover_asset_key) : null;
+      const overrideCoverMediaType = activeOverride ? stringOrNull(activeOverride.override_cover_media_type) : null;
+      if (overrideCoverKey && !overrideCoverMediaType) {
+        throw new CatalogDatabaseError("invalid_state", "A selected durable cover asset is missing from the database.");
+      }
+      const coverEdited = overrideCoverKey !== null;
+      const effectiveCoverKey = overrideCoverKey ?? metadata.coverKey;
+      const effectiveCoverMediaType = overrideCoverMediaType ?? metadata.coverMediaType;
+      const effectiveMetadataComplete = effectiveMetadata.title.trim().length > 0 && effectiveMetadata.authors.length > 0;
+      const presentationVersion = presentationVersionFor(
+        input.contentHash,
+        effectiveMetadata,
+        metadataEdited,
+        overrideCoverKey,
+      );
       const values: SqlValue[] = [
         input.rootId,
         sourceId,
-        metadata.title,
-        JSON.stringify(metadata.authors),
-        metadata.authorSort,
-        metadata.language,
-        metadata.publisher,
-        metadata.publishedAt,
-        metadata.series,
-        JSON.stringify(metadata.subjects),
-        JSON.stringify(metadata.identifiers),
-        metadata.metadataComplete ? 1 : 0,
-        metadata.coverMediaType,
-        metadata.coverKey,
+        effectiveMetadata.title,
+        JSON.stringify(effectiveMetadata.authors),
+        effectiveMetadata.authorSort,
+        effectiveMetadata.language,
+        effectiveMetadata.publisher,
+        effectiveMetadata.publishedAt,
+        effectiveMetadata.series,
+        effectiveMetadata.seriesIndex,
+        effectiveMetadata.description,
+        JSON.stringify(effectiveMetadata.subjects),
+        JSON.stringify(effectiveMetadata.identifiers),
+        effectiveMetadataComplete ? 1 : 0,
+        effectiveCoverMediaType,
+        effectiveCoverKey,
         (metadata.coverExpected ?? metadata.coverKey !== null) ? 1 : 0,
+        coverEdited ? "override" : "cache",
+        Number(overrideRow?.revision ?? 0),
+        metadataEdited ? 1 : 0,
+        coverEdited ? 1 : 0,
+        presentationVersion,
         timestamp,
         bookId,
       ];
@@ -1531,8 +1749,10 @@ export class CatalogDatabase {
         this.database
           .prepare(
             `UPDATE books SET root_id = ?, source_file_id = ?, title = ?, authors_json = ?,
-               author_sort = ?, language = ?, publisher = ?, published_at = ?, series = ?, subjects_json = ?,
-               identifiers_json = ?, metadata_complete = ?, cover_media_type = ?, cover_cache_key = ?, cover_expected = ?, available = 1,
+               author_sort = ?, language = ?, publisher = ?, published_at = ?, series = ?,
+               series_index = ?, description = ?, subjects_json = ?, identifiers_json = ?, metadata_complete = ?,
+               cover_media_type = ?, cover_cache_key = ?, cover_expected = ?,
+               cover_storage = ?, metadata_revision = ?, metadata_edited = ?, cover_edited = ?, presentation_version = ?, available = 1,
                updated_at = ? WHERE id = ?`,
           )
           .run(...values);
@@ -1541,27 +1761,70 @@ export class CatalogDatabase {
           .prepare(
             `INSERT INTO books(
                root_id, source_file_id, title, authors_json, author_sort, language, publisher,
-               published_at, series, subjects_json, identifiers_json, metadata_complete, cover_media_type,
-               cover_cache_key, cover_expected, updated_at, id, available, added_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+               published_at, series, series_index, description, subjects_json, identifiers_json, metadata_complete, cover_media_type,
+               cover_cache_key, cover_expected, cover_storage, metadata_revision, metadata_edited, cover_edited,
+               presentation_version, updated_at, id, available, added_at
+             ) VALUES (
+               ?, ?, ?, ?, ?, ?, ?, ?,
+               ?, ?, ?, ?, ?, ?, ?, ?,
+               ?, ?, ?, ?, ?, ?, ?, ?,
+               1, ?
+             )`,
           )
           .run(...values, timestamp);
       }
 
-      this.database.prepare("DELETE FROM books_fts WHERE book_id = ?").run(bookId);
       this.database
         .prepare(
-          `INSERT INTO books_fts(book_id, title, authors, subjects, publisher, series, identifiers, source_filename)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO book_source_metadata(
+             book_id, title, authors_json, author_sort, language, publisher, published_at,
+             series, series_index, description, subjects_json, identifiers_json,
+             metadata_complete, cover_media_type, cover_cache_key, cover_expected, updated_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(book_id) DO UPDATE SET
+             title = excluded.title, authors_json = excluded.authors_json, author_sort = excluded.author_sort,
+             language = excluded.language, publisher = excluded.publisher, published_at = excluded.published_at,
+             series = excluded.series, series_index = excluded.series_index, description = excluded.description,
+             subjects_json = excluded.subjects_json, identifiers_json = excluded.identifiers_json,
+             metadata_complete = excluded.metadata_complete,
+             cover_media_type = excluded.cover_media_type, cover_cache_key = excluded.cover_cache_key,
+             cover_expected = excluded.cover_expected, updated_at = excluded.updated_at`,
         )
         .run(
           bookId,
-          metadata.title,
-          metadata.authors.join(" "),
-          metadata.subjects.join(" "),
-          metadata.publisher ?? "",
-          metadata.series ?? "",
-          metadata.identifiers.join(" "),
+          sourceMetadata.title,
+          JSON.stringify(sourceMetadata.authors),
+          sourceMetadata.authorSort,
+          sourceMetadata.language,
+          sourceMetadata.publisher,
+          sourceMetadata.publishedAt,
+          sourceMetadata.series,
+          sourceMetadata.seriesIndex,
+          sourceMetadata.description,
+          JSON.stringify(sourceMetadata.subjects),
+          JSON.stringify(sourceMetadata.identifiers),
+          metadata.metadataComplete ? 1 : 0,
+          metadata.coverMediaType,
+          metadata.coverKey,
+          (metadata.coverExpected ?? metadata.coverKey !== null) ? 1 : 0,
+          timestamp,
+        );
+
+      this.database.prepare("DELETE FROM books_fts WHERE book_id = ?").run(bookId);
+      this.database
+        .prepare(
+          `INSERT INTO books_fts(book_id, title, authors, subjects, publisher, series, identifiers, description, source_filename)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          bookId,
+          effectiveMetadata.title,
+          effectiveMetadata.authors.join(" "),
+          effectiveMetadata.subjects.join(" "),
+          effectiveMetadata.publisher ?? "",
+          effectiveMetadata.series ?? "",
+          effectiveMetadata.identifiers.join(" "),
+          effectiveMetadata.description ?? "",
           input.relativePath,
         );
 
@@ -1773,7 +2036,7 @@ export class CatalogDatabase {
   referencedCoverKeys(): Set<string> {
     const rows = this.database
       .prepare(
-        `SELECT DISTINCT cover_cache_key FROM books
+        `SELECT DISTINCT cover_cache_key FROM book_source_metadata
          WHERE cover_cache_key IS NOT NULL AND trim(cover_cache_key) <> ''`,
       )
       .all() as Row[];
@@ -1941,14 +2204,391 @@ export class CatalogDatabase {
     return row ? mapBook(row) : null;
   }
 
+  getBookMetadataState(profileId: string, bookId: string): BookMetadataState | null {
+    const book = this.getBook(profileId, bookId);
+    if (!book) return null;
+    const source = this.database
+      .prepare(
+        `SELECT sm.*, sf.content_hash
+         FROM book_source_metadata sm
+         JOIN books b ON b.id = sm.book_id
+         JOIN source_files sf ON sf.id = b.source_file_id
+         JOIN profile_roots pr ON pr.root_id = b.root_id AND pr.enabled = 1
+         JOIN profiles p ON p.id = pr.profile_id AND p.enabled = 1
+         WHERE pr.profile_id = ? AND b.id = ?`,
+      )
+      .get(profileId, bookId) as Row | undefined;
+    if (!source) throw new CatalogDatabaseError("invalid_state", "Book source metadata is unavailable.");
+    const override = this.database
+      .prepare(
+        `SELECT o.*, a.asset_key AS asset_present, a.media_type AS asset_media_type,
+           a.byte_length AS asset_byte_length, a.width AS asset_width, a.height AS asset_height,
+           a.source_kind AS asset_source_kind, a.provider AS asset_provider,
+           a.provider_reference AS asset_provider_reference, a.source_url AS asset_source_url
+         FROM book_metadata_overrides o
+         LEFT JOIN metadata_cover_assets a ON a.asset_key = o.cover_asset_key
+         WHERE o.book_id = ?`,
+      )
+      .get(bookId) as Row | undefined;
+    const coverOverride = mapCoverOverride(override);
+    const sourceCoverKey = stringOrNull(source.cover_cache_key);
+    const sourceHasCover = sourceCoverKey !== null && stringOrNull(source.cover_media_type) !== null;
+    return {
+      book,
+      sourceMetadata: editableMetadataFromRow(source),
+      sourceCoverUrl: sourceHasCover
+        ? `/api/profiles/${encodeURIComponent(profileId)}/books/${encodeURIComponent(bookId)}/cover?source=true&v=${encodeURIComponent(sourceCoverKey)}`
+        : null,
+      overrides: overridesFromRow(override),
+      revision: Number(override?.revision ?? 0),
+      basedOnContentHash: stringOrNull(override?.source_content_hash) ?? String(source.content_hash),
+      sourceChanged: override !== undefined && String(override.source_content_hash) !== String(source.content_hash),
+      coverOverride,
+    };
+  }
+
+  patchBookMetadata(profileId: string, bookId: string, input: BookMetadataPatchInput): BookMetadataState {
+    this.transaction(() => {
+      const context = this.metadataMutationContext(profileId, bookId, input.expectedRevision, input.expectedContentHash);
+      const merged = { ...overridesFromRow(context.override), ...input.changes };
+      this.writeMetadataOverride(bookId, context.rootId, context.contentHash, context.nextRevision, merged, context.coverAssetKey);
+      this.refreshEffectiveBook(bookId);
+    });
+    return this.getBookMetadataState(profileId, bookId) as BookMetadataState;
+  }
+
+  resetBookMetadata(profileId: string, bookId: string, input: BookMetadataResetInput): BookMetadataState {
+    this.transaction(() => {
+      const context = this.metadataMutationContext(profileId, bookId, input.expectedRevision, input.expectedContentHash);
+      const retained = overridesFromRow(context.override);
+      for (const field of input.fields ?? EDITABLE_METADATA_FIELDS) delete retained[field];
+      this.writeMetadataOverride(bookId, context.rootId, context.contentHash, context.nextRevision, retained, context.coverAssetKey);
+      this.refreshEffectiveBook(bookId);
+    });
+    return this.getBookMetadataState(profileId, bookId) as BookMetadataState;
+  }
+
+  setBookCover(
+    profileId: string,
+    bookId: string,
+    expectedRevision: number,
+    expectedContentHash: string,
+    asset: MetadataCoverAssetInput,
+  ): CoverMutationResult {
+    let previousAssetKey: string | null = null;
+    this.transaction(() => {
+      const context = this.metadataMutationContext(profileId, bookId, expectedRevision, expectedContentHash);
+      previousAssetKey = context.coverAssetKey;
+      this.database
+        .prepare(
+          `INSERT INTO metadata_cover_assets(
+             asset_key, checksum, media_type, byte_length, width, height, source_kind,
+             provider, provider_reference, source_url, created_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(asset_key) DO NOTHING`,
+        )
+        .run(
+          asset.assetKey,
+          asset.checksum,
+          asset.mediaType,
+          asset.byteLength,
+          asset.width,
+          asset.height,
+          asset.sourceKind,
+          asset.provider,
+          asset.providerReference,
+          asset.sourceUrl,
+          now(),
+        );
+      this.writeMetadataOverride(
+        bookId,
+        context.rootId,
+        context.contentHash,
+        context.nextRevision,
+        overridesFromRow(context.override),
+        asset.assetKey,
+      );
+      this.refreshEffectiveBook(bookId);
+    });
+    const stale = previousAssetKey && previousAssetKey !== asset.assetKey && !this.isMetadataCoverReferenced(previousAssetKey)
+      ? previousAssetKey
+      : null;
+    return { state: this.getBookMetadataState(profileId, bookId) as BookMetadataState, unreferencedAssetKey: stale };
+  }
+
+  resetBookCover(
+    profileId: string,
+    bookId: string,
+    expectedRevision: number,
+    expectedContentHash: string,
+  ): CoverMutationResult {
+    let previousAssetKey: string | null = null;
+    this.transaction(() => {
+      const context = this.metadataMutationContext(profileId, bookId, expectedRevision, expectedContentHash);
+      previousAssetKey = context.coverAssetKey;
+      this.writeMetadataOverride(
+        bookId,
+        context.rootId,
+        context.contentHash,
+        context.nextRevision,
+        overridesFromRow(context.override),
+        null,
+      );
+      this.refreshEffectiveBook(bookId);
+    });
+    const stale = previousAssetKey && !this.isMetadataCoverReferenced(previousAssetKey) ? previousAssetKey : null;
+    return { state: this.getBookMetadataState(profileId, bookId) as BookMetadataState, unreferencedAssetKey: stale };
+  }
+
+  referencedMetadataCoverKeys(): Set<string> {
+    const rows = this.database
+      .prepare(
+        `SELECT DISTINCT cover_asset_key FROM book_metadata_overrides
+         WHERE cover_asset_key IS NOT NULL AND trim(cover_asset_key) <> ''`,
+      )
+      .all() as Row[];
+    return new Set(rows.map((row) => String(row.cover_asset_key)));
+  }
+
+  pruneUnreferencedMetadataCoverAssetRows(): number {
+    return Number(this.database
+      .prepare(
+        `DELETE FROM metadata_cover_assets
+         WHERE NOT EXISTS (
+           SELECT 1 FROM book_metadata_overrides o
+           WHERE o.cover_asset_key = metadata_cover_assets.asset_key
+         )`,
+      )
+      .run().changes);
+  }
+
+  isMetadataCoverReferenced(assetKey: string): boolean {
+    return this.database
+      .prepare("SELECT 1 AS referenced FROM book_metadata_overrides WHERE cover_asset_key = ? LIMIT 1")
+      .get(assetKey) !== undefined;
+  }
+
+  private metadataMutationContext(
+    profileId: string,
+    bookId: string,
+    expectedRevision: number,
+    expectedContentHash: string,
+  ): { rootId: string; contentHash: string; nextRevision: number; override: Row | undefined; coverAssetKey: string | null } {
+    const current = this.database
+      .prepare(
+        `SELECT b.root_id, sf.content_hash
+         FROM books b
+         JOIN source_files sf ON sf.id = b.source_file_id
+         JOIN profile_roots pr ON pr.root_id = b.root_id AND pr.enabled = 1
+         JOIN profiles p ON p.id = pr.profile_id AND p.enabled = 1
+         WHERE pr.profile_id = ? AND b.id = ?`,
+      )
+      .get(profileId, bookId) as Row | undefined;
+    if (!current) throw new CatalogDatabaseError("not_found", "Book not found.");
+    const contentHash = String(current.content_hash);
+    if (expectedContentHash !== contentHash) {
+      throw new CatalogDatabaseError("conflict", "The immutable source changed; reload the metadata editor.");
+    }
+    const override = this.database.prepare("SELECT * FROM book_metadata_overrides WHERE book_id = ?").get(bookId) as
+      | Row
+      | undefined;
+    const revision = Number(override?.revision ?? 0);
+    if (expectedRevision !== revision) {
+      throw new CatalogDatabaseError("conflict", "The metadata was edited elsewhere; reload before saving.");
+    }
+    return {
+      rootId: String(current.root_id),
+      contentHash,
+      nextRevision: revision + 1,
+      override,
+      coverAssetKey: stringOrNull(override?.cover_asset_key),
+    };
+  }
+
+  private writeMetadataOverride(
+    bookId: string,
+    rootId: string,
+    contentHash: string,
+    revision: number,
+    overrides: BookMetadataOverrides,
+    coverAssetKey: string | null,
+  ): void {
+    const value = (field: EditableMetadataField): SqlValue => {
+      if (!Object.hasOwn(overrides, field)) return null;
+      const raw = overrides[field];
+      return field === "authors" || field === "subjects" || field === "identifiers"
+        ? JSON.stringify(raw)
+        : (raw ?? null) as SqlValue;
+    };
+    const set = (field: EditableMetadataField): number => Object.hasOwn(overrides, field) ? 1 : 0;
+    const timestamp = now();
+    this.database
+      .prepare(
+        `INSERT INTO book_metadata_overrides(
+           book_id, root_id, source_content_hash, revision,
+           title_set, title, authors_set, authors_json, author_sort_set, author_sort,
+           language_set, language, publisher_set, publisher, published_at_set, published_at,
+           series_set, series, series_index_set, series_index, description_set, description,
+           subjects_set, subjects_json, identifiers_set, identifiers_json, cover_asset_key,
+           created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(book_id) DO UPDATE SET
+           root_id = excluded.root_id, source_content_hash = excluded.source_content_hash, revision = excluded.revision,
+           title_set = excluded.title_set, title = excluded.title,
+           authors_set = excluded.authors_set, authors_json = excluded.authors_json,
+           author_sort_set = excluded.author_sort_set, author_sort = excluded.author_sort,
+           language_set = excluded.language_set, language = excluded.language,
+           publisher_set = excluded.publisher_set, publisher = excluded.publisher,
+           published_at_set = excluded.published_at_set, published_at = excluded.published_at,
+           series_set = excluded.series_set, series = excluded.series,
+           series_index_set = excluded.series_index_set, series_index = excluded.series_index,
+           description_set = excluded.description_set, description = excluded.description,
+           subjects_set = excluded.subjects_set, subjects_json = excluded.subjects_json,
+           identifiers_set = excluded.identifiers_set, identifiers_json = excluded.identifiers_json,
+           cover_asset_key = excluded.cover_asset_key, updated_at = excluded.updated_at`,
+      )
+      .run(
+        bookId,
+        rootId,
+        contentHash,
+        revision,
+        set("title"), value("title"),
+        set("authors"), value("authors"),
+        set("authorSort"), value("authorSort"),
+        set("language"), value("language"),
+        set("publisher"), value("publisher"),
+        set("publishedAt"), value("publishedAt"),
+        set("series"), value("series"),
+        set("seriesIndex"), value("seriesIndex"),
+        set("description"), value("description"),
+        set("subjects"), value("subjects"),
+        set("identifiers"), value("identifiers"),
+        coverAssetKey,
+        timestamp,
+        timestamp,
+      );
+  }
+
+  private refreshEffectiveBook(bookId: string): void {
+    const row = this.database
+      .prepare(
+        `SELECT sm.*, sf.content_hash, sf.relative_path, o.revision,
+           o.source_content_hash AS override_source_content_hash, o.title_set, o.title AS override_title,
+           o.authors_set, o.authors_json AS override_authors_json,
+           o.author_sort_set, o.author_sort AS override_author_sort,
+           o.language_set, o.language AS override_language,
+           o.publisher_set, o.publisher AS override_publisher,
+           o.published_at_set, o.published_at AS override_published_at,
+           o.series_set, o.series AS override_series,
+           o.series_index_set, o.series_index AS override_series_index,
+           o.description_set, o.description AS override_description,
+           o.subjects_set, o.subjects_json AS override_subjects_json,
+           o.identifiers_set, o.identifiers_json AS override_identifiers_json,
+           o.cover_asset_key, a.media_type AS override_cover_media_type
+         FROM books b
+         JOIN source_files sf ON sf.id = b.source_file_id
+         JOIN book_source_metadata sm ON sm.book_id = b.id
+         LEFT JOIN book_metadata_overrides o ON o.book_id = b.id
+         LEFT JOIN metadata_cover_assets a ON a.asset_key = o.cover_asset_key
+         WHERE b.id = ?`,
+      )
+      .get(bookId) as Row | undefined;
+    if (!row) throw new CatalogDatabaseError("invalid_state", "Book source metadata is unavailable.");
+    const source = editableMetadataFromRow(row);
+    const active = stringOrNull(row.override_source_content_hash) === String(row.content_hash);
+    const overrideRow: Row | undefined = active
+      ? {
+          title_set: row.title_set, title: row.override_title,
+          authors_set: row.authors_set, authors_json: row.override_authors_json,
+          author_sort_set: row.author_sort_set, author_sort: row.override_author_sort,
+          language_set: row.language_set, language: row.override_language,
+          publisher_set: row.publisher_set, publisher: row.override_publisher,
+          published_at_set: row.published_at_set, published_at: row.override_published_at,
+          series_set: row.series_set, series: row.override_series,
+          series_index_set: row.series_index_set, series_index: row.override_series_index,
+          description_set: row.description_set, description: row.override_description,
+          subjects_set: row.subjects_set, subjects_json: row.override_subjects_json,
+          identifiers_set: row.identifiers_set, identifiers_json: row.override_identifiers_json,
+        }
+      : undefined;
+    const overrides = overridesFromRow(overrideRow);
+    const effective = mergeMetadata(source, overrides);
+    const metadataEdited = Object.keys(overrides).length > 0;
+    const metadataComplete = effective.title.trim().length > 0 && effective.authors.length > 0;
+    const coverAssetKey = active ? stringOrNull(row.cover_asset_key) : null;
+    const overrideMediaType = active ? stringOrNull(row.override_cover_media_type) : null;
+    if (coverAssetKey && !overrideMediaType) {
+      throw new CatalogDatabaseError("invalid_state", "A selected durable cover asset is missing from the database.");
+    }
+    const presentationVersion = presentationVersionFor(
+      String(row.content_hash),
+      effective,
+      metadataEdited,
+      coverAssetKey,
+    );
+    const timestamp = now();
+    this.database
+      .prepare(
+        `UPDATE books SET title = ?, authors_json = ?, author_sort = ?, language = ?, publisher = ?,
+           published_at = ?, series = ?, series_index = ?, description = ?, subjects_json = ?, identifiers_json = ?,
+           metadata_complete = ?,
+           cover_media_type = ?, cover_cache_key = ?, cover_expected = ?, cover_storage = ?,
+           metadata_revision = ?, metadata_edited = ?, cover_edited = ?, presentation_version = ?, updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(
+        effective.title,
+        JSON.stringify(effective.authors),
+        effective.authorSort,
+        effective.language,
+        effective.publisher,
+        effective.publishedAt,
+        effective.series,
+        effective.seriesIndex,
+        effective.description,
+        JSON.stringify(effective.subjects),
+        JSON.stringify(effective.identifiers),
+        metadataComplete ? 1 : 0,
+        coverAssetKey ? overrideMediaType : stringOrNull(row.cover_media_type),
+        coverAssetKey ?? stringOrNull(row.cover_cache_key),
+        coverAssetKey ? 1 : bool(row.cover_expected) ? 1 : 0,
+        coverAssetKey ? "override" : "cache",
+        Number(row.revision ?? 0),
+        metadataEdited ? 1 : 0,
+        coverAssetKey ? 1 : 0,
+        presentationVersion,
+        timestamp,
+        bookId,
+      );
+    this.database.prepare("DELETE FROM books_fts WHERE book_id = ?").run(bookId);
+    this.database
+      .prepare(
+        `INSERT INTO books_fts(book_id, title, authors, subjects, publisher, series, identifiers, description, source_filename)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        bookId,
+        effective.title,
+        effective.authors.join(" "),
+        effective.subjects.join(" "),
+        effective.publisher ?? "",
+        effective.series ?? "",
+        effective.identifiers.join(" "),
+        effective.description ?? "",
+        String(row.relative_path),
+      );
+  }
+
   getBookSource(profileId: string, bookId: string): BookSourceRecord | null {
     const row = this.database
       .prepare(
         `SELECT b.*, sf.format, sf.size, sf.content_hash,
+           sm.cover_cache_key AS source_cover_cache_key, sm.cover_media_type AS source_cover_media_type,
            pr.profile_id, r.path AS root_path, sf.relative_path
          FROM books b
          JOIN source_files sf ON sf.id = b.source_file_id
          JOIN library_roots r ON r.id = b.root_id
+         JOIN book_source_metadata sm ON sm.book_id = b.id
          JOIN profile_roots pr ON pr.root_id = b.root_id AND pr.enabled = 1
          JOIN profiles p ON p.id = pr.profile_id AND p.enabled = 1
          WHERE pr.profile_id = ? AND b.id = ?`,
@@ -1963,6 +2603,9 @@ export class CatalogDatabase {
       relativePath: String(row.relative_path),
       coverKey: stringOrNull(row.cover_cache_key),
       coverMediaType: stringOrNull(row.cover_media_type),
+      coverStorage: String(row.cover_storage) === "override" ? "override" : "cache",
+      sourceCoverKey: stringOrNull(row.source_cover_cache_key),
+      sourceCoverMediaType: stringOrNull(row.source_cover_media_type),
     };
   }
 
@@ -2133,10 +2776,13 @@ export class CatalogDatabase {
              + coalesce(length(CAST(b.publisher AS BLOB)), 0)
              + coalesce(length(CAST(b.published_at AS BLOB)), 0)
              + coalesce(length(CAST(b.series AS BLOB)), 0)
+             + coalesce(length(CAST(b.series_index AS BLOB)), 0)
+             + coalesce(length(CAST(b.description AS BLOB)), 0)
              + length(CAST(b.subjects_json AS BLOB)) + length(CAST(b.identifiers_json AS BLOB))
              + length(CAST(sf.format AS BLOB)) + length(CAST(sf.content_hash AS BLOB))
              + length(CAST(sf.relative_path AS BLOB)) + length(CAST(b.added_at AS BLOB))
              + length(CAST(b.updated_at AS BLOB))
+             + coalesce(length(CAST(b.presentation_version AS BLOB)), 0)
              + coalesce(length(CAST(b.cover_cache_key AS BLOB)), 0)
            ), 0) AS raw_bytes,
            sum(CASE WHEN
@@ -2218,6 +2864,10 @@ export class CatalogDatabase {
       sink.nullableString(stringOrNull(row.published_at));
       sink.raw(',"series":');
       sink.nullableString(stringOrNull(row.series));
+      sink.raw(',"seriesIndex":');
+      sink.number(numberOrNull(row.series_index));
+      sink.raw(',"description":');
+      sink.nullableString(stringOrNull(row.description));
       sink.raw(',"subjects":');
       sink.raw(String(row.subjects_json));
       sink.raw(',"identifiers":');
@@ -2228,6 +2878,8 @@ export class CatalogDatabase {
       sink.number(Number(row.size));
       sink.raw(',"contentHash":');
       sink.string(String(row.content_hash));
+      sink.raw(',"presentationVersion":');
+      sink.string(stringOrNull(row.presentation_version) ?? String(row.content_hash));
       sink.raw(',"sourceFilename":');
       sink.string(filename);
       sink.raw(',"addedAt":');
@@ -2246,6 +2898,12 @@ export class CatalogDatabase {
       );
       sink.raw(',"sourceUrl":');
       sink.string(`/api/profiles/${encodeURIComponent(profileId)}/books/${encodeURIComponent(id)}/source`);
+      sink.raw(',"metadataEdited":');
+      sink.raw(bool(row.metadata_edited) ? "true" : "false");
+      sink.raw(',"coverEdited":');
+      sink.raw(bool(row.cover_edited) ? "true" : "false");
+      sink.raw(',"metadataRevision":');
+      sink.number(Number(row.metadata_revision ?? 0));
       sink.raw("}");
     }
     sink.raw('],"total":');
@@ -2346,7 +3004,7 @@ export class CatalogDatabase {
         const entries: MatchIndexEntry[] = [];
         let current: MatchIndexEntry | null = null;
         this.walkMatchIndexRows(profileId, {
-          startBook: (row, managedToken) => {
+          startBook: (row, managedToken, staleManagedTokens) => {
             const relativePath = String(row.relative_path);
             current = {
               bookId: String(row.id),
@@ -2357,8 +3015,10 @@ export class CatalogDatabase {
               sourceFormat: String(row.format) as BookFormat,
               sourceSize: Number(row.size),
               contentHash: String(row.content_hash),
+              presentationVersion: String(row.presentation_version),
               sourceFilename: relativePath.split(/[\\/]/u).at(-1) ?? relativePath,
               managedToken,
+              staleManagedTokens: [...staleManagedTokens],
               deliveries: [],
             };
           },
@@ -2466,13 +3126,14 @@ export class CatalogDatabase {
               JOIN profiles dp ON dp.id = dpr.profile_id AND dp.enabled = 1
              WHERE d.profile_id = ? AND d.status = 'delivered'
                AND db.available = 1 AND dsf.available = 1
-               AND d.managed_token = kindle_bridge_managed_token(db.id, dsf.content_hash)
+               AND d.managed_token = kindle_bridge_managed_token(db.id, db.presentation_version)
            ) AS delivery_count,
            (SELECT coalesce(sum(
                length(CAST(b.id AS BLOB)) + length(CAST(b.title AS BLOB))
                + length(CAST(b.authors_json AS BLOB))
                + coalesce(length(CAST(b.author_sort AS BLOB)), 0)
                + length(CAST(b.identifiers_json AS BLOB))
+               + length(CAST(b.presentation_version AS BLOB))
                + length(CAST(sf.format AS BLOB)) + length(CAST(sf.content_hash AS BLOB))
                + length(CAST(sf.relative_path AS BLOB))
              ), 0)
@@ -2497,7 +3158,7 @@ export class CatalogDatabase {
               JOIN profiles dp ON dp.id = dpr.profile_id AND dp.enabled = 1
              WHERE d.profile_id = ? AND d.status = 'delivered'
                AND db.available = 1 AND dsf.available = 1
-               AND d.managed_token = kindle_bridge_managed_token(db.id, dsf.content_hash)
+               AND d.managed_token = kindle_bridge_managed_token(db.id, db.presentation_version)
            ) AS delivery_raw_bytes,
            (SELECT count(*)
               FROM books b
@@ -2625,7 +3286,7 @@ export class CatalogDatabase {
              JOIN profiles dp ON dp.id = dpr.profile_id AND dp.enabled = 1
              WHERE d.status = 'delivered' AND d.size IS NOT NULL AND d.size >= 0
                AND b.available = 1 AND sf.available = 1
-               AND d.managed_token = kindle_bridge_managed_token(b.id, sf.content_hash)
+               AND d.managed_token = kindle_bridge_managed_token(b.id, b.presentation_version)
              ORDER BY d.id
              LIMIT ${MAX_METADATA_CLAIM_DELIVERY_ROWS + 1}
            )
@@ -2674,7 +3335,7 @@ export class CatalogDatabase {
                  WHERE db.id = cb.id AND d.status = 'delivered'
                    AND d.size IS NOT NULL AND d.size >= 0
                    AND db.available = 1 AND dsf.available = 1
-                   AND d.managed_token = kindle_bridge_managed_token(db.id, dsf.content_hash)
+                   AND d.managed_token = kindle_bridge_managed_token(db.id, db.presentation_version)
                  LIMIT 1
                ) THEN 1 ELSE 0 END AS has_known_artifact_size
            FROM candidate_books cb ORDER BY cb.id`,
@@ -2751,7 +3412,7 @@ export class CatalogDatabase {
     let firstBook = true;
     let firstDelivery = true;
     this.walkMatchIndexRows(profileId, {
-      startBook: (row, managedToken) => {
+      startBook: (row, managedToken, staleManagedTokens) => {
         if (!firstBook) sink.raw(",");
         firstBook = false;
         firstDelivery = true;
@@ -2772,10 +3433,18 @@ export class CatalogDatabase {
         sink.number(Number(row.size));
         sink.raw(',"contentHash":');
         sink.string(String(row.content_hash));
+        sink.raw(',"presentationVersion":');
+        sink.string(String(row.presentation_version));
         sink.raw(',"sourceFilename":');
         sink.string(relativePath.split(/[\\/]/u).at(-1) ?? relativePath);
         sink.raw(',"managedToken":');
         sink.string(managedToken);
+        sink.raw(',"staleManagedTokens":[');
+        for (const [index, token] of staleManagedTokens.entries()) {
+          if (index > 0) sink.raw(",");
+          sink.string(token);
+        }
+        sink.raw("]");
         sink.raw(',"deliveries":[');
       },
       delivery: (row) => {
@@ -2791,7 +3460,7 @@ export class CatalogDatabase {
   private walkMatchIndexRows(
     profileId: string,
     visitor: {
-      startBook(row: MatchBookRow, managedToken: string): void;
+      startBook(row: MatchBookRow, managedToken: string, staleManagedTokens: readonly string[]): void;
       delivery(row: MatchDeliveryRow): void;
       endBook(): void;
     },
@@ -2799,7 +3468,7 @@ export class CatalogDatabase {
     const books = this.database
       .prepare(
         `SELECT b.id, b.title, b.authors_json, b.author_sort, b.identifiers_json,
-           sf.format, sf.size, sf.content_hash, sf.relative_path
+           b.presentation_version, sf.format, sf.size, sf.content_hash, sf.relative_path
          FROM books b
          JOIN source_files sf ON sf.id = b.source_file_id
          JOIN profile_roots pr ON pr.root_id = b.root_id AND pr.enabled = 1
@@ -2819,18 +3488,54 @@ export class CatalogDatabase {
          JOIN profiles p ON p.id = pr.profile_id AND p.enabled = 1
          WHERE d.profile_id = ? AND d.status = 'delivered'
            AND b.available = 1 AND sf.available = 1
-           AND d.managed_token = kindle_bridge_managed_token(b.id, sf.content_hash)
+           AND d.managed_token = kindle_bridge_managed_token(b.id, b.presentation_version)
          ORDER BY d.book_id, d.updated_at, d.id`,
       )
       .iterate(profileId) as IterableIterator<MatchDeliveryRow>)[Symbol.iterator]();
+    const staleTokenIterator = (this.database
+      .prepare(
+        `WITH stale_tokens AS (
+           SELECT d.book_id, d.managed_token, max(d.updated_at) AS latest_at
+           FROM deliveries d
+           JOIN books b ON b.id = d.book_id
+           JOIN source_files sf ON sf.id = b.source_file_id
+           JOIN profile_roots pr
+             ON pr.root_id = b.root_id AND pr.profile_id = d.profile_id AND pr.enabled = 1
+           JOIN profiles p ON p.id = pr.profile_id AND p.enabled = 1
+           WHERE d.profile_id = ? AND d.status = 'delivered'
+             AND b.available = 1 AND sf.available = 1
+             AND d.managed_token <> kindle_bridge_managed_token(b.id, b.presentation_version)
+             AND length(d.managed_token) = 23
+             AND substr(d.managed_token, 1, 3) = 'kb-'
+             AND substr(d.managed_token, 4) NOT GLOB '*[^0-9a-f]*'
+           GROUP BY d.book_id, d.managed_token
+         ), ranked_tokens AS (
+           SELECT book_id, managed_token,
+             row_number() OVER (
+               PARTITION BY book_id ORDER BY latest_at DESC, managed_token ASC
+             ) AS retention_rank
+           FROM stale_tokens
+         )
+         SELECT book_id, managed_token FROM ranked_tokens
+         WHERE retention_rank <= ${MAX_STALE_MANAGED_TOKENS_PER_BOOK}
+         ORDER BY book_id, retention_rank`,
+      )
+      .iterate(profileId) as IterableIterator<MatchStaleManagedTokenRow>)[Symbol.iterator]();
     let delivery = deliveryIterator.next();
+    let staleToken = staleTokenIterator.next();
     for (const book of books) {
       const bookId = String(book.id);
-      const managedToken = managedTokenForBook(bookId, String(book.content_hash));
+      const managedToken = managedTokenForBook(bookId, String(book.presentation_version));
       while (!delivery.done && String(delivery.value.book_id) < bookId) delivery = deliveryIterator.next();
-      visitor.startBook(book, managedToken);
+      while (!staleToken.done && String(staleToken.value.book_id) < bookId) staleToken = staleTokenIterator.next();
+      const staleManagedTokens: string[] = [];
+      while (!staleToken.done && String(staleToken.value.book_id) === bookId) {
+        staleManagedTokens.push(String(staleToken.value.managed_token));
+        staleToken = staleTokenIterator.next();
+      }
+      visitor.startBook(book, managedToken, staleManagedTokens);
       while (!delivery.done && String(delivery.value.book_id) === bookId) {
-        // The SQL predicate already excludes stale source-version evidence;
+        // The SQL predicate already excludes stale presentation evidence;
         // retain this equality as a fail-closed guard around the registered
         // deterministic token function.
         if (String(delivery.value.managed_token) === managedToken) visitor.delivery(delivery.value);
@@ -2995,6 +3700,7 @@ export class CatalogDatabase {
                  SELECT 1 FROM books b WHERE b.id = h.book_id AND b.root_id = h.root_id
                )
                AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.book_id = h.book_id)
+               AND NOT EXISTS (SELECT 1 FROM book_metadata_overrides o WHERE o.book_id = h.book_id)
                AND NOT EXISTS (
                  SELECT 1 FROM catalog_rebuild_pending_roots pending WHERE pending.root_id = h.root_id
                )
@@ -3028,7 +3734,7 @@ export class CatalogDatabase {
            JOIN profiles p ON p.id = pr.profile_id AND p.enabled = 1
            WHERE d.profile_id = ? AND d.status = 'delivered'
              AND b.available = 1 AND sf.available = 1
-             AND d.managed_token = kindle_bridge_managed_token(b.id, sf.content_hash)
+             AND d.managed_token = kindle_bridge_managed_token(b.id, b.presentation_version)
            LIMIT 1
          ) AS present`,
       )
@@ -3057,7 +3763,7 @@ export class CatalogDatabase {
          JOIN profiles p ON p.id = pr.profile_id AND p.enabled = 1
          WHERE d.profile_id = ? AND d.status = 'delivered'
            AND b.available = 1 AND sf.available = 1
-           AND d.managed_token = kindle_bridge_managed_token(b.id, sf.content_hash)
+           AND d.managed_token = kindle_bridge_managed_token(b.id, b.presentation_version)
          GROUP BY d.book_id`,
       )
       .iterate(profileId) as IterableIterator<Row>;
@@ -3078,7 +3784,7 @@ export class CatalogDatabase {
          JOIN profiles p ON p.id = pr.profile_id AND p.enabled = 1
          WHERE d.profile_id = ? AND d.status = 'delivered'
            AND b.available = 1 AND sf.available = 1
-           AND d.managed_token = kindle_bridge_managed_token(b.id, sf.content_hash)
+           AND d.managed_token = kindle_bridge_managed_token(b.id, b.presentation_version)
            ${currentPredicate}
          ORDER BY d.updated_at ASC, d.id ASC`,
       )

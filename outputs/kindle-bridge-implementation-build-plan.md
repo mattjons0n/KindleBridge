@@ -2,13 +2,15 @@
 
 Date: 2026-08-30
 
-Status: Software implemented through Milestone 9; the root automated gate and current schema-v13 local restore/rebuild plus dual-architecture OCI acceptance pass, and Milestone 10 external acceptance remains pending
+Status: Software implemented through Milestone 9; the root automated gate passes, prior schema-v13 local restore/rebuild plus dual-architecture OCI acceptance passed, and schema-v14 deployment plus Milestone 10 external acceptance remain pending
 
 Companion document: `outputs/kindle-bridge-service-design-plan.md`
 
 ## 1. Implemented software end state
 
 Kindle Bridge is implemented as a private, self-hosted household ebook service. It runs as a platform-agnostic Docker container, notices new or changed books in host-provided mounted directories, indexes metadata and covers once, and exposes a responsive web library.
+
+The post-baseline metadata/cover editor and multi-book transfer-feedback work are tracked as two explicit, testable objects in [`kindle-bridge-implementation-objects.md`](kindle-bridge-implementation-objects.md).
 
 The normal user journey is:
 
@@ -48,7 +50,7 @@ Milestones 0–9 now implement the production software that was absent from that
 - a reproducibly rebuilt boko artifact with pre-retention archive, spine, DOM/IR/style, MathML, normalized XHTML/CSS, cache, and 200 MiB AZW3-output limits plus actual-WASM hostile-input regressions;
 - strict host/origin controls and documented private HTTPS reverse-proxy/VPN operation.
 
-The original automated baseline was 18 test files and 133 passing tests; it is historical. The authoritative 2026-08-31 root gate completed with 55/55 test files and 666/666 tests, followed by successful client typechecking, server build, and production Vite build. Physical success still applies only to the earlier transfer POC. A fresh physical integrated journey, real household-mount/private-origin checks, and measured peak browser memory remain Milestone 10.
+The original automated baseline was 18 test files and 133 passing tests; it is historical. The authoritative 2026-09-01 root gate completed with 59/59 test files and 686/686 tests, followed by successful client typechecking, server build, and production Vite build. The final mixed-presentation audit adjustment additionally passed its focused regression and client typecheck. Physical success still applies only to the earlier transfer POC. A fresh physical integrated journey, real household-mount/private-origin checks, and measured peak browser memory remain Milestone 10.
 
 ## 3. Implemented architecture
 
@@ -125,10 +127,10 @@ Production serves the browser app and API from one HTTPS origin. Development kee
 | 6. Live Kindle connection | Self-test runs immediately, followed by device inventory in the same session | Implemented; fresh physical acceptance pending in Milestone 10 |
 | 7. Trustworthy reconciliation | Real confirmed, possible, and absent states replace simulated checks | Implemented; fresh physical acceptance pending in Milestone 10 |
 | 8. One-click Send | A catalog book is safely prepared and transferred end to end | Implemented; fresh physical acceptance pending in Milestone 10 |
-| 9. Docker container hardening | The service is installable, recoverable, and safely reachable | Implemented; current schema-v13 local image acceptance passed |
+| 9. Docker container hardening | The service is installable, recoverable, and safely reachable | Implemented; prior schema-v13 local image acceptance passed; schema-v14 lifecycle acceptance pending |
 | 10. Household release | Both real libraries pass the complete acceptance journey | Pending external acceptance |
 
-“Implemented” above means the code, tests, and deployment artifacts exist. The root automated gate and current schema-v13 local image lifecycle gate pass. Neither form of evidence implies fresh integrated physical-device, real household-data/host, actual private HTTPS-origin, or measured browser-memory acceptance; those external gates are recorded below.
+“Implemented” above means the code, tests, and deployment artifacts exist. The root automated gate passes, while the recorded local image lifecycle evidence applies to schema v13 and must be repeated for schema v14. Neither form of evidence implies fresh integrated physical-device, real household-data/host, actual private HTTPS-origin, or measured browser-memory acceptance; those external gates are recorded below.
 
 ## 5. Milestone details
 
@@ -148,7 +150,7 @@ Exit gate:
 
 - The target Docker environment and network boundary are documented.
 - A public unauthenticated route is explicitly rejected.
-- The expanded root gate passes at 55/55 files and 666/666 tests, with client typechecking and both production builds green.
+- The expanded root gate passes at 59/59 files and 686/686 tests, with client typechecking and both production builds green; the final mixed-presentation adjustment also passes its focused regression and client typecheck.
 
 ### Milestone 1 — Full-stack foundation — Implemented
 
@@ -326,7 +328,7 @@ Tasks:
 Exit gate:
 
 - One click advances through **Preparing**, **Converting** when needed, **Sending**, and **Verifying**.
-- Existing Kindle objects are never overwritten, broadly deleted, moved, or renamed. A separate user-confirmed removal action may delete only exact current confirmed book handles after live revalidation and exact absence verification.
+- Existing Kindle objects are never overwritten, broadly deleted, moved, or renamed. A separate user-confirmed removal action may delete only exact current confirmed handles, or a bounded exact prior KindleBridge presentation as removal-only evidence, after live revalidation and exact absence verification.
 - Host-mounted source hashes are identical before and after the operation.
 - Network loss, changed source, conversion failure, insufficient space, USB loss at every write phase, delivery-record failure, and retry are tested.
 - Actual checked-in WASM tests cover normal Epictetus conversion plus archive entry/inflation attacks, a 100,001-node wide DOM, 4,097 OPF itemrefs, excessive MathML depth, synthesized XHTML beyond 32 MiB, and resource-driven AZW3 output beyond 200 MiB without returning partial bytes.
@@ -356,7 +358,7 @@ Exit gate:
 - The actual reverse-proxy/VPN HTTPS origin completes the physical WebUSB flow.
 - Container and dependency checks pass on every supported Docker architecture.
 
-Completed local acceptance scope: the current schema-v13 image exercised the native `linux/arm64` hardened container across health/readiness, API catalog/search/facets/source/cover/delivery, restart persistence, read-only root/source enforcement, Host/Origin rejection, and security headers; a cold backup was restored and the derived catalog/cache rebuilt while preserving stable identities and exact source bytes. A verified dual-platform OCI archive contains `linux/amd64` and `linux/arm64` application manifests with per-platform SPDX/SLSA attestations; native arm64 and cross-runtime `process.arch=x64` executions both served the persisted catalog. Publishing and accepting a concrete image on the intended household host remains external release evidence.
+Completed prior local acceptance scope: the schema-v13 image exercised the native `linux/arm64` hardened container across health/readiness, API catalog/search/facets/source/cover/delivery, restart persistence, read-only root/source enforcement, Host/Origin rejection, and security headers; a cold backup was restored and the derived catalog/cache rebuilt while preserving stable identities and exact source bytes. A verified dual-platform OCI archive contains `linux/amd64` and `linux/arm64` application manifests with per-platform SPDX/SLSA attestations; native arm64 and cross-runtime `process.arch=x64` executions both served the persisted catalog. Schema-v14 image lifecycle acceptance, publishing, and acceptance on the intended household host remain external release evidence.
 
 ### Milestone 10 — Household release gate — Pending external acceptance
 
@@ -403,6 +405,14 @@ GET    /api/profiles/:profileId/filters
 GET    /api/profiles/:profileId/match-index
 GET    /api/profiles/:profileId/books/:bookId
 GET    /api/profiles/:profileId/books/:bookId/cover
+PUT    /api/profiles/:profileId/books/:bookId/cover
+DELETE /api/profiles/:profileId/books/:bookId/cover
+GET    /api/profiles/:profileId/books/:bookId/metadata
+PATCH  /api/profiles/:profileId/books/:bookId/metadata
+POST   /api/profiles/:profileId/books/:bookId/metadata/reset
+GET    /api/profiles/:profileId/books/:bookId/cover-search
+GET    /api/profiles/:profileId/books/:bookId/cover-preview
+POST   /api/profiles/:profileId/books/:bookId/cover-import
 GET    /api/profiles/:profileId/books/:bookId/source
 
 POST   /api/deliveries
@@ -472,7 +482,7 @@ Mocks can prove behavior, not Kindle acceptance. Any release that changes conver
 
 ## 10. Completion and next gate
 
-The read-only catalog slice and the later watcher, inventory, reconciliation, Send, exact removal, converter-hardening, recovery, and Docker software are implemented. The authoritative root gate passes at 55/55 files and 666/666 tests with typechecking and production builds. The current schema-v13 local image passes restore/rebuild, hardened native arm64, cross-runtime amd64, and attested dual-architecture OCI acceptance. Before household release:
+The read-only catalog slice and the later watcher, inventory, reconciliation, Send, exact removal, converter-hardening, recovery, and Docker software are implemented. The authoritative root gate passes at 59/59 files and 686/686 tests with typechecking and production builds; the final mixed-presentation adjustment also passes its focused regression and client typecheck. The prior schema-v13 local image passed restore/rebuild, hardened native arm64, cross-runtime amd64, and attested dual-architecture OCI acceptance. Before household release:
 
 1. Repeat the expanded journey on the physical Kindle: user-initiated chooser, automatic exact-byte self-test, complete/partial inventory behavior, confirmed/possible matching, catalog-driven Send, exact single/bulk removal, Kindle indexing/open/navigation/cover, reconnect, durable match recovery, and root-cache creation/reuse/A-B rotation from a second browser installation without surfacing the cache in the Kindle library or changing `metadata.calibre`.
 2. Configure the real husband and wife read-only host mounts, including multiple roots, and verify profile scope, incremental ingestion, source health, byte-identical originals, mount loss/restoration, backup/restore, and rebuild on the intended host.

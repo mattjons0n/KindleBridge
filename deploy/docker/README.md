@@ -65,7 +65,7 @@ docker compose --env-file /private/path/kindle-bridge.env ps
 
 Compose binds HTTP to `127.0.0.1:8080` by default. This keeps the unauthenticated origin off external interfaces. Configure initial libraries while `CATALOG_SETTINGS_MODE=read-write`; after setup, `read-only` prevents Settings mutations until the container is deliberately reconfigured.
 
-The runtime is UID/GID `1000:1000`, has a read-only root filesystem, no Linux capabilities, `no-new-privileges`, and a bounded process count. Only `/data` and `/cache` are writable. `/data` is durable; `/cache`, including `/cache/tmp`, is rebuildable. The browser owns WebUSB, so never pass a USB device into the container or run the service privileged.
+The runtime is UID/GID `1000:1000`, has a read-only root filesystem, no Linux capabilities, `no-new-privileges`, and a bounded process count. Only `/data` and `/cache` are writable. `/data` is durable and includes SQLite plus user-selected replacement covers under `/data/metadata-covers`; `/cache`, including `/cache/tmp`, is rebuildable. The browser owns WebUSB, so never pass a USB device into the container or run the service privileged.
 
 Before first start, the host source directories must grant UID/GID `1000:1000` read permission on book files and search (`x`) permission on every parent directory. Named `/data` and `/cache` volumes are initialized by the image and must remain writable by that identity. If host policy cannot grant those permissions, prepare equivalent ACLs on the host; do not make the container privileged or writable against source mounts.
 
@@ -105,11 +105,11 @@ The proxy must preserve the external Host and must not rewrite the browser to a 
 
 Trust Caddy's local root CA on every client before testing. Desktop Chromium is the supported browser. The first USB chooser remains user initiated, and permission is tied to the exact scheme/host/port. Changing the origin can also strand a browser-local recovery-journal entry, so inspect or finish interrupted transfers before changing it.
 
-For defense in depth, block container egress unless the operator needs it for unrelated monitoring: catalog indexing, cover extraction, conversion, and Kindle transfer require no cloud service.
+For defense in depth, block container egress unless the operator enables online cover search. Catalog indexing, source-cover extraction, conversion, and Kindle transfer require no cloud service. Google Books/Open Library cover search is the sole optional product feature that needs outbound HTTPS; if it is enabled, restrict egress to the documented provider hosts (`www.googleapis.com`, `books.google.com`, `books.googleusercontent.com`/Google image redirects, `openlibrary.org`, and `covers.openlibrary.org`) and keep arbitrary destinations blocked. Uploaded, dragged, and clipboard-pasted covers remain fully local.
 
 ## 6. Cold backup
 
-Back up `/data`; do not back up `/cache`. A consistent cold backup avoids copying SQLite while a migration or write transaction is active.
+Back up all of `/data`; do not back up `/cache`. The archive must include both SQLite and `/data/metadata-covers`, otherwise restored metadata may reference missing user-selected images. A consistent cold backup avoids copying SQLite while a migration or write transaction is active.
 
 1. Record the exact image digest and environment file in the backup log.
 2. Stop cleanly and wait for the container to exit.
@@ -150,7 +150,7 @@ For an application rollback, stop the service, select the previous immutable ima
 
 To rebuild derived covers and temporary artifacts, stop the service and select a fresh empty cache volume through `KINDLE_BRIDGE_CACHE_VOLUME`. Keep `/data` and every source mount unchanged, restart, and request a reconciliation for each configured root. Confirm that book counts, FTS search, facets, covers, and source streaming recover before retiring the old cache.
 
-To rebuild the derived SQLite catalog while retaining profiles, root configuration, stable book identities, and delivery evidence, first make a cold backup and stop every container using the data volume. Then run:
+To rebuild the derived SQLite catalog while retaining profiles, root configuration, stable book identities, delivery evidence, metadata overrides, and user-selected covers, first make a cold backup and stop every container using the data volume. Then run:
 
 ```sh
 KINDLE_BRIDGE_IMAGE=kindle-bridge:local \

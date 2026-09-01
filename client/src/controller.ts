@@ -1,6 +1,8 @@
 import { convertEpub, type ConversionResult } from "./api/convert";
+import type { ConversionOverrides } from "./api/conversion-overrides";
 import { AppError, toAppError } from "./app-error";
 import type {
+  CatalogSendBatchResult,
   CatalogKindleInventory,
   CatalogRemoveRequest,
   CatalogSendRequest,
@@ -117,7 +119,11 @@ export interface AppControllerDependencies {
     hooks: DeviceRuntimeHooks,
     signal: AbortSignal,
   ) => Promise<ConnectedKindlePort>;
-  readonly convert: (file: File, signal?: AbortSignal) => Promise<ConversionResult>;
+  readonly convert: (
+    file: File,
+    signal?: AbortSignal,
+    overrides?: ConversionOverrides,
+  ) => Promise<ConversionResult>;
   readonly download: (blob: Blob, filename: string) => void;
   readonly copyText: (value: string) => Promise<void>;
   readonly now: () => number;
@@ -193,6 +199,20 @@ export interface CatalogReconciliationLimits {
   readonly stringCodeUnits: number;
 }
 
+interface ActiveCatalogSendBatch {
+  readonly id: string;
+  readonly profileId: string;
+  readonly total: number;
+  completed: number;
+  latestInventory?: KindleInventorySnapshot;
+  latestDiagnosticInventory?: KindleInventorySnapshot;
+}
+
+interface ReconciledCatalogVersion {
+  readonly contentHash: string;
+  readonly presentationVersion: string;
+}
+
 interface CatalogReconciliationFootprint extends CatalogReconciliationLimits {
   readonly profiles: number;
 }
@@ -228,7 +248,9 @@ function matchIndexFootprint(index: CatalogMatchIndex): CatalogReconciliationFoo
     retain(entry.sourceFilename);
     retain(entry.sourceFormat);
     retain(entry.contentHash);
+    retain(entry.presentationVersion);
     retain(entry.managedToken);
+    for (const token of entry.staleManagedTokens ?? []) retain(token);
     for (const value of entry.authors) retain(value);
     for (const value of entry.identifiers) retain(value);
     for (const delivery of entry.deliveries) {
@@ -424,9 +446,10 @@ export class AppController {
   #rawCatalogInventory?: KindleInventorySnapshot;
   #catalogInventoryEpoch?: number;
   #catalogReadyProfileIds = new Set<string>();
-  #catalogReconciledContentHashes = new Map<string, string>();
+  #catalogReconciledVersions = new Map<string, ReconciledCatalogVersion>();
   #catalogEventReconciliation?: Promise<void>;
   #catalogEventReconciliationQueued = false;
+  #catalogSendBatch?: ActiveCatalogSendBatch;
 
   readonly #handlePageHide = (event: Event): void => {
     this.#hiddenAt = undefined;
@@ -532,6 +555,7 @@ export class AppController {
       onCatalogConnectRequested: () => this.connect("catalog"),
       onCatalogDisconnectRequested: () => this.disconnect(),
       onCatalogSendRequested: (request) => this.sendCatalogBook(request),
+      onCatalogSendBatchFinished: (result) => this.finishCatalogSendBatch(result),
       onCatalogRemoveRequested: (request) => this.removeCatalogBooks(request),
       onCatalogChanged: () => this.#queueConnectedCatalogReconciliation(),
       onCatalogProfileChanged: () => this.#queueConnectedCatalogReconciliation(),
@@ -1092,6 +1116,7 @@ export class AppController {
     if (this.#conversionPipelineBusy) {
       throw new AppError("CONVERSION_BUSY", "Another browser-local book conversion is already running");
     }
+    this.#beginCatalogSendBatch(request);
     if (this.#synchronizePendingCleanupFromStorage()) {
       throw new AppError(
         "INVALID_STATE",
@@ -1129,8 +1154,8 @@ export class AppController {
       );
     }
     const reconciliationKey = `${request.profileId}\u0000${request.book.id}`;
-    const reconciledContentHash = this.#catalogReconciledContentHashes.get(reconciliationKey);
-    if (!reconciledContentHash) {
+    const reconciledVersion = this.#catalogReconciledVersions.get(reconciliationKey);
+    if (!reconciledVersion) {
       throw new AppError(
         "INVALID_STATE",
         "The compared catalog version is unavailable. No book was sent; refresh the Kindle comparison before trying again.",
@@ -1161,11 +1186,64 @@ export class AppController {
       );
       this.#assertConnectionCurrent(epoch, connection, signal);
       if (!book.contentHash
-        || book.contentHash.toLocaleLowerCase("en-US") !== reconciledContentHash) {
+        || book.contentHash.toLocaleLowerCase("en-US") !== reconciledVersion.contentHash
+        || (book.presentationVersion ?? book.contentHash).toLocaleLowerCase("en-US") !== reconciledVersion.presentationVersion) {
         throw new AppError(
           "CATALOG_SOURCE_CHANGED",
-          "The indexed book changed after Kindle comparison. No book was sent; refresh the comparison before trying again.",
+          "The indexed book or its presentation metadata changed after Kindle comparison. No book was sent; refresh the comparison before trying again.",
         );
+      }
+      let metadataState: Awaited<ReturnType<NonNullable<CatalogApi["getBookMetadata"]>>> | undefined;
+      let overrides: ConversionOverrides | undefined;
+      if (book.metadataEdited || book.coverEdited) {
+        if (!this.#catalogApi.getBookMetadata) {
+          throw new AppError(
+            "INVALID_STATE",
+            "This catalog service cannot provide the edited metadata needed for a safe transfer.",
+          );
+        }
+        metadataState = await this.#withCatalogDeadline(
+          (catalogSignal) => this.#catalogApi.getBookMetadata!(request.profileId, book.id, catalogSignal),
+          this.#dependencies.preUploadCatalogTimeoutMs ?? DEFAULT_PRE_UPLOAD_CATALOG_TIMEOUT_MS,
+          "pre-upload-metadata",
+          signal,
+        );
+        this.#assertConnectionCurrent(epoch, connection, signal);
+        if (
+          metadataState.sourceChanged
+          || metadataState.basedOnContentHash.toLocaleLowerCase("en-US") !== reconciledVersion.contentHash
+          || metadataState.revision !== book.metadataRevision
+          || (metadataState.book.presentationVersion ?? metadataState.book.contentHash)?.toLocaleLowerCase("en-US")
+            !== reconciledVersion.presentationVersion
+        ) {
+          throw new AppError(
+            "CATALOG_SOURCE_CHANGED",
+            "The metadata or cover edit changed after Kindle comparison. No book was sent; refresh the comparison before trying again.",
+          );
+        }
+        overrides = { ...metadataState.overrides };
+        if (metadataState.coverOverride) {
+          if (!this.#catalogApi.getBookCover) {
+            throw new AppError(
+              "INVALID_STATE",
+              "This catalog service cannot provide the edited cover needed for a safe transfer.",
+            );
+          }
+          const cover = await this.#withCatalogDeadline(
+            (catalogSignal) => this.#catalogApi.getBookCover!(request.profileId, book.id, catalogSignal),
+            this.#dependencies.preUploadCatalogTimeoutMs ?? DEFAULT_PRE_UPLOAD_CATALOG_TIMEOUT_MS,
+            "pre-upload-cover",
+            signal,
+          );
+          this.#assertConnectionCurrent(epoch, connection, signal);
+          overrides = {
+            ...overrides,
+            cover: {
+              blob: cover,
+              mediaType: metadataState.coverOverride.mediaType,
+            },
+          };
+        }
       }
       const source = await this.#withCatalogDeadline(
         (catalogSignal) => this.#catalogApi.getBookSource(request.profileId, book.id, catalogSignal),
@@ -1185,9 +1263,19 @@ export class AppController {
       if (source.etag && expectedEtag && source.etag.toLocaleLowerCase() !== expectedEtag) {
         throw new AppError("CATALOG_SOURCE_CHANGED", "The streamed ETag does not match the indexed source hash");
       }
+      if (
+        source.presentationVersion
+        && source.presentationVersion.toLocaleLowerCase("en-US") !== reconciledVersion.presentationVersion
+      ) {
+        throw new AppError(
+          "CATALOG_SOURCE_CHANGED",
+          "The presentation metadata changed while the source was being loaded. No book was sent; refresh the comparison before trying again.",
+        );
+      }
       const prepared = await prepareCatalogArtifact(book, source.blob, {
         signal,
         convertEpub: this.#dependencies.convert,
+        overrides,
         onPhase: (phase) => {
           if (phase === "preparing") {
             this.#view.setCatalogTransferUpdate({
@@ -1211,6 +1299,50 @@ export class AppController {
         },
       });
       this.#assertConnectionCurrent(epoch, connection, signal);
+      if (metadataState) {
+        const currentMetadataState = await this.#withCatalogDeadline(
+          (catalogSignal) => this.#catalogApi.getBookMetadata!(request.profileId, book.id, catalogSignal),
+          this.#dependencies.preUploadCatalogTimeoutMs ?? DEFAULT_PRE_UPLOAD_CATALOG_TIMEOUT_MS,
+          "pre-upload-metadata-recheck",
+          signal,
+        );
+        this.#assertConnectionCurrent(epoch, connection, signal);
+        if (
+          currentMetadataState.sourceChanged
+          || currentMetadataState.revision !== metadataState.revision
+          || currentMetadataState.basedOnContentHash.toLocaleLowerCase("en-US") !== reconciledVersion.contentHash
+          || (currentMetadataState.book.presentationVersion ?? currentMetadataState.book.contentHash)?.toLocaleLowerCase("en-US")
+            !== reconciledVersion.presentationVersion
+        ) {
+          throw new AppError(
+            "CATALOG_SOURCE_CHANGED",
+            "The metadata or cover edit changed during preparation. No book was sent; refresh the comparison before trying again.",
+          );
+        }
+      } else {
+        // An initially unedited book can gain its first overlay in another tab
+        // while source bytes are downloaded or converted. Recheck every such
+        // presentation immediately before MTP instead of assuming that the
+        // absence of an earlier overlay remains true.
+        const currentBook = await this.#withCatalogDeadline(
+          (catalogSignal) => this.#catalogApi.getBook(request.profileId, book.id, catalogSignal),
+          this.#dependencies.preUploadCatalogTimeoutMs ?? DEFAULT_PRE_UPLOAD_CATALOG_TIMEOUT_MS,
+          "pre-upload-book-recheck",
+          signal,
+        );
+        this.#assertConnectionCurrent(epoch, connection, signal);
+        if (
+          !currentBook.contentHash
+          || currentBook.contentHash.toLocaleLowerCase("en-US") !== reconciledVersion.contentHash
+          || (currentBook.presentationVersion ?? currentBook.contentHash).toLocaleLowerCase("en-US")
+            !== reconciledVersion.presentationVersion
+        ) {
+          throw new AppError(
+            "CATALOG_SOURCE_CHANGED",
+            "The source or presentation metadata changed during preparation. No book was sent; refresh the comparison before trying again.",
+          );
+        }
+      }
       if (
         connection.details.freeBytes !== undefined
         && BigInt(prepared.blob.size) > connection.details.freeBytes
@@ -1222,7 +1354,7 @@ export class AppController {
           },
         });
       }
-      const managedToken = await createManagedFilenameToken(book.id, prepared.sourceHash);
+      const managedToken = await createManagedFilenameToken(book.id, reconciledVersion.presentationVersion);
       this.#assertConnectionCurrent(epoch, connection, signal);
       // The controller's connection-scoped snapshot may include a verified
       // object synthesized from returned MTP metadata when the device's
@@ -1283,7 +1415,7 @@ export class AppController {
           onObjectState: this.#objectStateHandler("metadata-cache", undefined, connection.details),
         },
       );
-      if (sent.inventory !== undefined) {
+      if (sent.inventory !== undefined && request.batch === undefined) {
         this.#logKindleMetadataCacheDiagnostics(sent.inventory);
       }
       const inventory = sent.inventory?.objects.some((object) => object.handle === sent.transfer.handle)
@@ -1311,10 +1443,19 @@ export class AppController {
         request.profileId,
         book,
         prepared.sourceHash,
+        reconciledVersion.presentationVersion,
         inventory,
         connection,
         delivery,
       );
+      if (request.batch) {
+        const batch = this.#catalogSendBatch;
+        if (batch?.id === request.batch.id) {
+          batch.completed = request.batch.position;
+          batch.latestInventory = inventory;
+          batch.latestDiagnosticInventory = sent.inventory;
+        }
+      }
       const queued = await queuePendingDelivery({
         version: 1,
         operationId,
@@ -1351,7 +1492,12 @@ export class AppController {
             { details: { inventoryErrorCode: sent.inventoryErrorCode } },
           )
         : undefined;
-      if (postTransferConnectionError) {
+      if (request.batch) {
+        // Every upload still receives its own exact MTP verification and live
+        // inventory refresh. Catalog matching is intentionally deferred until
+        // the browser reports that the batch has ended.
+        reconciliationDegraded = postTransferConnectionError !== undefined;
+      } else if (postTransferConnectionError) {
         reconciliationDegraded = true;
       } else if (this.#isActiveConnection(epoch, connection)) {
         try {
@@ -1378,7 +1524,9 @@ export class AppController {
       this.#view.setCatalogTransferUpdate({
         phase: "complete",
         progress: 100,
-        message: reconciliationDegraded
+        message: request.batch
+          ? "Book transferred and verified; batch comparison is deferred until the selected books finish"
+          : reconciliationDegraded
           ? "Transfer verified; live catalog matching will retry when the connection is available"
           : deliveryRecorded
             ? "Transfer and delivery record verified"
@@ -1393,6 +1541,11 @@ export class AppController {
         bytes: sent.transfer.size,
         inventoryRefresh: sent.inventoryRefresh,
         deliveryRecorded,
+        ...(request.batch === undefined ? {} : {
+          batchId: request.batch.id,
+          batchPosition: request.batch.position,
+          batchTotal: request.batch.total,
+        }),
       });
       if (postTransferConnectionError && this.#connection === connection) {
         await this.#retireFaultedConnection(connection, postTransferConnectionError);
@@ -1416,6 +1569,121 @@ export class AppController {
     } finally {
       this.#conversionPipelineBusy = false;
       this.#finishHardwareOperation();
+    }
+  }
+
+  async finishCatalogSendBatch(result: CatalogSendBatchResult): Promise<void> {
+    const batch = this.#catalogSendBatch;
+    if (!batch || batch.id !== result.id) {
+      this.log.warn("Catalog send batch finalization had no matching active batch", {
+        batchId: result.id,
+        succeeded: result.succeeded.length,
+        total: result.total,
+      });
+      return;
+    }
+
+    let reconciliationComplete = batch.completed === 0;
+    this.#hardwareBusy = true;
+    try {
+      if (batch.latestDiagnosticInventory ?? batch.latestInventory) {
+        // One diagnostic snapshot from the latest verified per-book inventory
+        // replaces a verbose near-identical entry after every upload.
+        this.#logKindleMetadataCacheDiagnostics(batch.latestDiagnosticInventory ?? batch.latestInventory!);
+      }
+      const connection = this.#connection;
+      if (
+        batch.completed > 0
+        && batch.latestInventory
+        && connection
+        && this.#isActiveConnection(this.#deviceEpoch, connection)
+      ) {
+        try {
+          const reconciliation = await this.#withPostUploadCatalogDeadline((catalogSignal) => (
+            this.#reconcileCatalogInventory(batch.latestInventory!, connection, catalogSignal)
+          ));
+          reconciliationComplete = reconciliation.activeProfileComplete;
+          if (!reconciliationComplete) {
+            this.log.warn("Batch transfers verified but the final catalog match index was unavailable");
+          }
+        } catch (error) {
+          reconciliationComplete = false;
+          if (this.#connection === connection && !connection.closed) {
+            this.#catalogInventoryEpoch = undefined;
+            this.#commit({ ...this.#state, catalogInventoryState: "failed" });
+          }
+          this.log.warn("Batch transfers verified but final catalog matching will retry later", {
+            code: errorContext(toAppError(error)).code,
+          });
+        }
+      } else if (batch.completed > 0) {
+        reconciliationComplete = false;
+        this.log.warn("Batch transfers verified without an active connection for final catalog matching");
+      }
+    } finally {
+      // Delivery SSE hints received during the batch are represented by this
+      // authoritative final match-index fetch and must not trigger a duplicate.
+      this.#catalogEventReconciliationQueued = false;
+      this.#catalogSendBatch = undefined;
+      this.#finishHardwareOperation();
+    }
+
+    const summary = `${result.succeeded.length} of ${result.total} books transferred and verified.`;
+    const context = {
+      batchId: result.id,
+      succeededTitles: result.succeeded.map(({ title }) => title),
+      unsentTitles: result.unsent.map(({ title }) => title),
+      ...(result.failed === undefined ? {} : {
+        failedTitle: result.failed.title,
+        failure: result.failed.message,
+      }),
+      reconciliationComplete,
+    };
+    if (result.failed) {
+      this.log.warn(`${summary} Batch stopped at “${result.failed.title}”.`, context);
+    } else {
+      this.log.info(summary, context);
+    }
+  }
+
+  #beginCatalogSendBatch(request: CatalogSendRequest): void {
+    const descriptor = request.batch;
+    if (!descriptor) {
+      if (this.#catalogSendBatch) {
+        throw new AppError("INVALID_STATE", "Finish the active multi-book transfer before sending another book");
+      }
+      return;
+    }
+    if (
+      !descriptor.id
+      || !Number.isSafeInteger(descriptor.position)
+      || !Number.isSafeInteger(descriptor.total)
+      || descriptor.position < 1
+      || descriptor.total < 1
+      || descriptor.position > descriptor.total
+    ) {
+      throw new AppError("INVALID_STATE", "The multi-book transfer position is invalid");
+    }
+    const active = this.#catalogSendBatch;
+    if (!active) {
+      if (descriptor.position !== 1) {
+        throw new AppError("INVALID_STATE", "A multi-book transfer must start with its first book");
+      }
+      this.#catalogSendBatch = {
+        id: descriptor.id,
+        profileId: request.profileId,
+        total: descriptor.total,
+        completed: 0,
+      };
+      return;
+    }
+    if (
+      active.id !== descriptor.id
+      || active.profileId !== request.profileId
+      || active.total !== descriptor.total
+      || descriptor.position !== active.completed + 1
+    ) {
+      throw new AppError("INVALID_STATE", "The multi-book transfer order changed while it was running");
     }
   }
 
@@ -1484,14 +1752,19 @@ export class AppController {
     for (const target of request.targets) {
       const item = presentedById.get(target.itemId);
       const raw = rawById.get(target.itemId);
+      const bookStatus = this.#view.catalogKindleStatus(target.bookId);
+      const exactCurrentPresentation = item?.match === "confirmed" && bookStatus === "confirmed";
+      const exactPriorPresentation = item?.stalePresentation === true
+        && item.managed === true
+        && item.match === "possible"
+        && (bookStatus === "possible" || bookStatus === "confirmed");
       if (
         seenItemIds.has(target.itemId)
         || !item
         || !raw
         || raw.kind !== "file"
-        || item.match !== "confirmed"
+        || (!exactCurrentPresentation && !exactPriorPresentation)
         || item.bookId !== target.bookId
-        || this.#view.catalogKindleStatus(target.bookId) !== "confirmed"
         || item.filename !== target.filename
         || item.size !== target.size
         || raw.filename !== item.filename
@@ -1499,7 +1772,7 @@ export class AppController {
       ) {
         throw new AppError(
           "INVALID_STATE",
-          "A selected Kindle file changed or is no longer an exact confirmed match. Reconnect before removing it.",
+          "A selected Kindle file changed or is no longer an exact removable match. Reconnect before removing it.",
         );
       }
       seenItemIds.add(target.itemId);
@@ -2261,9 +2534,12 @@ export class AppController {
     this.#rawCatalogInventory = inventory;
     this.#catalogInventory = presentedInventory;
     this.#catalogReadyProfileIds = new Set(indexes.map((index) => index.profileId));
-    this.#catalogReconciledContentHashes = new Map(indexes.flatMap((index) => index.entries.map((entry) => [
+    this.#catalogReconciledVersions = new Map(indexes.flatMap((index) => index.entries.map((entry) => [
       `${index.profileId}\u0000${entry.bookId}`,
-      entry.contentHash.toLocaleLowerCase("en-US"),
+      {
+        contentHash: entry.contentHash.toLocaleLowerCase("en-US"),
+        presentationVersion: (entry.presentationVersion ?? entry.contentHash).toLocaleLowerCase("en-US"),
+      },
     ] as const)));
     this.#view.setCatalogKindleStatuses(reconciled.statuses, reconciled.statusCountsByProfile);
     this.#view.setCatalogKindleInventory(presentedInventory);
@@ -2436,6 +2712,12 @@ export class AppController {
       this.#catalogEventReconciliationQueued = false;
       return Promise.resolve();
     }
+    if (this.#catalogSendBatch) {
+      // Delivery events are hints. The batch finalizer reconciles the newest
+      // verified inventory once after all selected books stop or complete.
+      this.#catalogEventReconciliationQueued = true;
+      return this.#catalogEventReconciliation ?? Promise.resolve();
+    }
     if (!this.#rawCatalogInventory) {
       // Catalog bootstrap/profile selection can finish while the automatic
       // connection inventory is still being reconciled. Preserve that intent;
@@ -2529,6 +2811,7 @@ export class AppController {
     profileId: string,
     book: CatalogSendRequest["book"],
     sourceHash: string,
+    presentationVersion: string,
     inventory: KindleInventorySnapshot,
     connection: ConnectedKindlePort,
     delivery: CreateDeliveryInput,
@@ -2546,6 +2829,7 @@ export class AppController {
           sourceFormat: book.format,
           sourceSize: book.size,
           contentHash: book.contentHash ?? sourceHash,
+          presentationVersion,
           sourceFilename: book.sourceFilename,
           managedToken: delivery.managedToken as string,
           deliveries: [{
@@ -2631,7 +2915,7 @@ export class AppController {
     this.#catalogInventory = presented;
     this.#catalogInventoryEpoch = undefined;
     this.#catalogReadyProfileIds.clear();
-    this.#catalogReconciledContentHashes.clear();
+    this.#catalogReconciledVersions.clear();
     this.#view.setCatalogKindleStatuses(new Map(), new Map());
     this.#view.setCatalogKindleInventory(presented);
     this.#commit({ ...this.#state, catalogInventoryState: "failed" });
@@ -2655,7 +2939,7 @@ export class AppController {
     this.#rawCatalogInventory = undefined;
     this.#catalogInventoryEpoch = undefined;
     this.#catalogReadyProfileIds.clear();
-    this.#catalogReconciledContentHashes.clear();
+    this.#catalogReconciledVersions.clear();
   }
 
   #currentRawCatalogInventory(connection: ConnectedKindlePort): KindleInventorySnapshot | undefined {
@@ -2785,7 +3069,7 @@ export class AppController {
     this.#hardwareBusy = false;
     for (const resolve of this.#hardwareIdleWaiters) resolve();
     this.#hardwareIdleWaiters.clear();
-    if (this.#catalogEventReconciliationQueued) {
+    if (this.#catalogEventReconciliationQueued && !this.#catalogSendBatch) {
       void this.#queueConnectedCatalogReconciliation();
     }
   }

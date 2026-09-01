@@ -5,15 +5,18 @@ import type {
 import type {
   CatalogKindleStatus,
   CatalogKindleStatusCounts,
+  CatalogMatchDelivery,
   CatalogMatchIndex,
   CatalogMatchIndexEntry,
 } from "./catalog-client";
 import {
   createManagedFilenameToken,
+  extractManagedFilenameToken,
   hasSufficientKindleObjectDistinguishability,
   isKindleReadableBookFilename,
   kindleInventoryObjectToMatchInput,
   matchCatalogBookToKindle,
+  normalizeManagedFilenameToken,
   type KindleInventorySnapshot,
   type KindleObjectMatchInput,
 } from "./kindle";
@@ -40,11 +43,32 @@ export interface ReconcileCatalogOptions {
 interface ObjectAssociation {
   readonly bookId: string;
   readonly status: "confirmed" | "possible";
+  readonly stalePresentation?: boolean;
 }
 
 function managedTokenFromIndex(entry: CatalogMatchIndexEntry): string | undefined {
   const candidate = Reflect.get(entry, "managedToken");
   return typeof candidate === "string" ? candidate : undefined;
+}
+
+function normalizedManagedToken(token: string | undefined): string | undefined {
+  if (!token) return undefined;
+  try {
+    return normalizeManagedFilenameToken(token);
+  } catch {
+    return undefined;
+  }
+}
+
+function managedTokenFromDelivery(delivery: CatalogMatchDelivery): string | undefined {
+  return normalizedManagedToken(delivery.managedToken)
+    ?? extractManagedFilenameToken(delivery.filename);
+}
+
+function managedTokenFromObject(object: KindleObjectMatchInput): string | undefined {
+  if (object.metadataAdjusted) return undefined;
+  return normalizedManagedToken(object.managedToken)
+    ?? extractManagedFilenameToken(object.filename);
 }
 
 function deviceFormat(filename: string): string | undefined {
@@ -105,24 +129,41 @@ export async function reconcileCatalogIndexes(
   const associations = new Map<number, ObjectAssociation>();
   const confirmedClaims = new Map<number, Set<string>>();
   const possibleClaims = new Map<string, Set<number>>();
+  const stalePresentationClaims = new Map<number, Set<string>>();
 
   for (const index of indexes) {
     for (const entry of index.entries) {
-      const managedToken = managedTokenFromIndex(entry)
-        ?? await createManagedFilenameToken(entry.bookId, entry.contentHash);
-      const deliveries = entry.deliveries
+      const managedToken = normalizedManagedToken(managedTokenFromIndex(entry))
+        ?? await createManagedFilenameToken(
+          entry.bookId,
+          entry.presentationVersion ?? entry.contentHash,
+        );
+      const scopedDeliveries = entry.deliveries
         // Only a completed delivery may contribute delivery-record authority.
         // A queued/sending/failed row can exist before verified upload and must
         // never turn an unrelated on-device object into a green confirmation.
         .filter((delivery) => delivery.status === "delivered")
-        .filter((delivery) => delivery.managedToken === managedToken)
-        .filter((delivery) => !options.deviceKey || delivery.deviceKey === options.deviceKey)
+        .filter((delivery) => !options.deviceKey || delivery.deviceKey === options.deviceKey);
+      const deliveries = scopedDeliveries
+        .filter((delivery) => managedTokenFromDelivery(delivery) === managedToken)
         .map((delivery) => ({
           persistentObjectId: delivery.objectIdentity,
           managedToken: delivery.managedToken,
           destinationFilename: delivery.filename,
           artifactSize: delivery.artifactSize,
         }));
+      const staleManagedTokens = new Set((entry.staleManagedTokens ?? [])
+        .map(normalizedManagedToken)
+        .filter((token): token is string => token !== undefined && token !== managedToken));
+      if (staleManagedTokens.size > 0) {
+        for (const object of objects) {
+          const token = managedTokenFromObject(object);
+          if (!token || !staleManagedTokens.has(token)) continue;
+          const claims = stalePresentationClaims.get(object.handle) ?? new Set<string>();
+          claims.add(entry.bookId);
+          stalePresentationClaims.set(object.handle, claims);
+        }
+      }
       const match = matchCatalogBookToKindle({
         title: entry.title,
         authors: entry.authors,
@@ -190,6 +231,20 @@ export async function reconcileCatalogIndexes(
     }
   }
 
+  // A prior presentation token proves which managed object can be removed,
+  // but it must not claim that the current metadata/cover presentation is on
+  // the Kindle. Associate only an unambiguous live token, keep the book yellow
+  // (therefore Send-blocked), and expose deletion authority separately.
+  for (const [handle, claims] of stalePresentationClaims) {
+    if (claims.size !== 1) continue;
+    const bookId = claims.values().next().value as string | undefined;
+    if (!bookId) continue;
+    const current = associations.get(handle);
+    if (current?.status === "confirmed") continue;
+    associations.set(handle, { bookId, status: "possible", stalePresentation: true });
+    if (statuses.get(bookId) !== "confirmed") statuses.set(bookId, "possible");
+  }
+
   for (const index of indexes) {
     const counts = {
       confirmed: 0,
@@ -219,6 +274,7 @@ export async function reconcileCatalogIndexes(
       managed: object.managedToken !== undefined,
       ...(association === undefined ? {} : { bookId: association.bookId }),
       match: association?.status ?? "unmatched",
+      ...(association?.stalePresentation === true ? { stalePresentation: true } : {}),
     };
   });
 

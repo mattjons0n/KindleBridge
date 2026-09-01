@@ -1,5 +1,11 @@
 import { AppError } from "../app-error";
 import { MAX_BOOK_SOURCE_BYTES, MAX_KINDLE_ARTIFACT_BYTES } from "../book-limits";
+import {
+  hasConversionOverrides,
+  resolveConversionOverrides,
+  type ConversionOverrides,
+} from "./conversion-overrides";
+import { createEphemeralEpubDerivative } from "./epub-overrides";
 
 export interface BookMetadata {
   readonly title: string;
@@ -20,6 +26,7 @@ export interface ConversionResult {
     readonly outputBytes: number;
     readonly kindleDocumentType: "PDOC";
     readonly embeddedCover: boolean;
+    readonly overridesApplied?: boolean;
   };
 }
 
@@ -29,6 +36,7 @@ interface WorkerSuccess {
   readonly metadata: BookMetadata;
   readonly kindleDocumentType: "PDOC";
   readonly embeddedCover: boolean;
+  readonly overridesApplied: boolean;
 }
 
 interface WorkerFailure {
@@ -47,7 +55,11 @@ function outputName(inputName: string): string {
   return `${stem}.azw3`;
 }
 
-export async function convertEpub(file: File, signal?: AbortSignal): Promise<ConversionResult> {
+export async function convertEpub(
+  file: File,
+  signal?: AbortSignal,
+  overrides?: ConversionOverrides,
+): Promise<ConversionResult> {
   if (!/\.epub$/iu.test(file.name)) {
     throw new AppError("CONVERSION_INVALID_INPUT", "Choose a file with the .epub extension");
   }
@@ -63,10 +75,20 @@ export async function convertEpub(file: File, signal?: AbortSignal): Promise<Con
     throw new AppError("CONVERSION_ABORTED", "Conversion was cancelled");
   }
 
-  const input = await file.arrayBuffer();
+  const sourceInput = await file.arrayBuffer();
   if (signal?.aborted) {
     throw new AppError("CONVERSION_ABORTED", "Conversion was cancelled");
   }
+  const resolvedOverrides = await resolveConversionOverrides(overrides, signal);
+  const derivative = resolvedOverrides
+    ? await createEphemeralEpubDerivative(new Uint8Array(sourceInput), resolvedOverrides)
+    : undefined;
+  if (signal?.aborted) {
+    throw new AppError("CONVERSION_ABORTED", "Conversion was cancelled");
+  }
+  const input = derivative
+    ? derivative.buffer.slice(derivative.byteOffset, derivative.byteOffset + derivative.byteLength) as ArrayBuffer
+    : sourceInput;
   const worker = new Worker(new URL("./convert.worker.ts", import.meta.url), { type: "module" });
 
   return new Promise<ConversionResult>((resolve, reject) => {
@@ -125,9 +147,10 @@ export async function convertEpub(file: File, signal?: AbortSignal): Promise<Con
           outputBytes: bytes.byteLength,
           kindleDocumentType: response.kindleDocumentType,
           embeddedCover: response.embeddedCover,
+          overridesApplied: response.overridesApplied,
         },
       }));
     });
-    worker.postMessage({ input }, [input]);
+    worker.postMessage({ input, overridesApplied: hasConversionOverrides(overrides) }, [input]);
   });
 }

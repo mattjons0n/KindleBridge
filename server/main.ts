@@ -27,6 +27,7 @@ export function catalogConfigFromEnvironment(environment: NodeJS.ProcessEnv = pr
   return {
     databasePath: environment.CATALOG_DATABASE_PATH?.trim() || "/data/catalog.sqlite",
     cacheDirectory: environment.CATALOG_CACHE_DIRECTORY?.trim() || "/cache",
+    metadataDirectory: environment.CATALOG_METADATA_DIRECTORY?.trim() || undefined,
     allowedRootPaths,
     rootPolicyValidationTimeoutMs: integerEnvironment(
       environment.CATALOG_ROOT_POLICY_TIMEOUT_MS,
@@ -66,6 +67,13 @@ export function catalogConfigFromEnvironment(environment: NodeJS.ProcessEnv = pr
       ),
       shutdownDrainTimeoutMs: shutdownTimeoutMs,
       settingsMode: settingsModeEnvironment(environment.CATALOG_SETTINGS_MODE),
+      googleBooksApiKey: environment.CATALOG_GOOGLE_BOOKS_API_KEY?.trim() || undefined,
+      coverProviderTimeoutMs: integerEnvironment(
+        environment.CATALOG_COVER_PROVIDER_TIMEOUT_MS,
+        12_000,
+        1_000,
+        60_000,
+      ),
       staticDirectory: existsSync(staticCandidate) ? staticCandidate : undefined,
     },
     scanner: {

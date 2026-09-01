@@ -203,7 +203,7 @@ describe("catalog/Kindle reconciliation", () => {
     expect(result.inventory.items[0]?.match).not.toBe("confirmed");
   });
 
-  it("does not re-green an old managed version through unchanged metadata or delivery history", async () => {
+  it("keeps an old managed version yellow but exposes its exact removal-only association", async () => {
     const oldVersion = await inventory("book-1");
     const oldToken = oldVersion.objects[0]!.managedToken!;
     const staleObject: KindleInventorySnapshot = {
@@ -233,14 +233,7 @@ describe("catalog/Kindle reconciliation", () => {
       entries: [{
         ...replacement.entries[0]!,
         contentHash: "b".repeat(64),
-        deliveries: [{
-          deviceKey: "device-key",
-          filename: staleObject.objects[0]!.filename,
-          artifactSize: staleObject.objects[0]!.size,
-          managedToken: oldToken,
-          status: "delivered",
-          deliveredAt: "2026-08-29T10:00:00.000Z",
-        }],
+        staleManagedTokens: [oldToken],
       }],
     };
 
@@ -249,8 +242,13 @@ describe("catalog/Kindle reconciliation", () => {
       deviceKey: "device-key",
     });
 
-    expect(result.statuses.get("book-1")).toBe("not-on-kindle");
-    expect(result.inventory.items[0]).toMatchObject({ match: "unmatched", managed: true });
+    expect(result.statuses.get("book-1")).toBe("possible");
+    expect(result.inventory.items[0]).toMatchObject({
+      bookId: "book-1",
+      match: "possible",
+      managed: true,
+      stalePresentation: true,
+    });
   });
 
   it("never confirms a managed-looking token on a non-book Kindle object", async () => {

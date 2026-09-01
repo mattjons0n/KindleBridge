@@ -23,10 +23,10 @@ Record the image digest, data-volume snapshot, date, operator, target host, brow
 ## Storage lifecycle
 
 - [ ] Graceful stop during an active scan/source response closes SSE and the listener first, drains work, and exits inside 30 seconds with no corrupted migration/database state.
-- [ ] Restart preserves installation identity, profiles, roots, Settings mode, and delivery history.
+- [ ] Restart preserves installation identity, profiles, roots, Settings mode, delivery history, metadata overrides, and user-selected replacement covers.
 - [ ] Removing a source mount reports unavailable without mass deletion; restoring it reconciles normally.
 - [ ] Cold backup produces a checksum-valid archive.
-- [ ] Restore into a new volume preserves durable state and leaves the old volume untouched.
+- [ ] Restore into a new volume preserves durable state, including `/data/metadata-covers`, and leaves the old volume untouched.
 - [ ] Upgrade is tested against a restored copy; rollback selects the previous image and data snapshot together.
 - [ ] Fresh cache plus reconciliation rebuilds covers, search, facets, and source serving.
 
@@ -36,12 +36,13 @@ Record the image digest, data-volume snapshot, date, operator, target host, brow
 - [ ] Source streaming, scans, and Settings changes honor configured rate/concurrency/body bounds.
 - [ ] Startup-root validation, Settings path validation, source responses, and cover reads honor their configured deadlines and release capacity after timeout/disconnect.
 - [ ] Logs contain no storage credentials, raw source bytes, conversion output, host paths where prohibited, or raw device serials.
-- [ ] No analytics, external cover fetch, cloud conversion, or cloud book storage request occurs.
+- [ ] No analytics, cloud conversion, or cloud book storage request occurs. When optional cover search is disabled, no provider request occurs; when enabled, egress is limited to the documented Google Books/Open Library hosts and selected bytes are copied into `/data`.
 
 ## Physical secure-origin acceptance
 
 - [ ] Desktop Chromium trusts the real household certificate and reports a secure context.
 - [ ] A user gesture opens the WebUSB chooser. On a clean connection the exact-byte self-test runs first and automatic inventory follows in the same session; pending exact cleanup stays read-only until acknowledgement plus a fresh self-test, inventory, and reconciliation.
 - [ ] Confirmed/possible/absent matching remains conservative on the physical Kindle.
-- [ ] Send prepares only a derivative, transfers and verifies it, then the exact book opens, navigates chapters, and displays its cover.
+- [ ] Send prepares only a derivative, transfers and verifies it, then the exact book opens, navigates chapters, and displays its cover. An edited EPUB shows the selected title/author/cover while its mounted source hash remains unchanged.
+- [ ] A physical multi-book Send keeps `Book X of Y`, marks each returned object verified, reports the exact batch summary, leaves only unsent books selected after an induced failure, and reconciles once when the batch ends.
 - [ ] A second household profile and its real mounted roots remain scoped correctly across restart.

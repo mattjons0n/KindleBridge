@@ -1,6 +1,7 @@
 import type { DebugLog } from "./log";
 import {
   CatalogBrowser,
+  type CatalogSendBatchResult,
   type CatalogHardwareHooks,
   type CatalogKindleInventory,
   type CatalogRemoveRequest,
@@ -9,10 +10,12 @@ import {
 } from "./catalog-browser";
 import {
   createCatalogClient,
+  type BookMetadataOverrides,
   type CatalogApi,
   type CatalogEvent,
   type CatalogKindleStatus,
   type CatalogKindleStatusCounts,
+  type CoverProvider,
 } from "./catalog-client";
 import { renderKindleDeviceContents, renderLibraryPrototype, renderLibraryResults } from "./library-prototype-view";
 import type { KindleFilter, LibrarySort, LibraryView, MetadataFilter } from "./library-prototype";
@@ -44,6 +47,7 @@ export interface AppViewHandlers {
   readonly onCatalogConnectRequested?: () => void | Promise<void>;
   readonly onCatalogDisconnectRequested?: () => void | Promise<void>;
   readonly onCatalogSendRequested?: (request: CatalogSendRequest) => void | Promise<void>;
+  readonly onCatalogSendBatchFinished?: (result: CatalogSendBatchResult) => void | Promise<void>;
   readonly onCatalogRemoveRequested?: (request: CatalogRemoveRequest) => void | Promise<void>;
   readonly onCatalogChanged?: (event: CatalogEvent) => void | Promise<void>;
   readonly onCatalogProfileChanged?: (profileId: string) => void | Promise<void>;
@@ -263,6 +267,7 @@ export class AppView {
   #profileDraft: TargetProfile;
   #catalogDialogReturnBookId?: string;
   #catalogRemovalReturnBookId?: string;
+  #catalogMetadataReturnBookId?: string;
   #settingsDeleteReturnLibraryId?: string;
 
   constructor(
@@ -281,6 +286,7 @@ export class AppView {
       onConnectRequested: handlers.onCatalogConnectRequested,
       onDisconnectRequested: handlers.onCatalogDisconnectRequested,
       onSendRequested: handlers.onCatalogSendRequested,
+      onSendBatchFinished: handlers.onCatalogSendBatchFinished,
       onRemoveRequested: handlers.onCatalogRemoveRequested,
       onCatalogChanged: handlers.onCatalogChanged,
       onActiveProfileChanged: handlers.onCatalogProfileChanged,
@@ -604,6 +610,12 @@ export class AppView {
         this.#catalog.openSend(bookId);
       }
     }));
+    scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="edit-book-metadata"]').forEach((button) => button.addEventListener("click", () => {
+      const bookId = button.dataset.bookId;
+      if (!bookId) return;
+      this.#catalogMetadataReturnBookId = bookId;
+      void this.#catalog.openMetadataEditor(bookId);
+    }));
     scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="set-library-layout"]').forEach((button) => button.addEventListener("click", () => {
       const layout = button.dataset.layout;
       if (layout === "grid" || layout === "list") this.#catalog.setLayout(layout);
@@ -645,10 +657,207 @@ export class AppView {
     scope.querySelectorAll<HTMLElement>('[data-ui-action="close-send"]').forEach((element) => element.addEventListener("click", () => this.#closeCatalogDialog()));
     scope.querySelector<HTMLButtonElement>('button[data-ui-action="confirm-catalog-send"]')?.addEventListener("click", () => { void this.#catalog.confirmSend(); });
     scope.querySelector<HTMLButtonElement>('button[data-ui-action="dismiss-announcement"]')?.addEventListener("click", () => this.#catalog.dismissAnnouncement());
+    this.#bindMetadataEditorEvents(scope);
     if (scope === this.#root) {
       this.#activateCatalogDialog();
       this.#activateCatalogRemovalDialog();
+      this.#activateMetadataEditorDialog();
     }
+  }
+
+  #readMetadataEditorForm(): BookMetadataOverrides | undefined {
+    const form = this.#root.querySelector<HTMLFormElement>("form.metadata-editor-form");
+    if (!form) return undefined;
+    const values: Record<string, unknown> = {};
+    const fields = [
+      "title", "authors", "authorSort", "language", "publisher", "publishedAt",
+      "series", "seriesIndex", "description", "subjects", "identifiers",
+    ] as const;
+    for (const field of fields) {
+      const enabled = form.querySelector<HTMLInputElement>(`input[data-metadata-override="${field}"]`);
+      if (!enabled?.checked) continue;
+      const control = form.querySelector<HTMLInputElement | HTMLTextAreaElement>(`[data-metadata-field="${field}"]`);
+      if (!control) continue;
+      control.setCustomValidity("");
+      const raw = control.value.trim();
+      if (field === "title") {
+        if (!raw) {
+          control.setCustomValidity("An overridden title cannot be empty.");
+          control.reportValidity();
+          control.focus();
+          return undefined;
+        }
+        values[field] = raw;
+      } else if (field === "authors" || field === "subjects" || field === "identifiers") {
+        values[field] = control.value.split(/\r?\n/u).map((value) => value.trim()).filter(Boolean);
+      } else if (field === "seriesIndex") {
+        if (!raw) values[field] = null;
+        else {
+          const numeric = Number(raw);
+          if (!Number.isFinite(numeric) || numeric < 0) {
+            control.setCustomValidity("Enter a non-negative series number or leave it blank.");
+            control.reportValidity();
+            control.focus();
+            return undefined;
+          }
+          values[field] = numeric;
+        }
+      } else {
+        values[field] = raw || null;
+      }
+    }
+    return values as BookMetadataOverrides;
+  }
+
+  #captureMetadataEditorForm(): boolean {
+    const changes = this.#readMetadataEditorForm();
+    if (!changes) return false;
+    this.#catalog.setMetadataEditorDraft(changes);
+    return true;
+  }
+
+  #bindMetadataEditorEvents(scope: ParentNode): void {
+    const form = scope.querySelector<HTMLFormElement>("form.metadata-editor-form");
+    form?.addEventListener("submit", (event) => event.preventDefault());
+    form?.querySelectorAll<HTMLInputElement>("input[data-metadata-override]").forEach((checkbox) => checkbox.addEventListener("change", () => {
+      const field = checkbox.dataset.metadataOverride;
+      const row = field ? form.querySelector<HTMLElement>(`[data-metadata-field-row="${field}"]`) : undefined;
+      const control = field ? row?.querySelector<HTMLInputElement | HTMLTextAreaElement>(`[data-metadata-field="${field}"]`) : undefined;
+      if (control) control.disabled = !checkbox.checked;
+      const label = checkbox.closest("label")?.querySelector("span");
+      if (label) label.textContent = checkbox.checked ? "Override active" : "Use source";
+      if (this.#captureMetadataEditorForm() && checkbox.checked) control?.focus();
+    }));
+    form?.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>("[data-metadata-field]").forEach((control) => {
+      control.addEventListener("input", () => this.#captureMetadataEditorForm());
+      control.addEventListener("change", () => this.#captureMetadataEditorForm());
+    });
+    scope.querySelectorAll<HTMLElement>('[data-ui-action="close-metadata-editor"]').forEach((element) => element.addEventListener("click", () => this.#closeMetadataEditorDialog()));
+    scope.querySelector<HTMLButtonElement>('[data-ui-action="save-book-metadata"]')?.addEventListener("click", () => {
+      if (this.#captureMetadataEditorForm()) void this.#catalog.saveBookMetadata();
+    });
+    scope.querySelector<HTMLButtonElement>('[data-ui-action="reset-book-metadata"]')?.addEventListener("click", () => {
+      void this.#catalog.resetBookMetadata();
+    });
+    scope.querySelector<HTMLButtonElement>('[data-ui-action="reset-book-cover"]')?.addEventListener("click", () => {
+      if (this.#captureMetadataEditorForm()) void this.#catalog.resetBookCover();
+    });
+    const search = (): void => {
+      if (!this.#captureMetadataEditorForm()) return;
+      const provider = scope.querySelector<HTMLSelectElement>("#metadata-cover-provider")?.value as CoverProvider | undefined;
+      const query = scope.querySelector<HTMLInputElement>("#metadata-cover-query")?.value ?? "";
+      if (provider === "google-books" || provider === "open-library") void this.#catalog.searchBookCovers(provider, query);
+    };
+    scope.querySelector<HTMLButtonElement>('[data-ui-action="search-metadata-covers"]')?.addEventListener("click", search);
+    scope.querySelector<HTMLInputElement>("#metadata-cover-query")?.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        search();
+      }
+    });
+    scope.querySelectorAll<HTMLButtonElement>('[data-ui-action="import-metadata-cover"]').forEach((button) => button.addEventListener("click", () => {
+      const candidateId = button.dataset.candidateId;
+      if (candidateId && this.#captureMetadataEditorForm()) void this.#catalog.importBookCover(candidateId);
+    }));
+    const fileInput = scope.querySelector<HTMLInputElement>('input[data-ui-action="upload-metadata-cover"]');
+    const upload = (image: Blob | undefined): void => {
+      if (image && this.#captureMetadataEditorForm()) void this.#catalog.uploadBookCover(image);
+    };
+    fileInput?.addEventListener("change", () => upload(fileInput.files?.[0]));
+    const dropzone = scope.querySelector<HTMLElement>("[data-metadata-cover-dropzone]");
+    dropzone?.addEventListener("click", () => {
+      if (dropzone.getAttribute("aria-disabled") !== "true") fileInput?.click();
+    });
+    dropzone?.addEventListener("keydown", (event) => {
+      if ((event.key === "Enter" || event.key === " ") && dropzone.getAttribute("aria-disabled") !== "true") {
+        event.preventDefault();
+        fileInput?.click();
+      }
+    });
+    ["dragenter", "dragover"].forEach((type) => dropzone?.addEventListener(type, (event) => {
+      event.preventDefault();
+      if (dropzone.getAttribute("aria-disabled") !== "true") dropzone.classList.add("dragging");
+    }));
+    ["dragleave", "drop"].forEach((type) => dropzone?.addEventListener(type, (event) => {
+      event.preventDefault();
+      dropzone.classList.remove("dragging");
+      if (type === "drop" && dropzone.getAttribute("aria-disabled") !== "true") {
+        const transfer = (event as DragEvent).dataTransfer;
+        upload([...transfer?.files ?? []].find((file) => file.type.startsWith("image/")));
+      }
+    }));
+    dropzone?.addEventListener("paste", (event) => {
+      if (dropzone.getAttribute("aria-disabled") === "true") return;
+      const clipboard = (event as ClipboardEvent).clipboardData;
+      const item = [...clipboard?.items ?? []].find((candidate) => candidate.kind === "file" && candidate.type.startsWith("image/"));
+      const image = item?.getAsFile() ?? [...clipboard?.files ?? []].find((file) => file.type.startsWith("image/"));
+      if (!image) return;
+      event.preventDefault();
+      upload(image);
+    });
+    scope.querySelectorAll<HTMLImageElement>("img[data-metadata-cover-image]").forEach((image) => image.addEventListener("error", () => {
+      image.hidden = true;
+    }));
+  }
+
+  #closeMetadataEditorDialog(): void {
+    const editor = this.#catalog.snapshot.metadataEditor;
+    if (!editor || editor.busy) return;
+    const dirty = editor.data !== undefined
+      && JSON.stringify(editor.draftOverrides) !== JSON.stringify(editor.data.overrides);
+    if (dirty && typeof window.confirm === "function" && !window.confirm("Discard unsaved metadata changes?")) return;
+    const returnBookId = this.#catalogMetadataReturnBookId;
+    this.#catalogMetadataReturnBookId = undefined;
+    this.#catalog.closeMetadataEditor();
+    window.queueMicrotask(() => {
+      const trigger = returnBookId
+        ? [...this.#root.querySelectorAll<HTMLElement>(".library-book-menu > summary")]
+            .find((summary) => summary.closest<HTMLElement>("[data-book-id]")?.dataset.bookId === returnBookId)
+        : undefined;
+      (trigger
+        ?? this.#root.querySelector<HTMLElement>('.library-nav-item[aria-current="page"]')
+        ?? this.#root.querySelector<HTMLElement>(".library-brand"))?.focus();
+    });
+  }
+
+  #activateMetadataEditorDialog(): void {
+    const dialog = this.#root.querySelector<HTMLElement>('.library-metadata-sheet[role="dialog"]');
+    if (!dialog) return;
+    [
+      this.#root.querySelector<HTMLElement>(".library-topbar"),
+      this.#root.querySelector<HTMLElement>(".library-sidebar"),
+      ...this.#root.querySelectorAll<HTMLElement>(".library-main > :not(.library-metadata-sheet):not(.library-modal-backdrop)"),
+      this.#root.querySelector<HTMLElement>(".library-global-alerts"),
+      this.#root.querySelector<HTMLElement>(".poc-lab"),
+      this.#root.querySelector<HTMLElement>(".footer"),
+    ].filter((element): element is HTMLElement => element !== null)
+      .forEach((element) => element.setAttribute("inert", ""));
+    dialog.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        this.#closeMetadataEditorDialog();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = [...dialog.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])')]
+        .filter((element) => !element.hasAttribute("hidden"));
+      if (focusable.length === 0) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+      const first = focusable[0]!;
+      const last = focusable.at(-1)!;
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    });
+    (dialog.querySelector<HTMLElement>('button[data-ui-action="close-metadata-editor"]:not([disabled])')
+      ?? dialog).focus();
   }
 
   #closeCatalogDialog(): void {

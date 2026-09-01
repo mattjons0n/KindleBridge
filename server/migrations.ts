@@ -6,7 +6,7 @@ interface Migration {
   sql: string;
 }
 
-export const CATALOG_SCHEMA_VERSION = 13;
+export const CATALOG_SCHEMA_VERSION = 14;
 /** Bounded replay window for Settings/configuration mutations per profile. */
 export const MAX_CONFIGURATION_WRITES_PER_PROFILE = 1_000;
 /** Unreferenced stable identities retained per root after confirmed scans. */
@@ -327,6 +327,136 @@ export const CATALOG_MIGRATIONS: readonly Migration[] = [
     sql: `
       ALTER TABLE scan_requests ADD COLUMN pending INTEGER NOT NULL DEFAULT 1
         CHECK(pending IN (0, 1));
+    `,
+  },
+  {
+    version: 14,
+    name: "durable non-destructive metadata and cover overlays",
+    sql: `
+      ALTER TABLE books ADD COLUMN series_index REAL;
+      ALTER TABLE books ADD COLUMN description TEXT;
+      ALTER TABLE books ADD COLUMN presentation_version TEXT;
+      ALTER TABLE books ADD COLUMN cover_storage TEXT NOT NULL DEFAULT 'cache'
+        CHECK(cover_storage IN ('cache', 'override'));
+      ALTER TABLE books ADD COLUMN metadata_revision INTEGER NOT NULL DEFAULT 0
+        CHECK(metadata_revision >= 0);
+      ALTER TABLE books ADD COLUMN metadata_edited INTEGER NOT NULL DEFAULT 0
+        CHECK(metadata_edited IN (0, 1));
+      ALTER TABLE books ADD COLUMN cover_edited INTEGER NOT NULL DEFAULT 0
+        CHECK(cover_edited IN (0, 1));
+      UPDATE books
+        SET presentation_version = coalesce(
+          (SELECT sf.content_hash FROM source_files sf WHERE sf.id = books.source_file_id),
+          ''
+        );
+
+      -- This table is rebuildable source evidence. It exists separately so a
+      -- scan can refresh the file-derived values without overwriting a user's
+      -- durable overlay or losing the values needed by Reset.
+      CREATE TABLE book_source_metadata (
+        book_id TEXT PRIMARY KEY REFERENCES books(id) ON DELETE CASCADE,
+        title TEXT NOT NULL,
+        authors_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(authors_json)),
+        author_sort TEXT,
+        language TEXT,
+        publisher TEXT,
+        published_at TEXT,
+        series TEXT,
+        series_index REAL,
+        description TEXT,
+        subjects_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(subjects_json)),
+        identifiers_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(identifiers_json)),
+        metadata_complete INTEGER NOT NULL DEFAULT 0 CHECK(metadata_complete IN (0, 1)),
+        cover_media_type TEXT,
+        cover_cache_key TEXT,
+        cover_expected INTEGER NOT NULL DEFAULT 0 CHECK(cover_expected IN (0, 1)),
+        updated_at TEXT NOT NULL
+      ) STRICT;
+      INSERT INTO book_source_metadata(
+        book_id, title, authors_json, author_sort, language, publisher, published_at,
+        series, series_index, description, subjects_json, identifiers_json,
+        metadata_complete, cover_media_type, cover_cache_key, cover_expected, updated_at
+      )
+      SELECT b.id, b.title, b.authors_json, b.author_sort, b.language, b.publisher, b.published_at,
+        b.series, b.series_index, b.description, b.subjects_json, b.identifiers_json,
+        b.metadata_complete, b.cover_media_type, b.cover_cache_key, b.cover_expected, b.updated_at
+      FROM books b;
+
+      -- No foreign key to the rebuildable books table: stable book IDs and
+      -- their edits intentionally survive an explicit catalog rebuild.
+      CREATE TABLE book_metadata_overrides (
+        book_id TEXT PRIMARY KEY,
+        root_id TEXT NOT NULL REFERENCES library_roots(id) ON DELETE CASCADE,
+        source_content_hash TEXT NOT NULL,
+        revision INTEGER NOT NULL CHECK(revision > 0),
+        title_set INTEGER NOT NULL DEFAULT 0 CHECK(title_set IN (0, 1)),
+        title TEXT,
+        authors_set INTEGER NOT NULL DEFAULT 0 CHECK(authors_set IN (0, 1)),
+        authors_json TEXT CHECK(authors_json IS NULL OR json_valid(authors_json)),
+        author_sort_set INTEGER NOT NULL DEFAULT 0 CHECK(author_sort_set IN (0, 1)),
+        author_sort TEXT,
+        language_set INTEGER NOT NULL DEFAULT 0 CHECK(language_set IN (0, 1)),
+        language TEXT,
+        publisher_set INTEGER NOT NULL DEFAULT 0 CHECK(publisher_set IN (0, 1)),
+        publisher TEXT,
+        published_at_set INTEGER NOT NULL DEFAULT 0 CHECK(published_at_set IN (0, 1)),
+        published_at TEXT,
+        series_set INTEGER NOT NULL DEFAULT 0 CHECK(series_set IN (0, 1)),
+        series TEXT,
+        series_index_set INTEGER NOT NULL DEFAULT 0 CHECK(series_index_set IN (0, 1)),
+        series_index REAL,
+        description_set INTEGER NOT NULL DEFAULT 0 CHECK(description_set IN (0, 1)),
+        description TEXT,
+        subjects_set INTEGER NOT NULL DEFAULT 0 CHECK(subjects_set IN (0, 1)),
+        subjects_json TEXT CHECK(subjects_json IS NULL OR json_valid(subjects_json)),
+        identifiers_set INTEGER NOT NULL DEFAULT 0 CHECK(identifiers_set IN (0, 1)),
+        identifiers_json TEXT CHECK(identifiers_json IS NULL OR json_valid(identifiers_json)),
+        cover_asset_key TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      ) STRICT;
+
+      CREATE TABLE metadata_cover_assets (
+        asset_key TEXT PRIMARY KEY,
+        checksum TEXT NOT NULL UNIQUE,
+        media_type TEXT NOT NULL CHECK(media_type IN ('image/jpeg', 'image/png', 'image/webp')),
+        byte_length INTEGER NOT NULL CHECK(byte_length > 0),
+        width INTEGER NOT NULL CHECK(width > 0),
+        height INTEGER NOT NULL CHECK(height > 0),
+        source_kind TEXT NOT NULL CHECK(source_kind IN ('upload', 'provider')),
+        provider TEXT CHECK(provider IS NULL OR provider IN ('google-books', 'open-library')),
+        provider_reference TEXT,
+        source_url TEXT,
+        created_at TEXT NOT NULL
+      ) STRICT;
+      CREATE INDEX book_metadata_overrides_hash_idx
+        ON book_metadata_overrides(source_content_hash);
+      CREATE INDEX book_metadata_overrides_cover_idx
+        ON book_metadata_overrides(cover_asset_key);
+
+      DROP TABLE books_fts;
+      CREATE VIRTUAL TABLE books_fts USING fts5(
+        book_id UNINDEXED,
+        title,
+        authors,
+        subjects,
+        publisher,
+        series,
+        identifiers,
+        description,
+        source_filename,
+        tokenize = 'unicode61 remove_diacritics 2'
+      );
+      INSERT INTO books_fts(
+        book_id, title, authors, subjects, publisher, series, identifiers, description, source_filename
+      )
+      SELECT b.id, b.title,
+        replace(replace(b.authors_json, '[', ' '), ']', ' '),
+        replace(replace(b.subjects_json, '[', ' '), ']', ' '),
+        coalesce(b.publisher, ''), coalesce(b.series, ''),
+        replace(replace(b.identifiers_json, '[', ' '), ']', ' '),
+        coalesce(b.description, ''), sf.relative_path
+      FROM books b JOIN source_files sf ON sf.id = b.source_file_id;
     `,
   },
 ];

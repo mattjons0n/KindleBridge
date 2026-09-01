@@ -6,11 +6,14 @@ import { CatalogIndexer, type CatalogIndexerOptions } from "./catalog-indexer.js
 import { CoverCache } from "./cover-cache.js";
 import { CatalogEventHub } from "./event-hub.js";
 import { CatalogHttpServer, type CatalogHttpOptions } from "./http-server.js";
+import { MetadataCoverStore } from "./metadata-cover-store.js";
 import { AllowedRootPolicy } from "./root-policy.js";
 
 export interface CatalogServiceConfig {
   databasePath: string;
   cacheDirectory: string;
+  /** Durable user-selected cover assets. Defaults beside catalog.sqlite. */
+  metadataDirectory?: string;
   allowedRootPaths: string[];
   rootPolicyValidationTimeoutMs?: number;
   http?: Partial<CatalogHttpOptions>;
@@ -28,6 +31,7 @@ export class CatalogService {
     readonly indexer: CatalogIndexer,
     readonly http: CatalogHttpServer,
     readonly events: CatalogEventHub,
+    readonly metadataCoverStore?: MetadataCoverStore,
   ) {}
 
   async start(): Promise<{ hostname: string; port: number }> {
@@ -128,6 +132,12 @@ export async function createCatalogService(
   });
   const database = new CatalogDatabase(path.resolve(config.databasePath));
   const coverCache = new CoverCache(path.resolve(config.cacheDirectory));
+  const metadataCoverStore = new MetadataCoverStore(
+    path.resolve(config.metadataDirectory ?? path.dirname(config.databasePath)),
+  );
+  await metadataCoverStore.initialize();
+  database.pruneUnreferencedMetadataCoverAssetRows();
+  await metadataCoverStore.pruneOrphans(database.referencedMetadataCoverKeys());
   const events = new CatalogEventHub();
   const indexer = new CatalogIndexer(
     database,
@@ -136,9 +146,17 @@ export async function createCatalogService(
     (event) => events.publish(event),
     config.scanner,
   );
-  const http = new CatalogHttpServer(database, indexer, rootPolicy, coverCache, events, config.http);
+  const http = new CatalogHttpServer(
+    database,
+    indexer,
+    rootPolicy,
+    coverCache,
+    events,
+    config.http,
+    metadataCoverStore,
+  );
   indexer.setOperationalStateHandler((component, state) => http.setOperationalState(component, state));
-  return new CatalogService(database, indexer, http, events);
+  return new CatalogService(database, indexer, http, events, metadataCoverStore);
 }
 
 export async function startCatalogService(

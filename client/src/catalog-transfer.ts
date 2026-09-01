@@ -1,6 +1,10 @@
 import { AppError } from "./app-error";
 import { prepareKindleSideload } from "./api/azw3-sideload";
 import type { ConversionResult } from "./api/convert";
+import {
+  hasConversionOverrides,
+  type ConversionOverrides,
+} from "./api/conversion-overrides";
 import { MAX_KINDLE_ARTIFACT_BYTES } from "./book-limits";
 import { MAX_CATALOG_SOURCE_BYTES } from "./catalog-client";
 
@@ -26,11 +30,17 @@ export interface PreparedCatalogArtifact {
   readonly converted: boolean;
   readonly embeddedCover: boolean;
   readonly kindleDocumentType: "PDOC";
+  readonly overridesApplied: boolean;
 }
 
 export interface PrepareCatalogArtifactOptions {
   readonly signal?: AbortSignal;
-  readonly convertEpub: (file: File, signal?: AbortSignal) => Promise<ConversionResult>;
+  readonly convertEpub: (
+    file: File,
+    signal?: AbortSignal,
+    overrides?: ConversionOverrides,
+  ) => Promise<ConversionResult>;
+  readonly overrides?: ConversionOverrides;
   readonly onPhase?: (phase: CatalogTransferPhase) => void;
 }
 
@@ -142,12 +152,18 @@ export async function prepareCatalogArtifact(
       safeSourceFilename(book, "epub"),
       { type: source.type || "application/epub+zip", lastModified: Date.now() },
     );
-    const result = await options.convertEpub(input, options.signal);
+    const result = await options.convertEpub(input, options.signal, options.overrides);
     artifact = result.blob;
     filename = result.filename;
     converted = true;
     embeddedCover = result.diagnostics.embeddedCover;
   } else {
+    if (hasConversionOverrides(options.overrides)) {
+      throw new AppError(
+        "CONVERSION_INVALID_INPUT",
+        "Metadata or cover overrides cannot yet be embedded safely in an existing AZW3. The original remains unchanged; use an EPUB source for edited Kindle metadata.",
+      );
+    }
     options.onPhase?.("validating");
     const prepared = prepareKindleSideload(new Uint8Array(await source.arrayBuffer()));
     // Copy into an ArrayBuffer-backed view. TypeScript's newer typed-array
@@ -178,5 +194,8 @@ export async function prepareCatalogArtifact(
     converted,
     embeddedCover,
     kindleDocumentType: "PDOC",
+    overridesApplied: hasConversionOverrides(options.overrides),
   };
 }
+
+export type { ConversionOverrides } from "./api/conversion-overrides";

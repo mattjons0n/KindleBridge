@@ -98,7 +98,20 @@ describe("catalog database", () => {
       INSERT INTO source_files(id, root_id, relative_path, content_hash, size) VALUES
         ('source-cover', 'root-retained', 'with.epub', '${"a".repeat(64)}', 10),
         ('source-plain', 'root-retained', 'without.epub', '${"b".repeat(64)}', 11);
-      CREATE TABLE books(id TEXT PRIMARY KEY, root_id TEXT NOT NULL, source_file_id TEXT NOT NULL, cover_cache_key TEXT, updated_at TEXT NOT NULL) STRICT;
+      CREATE TABLE books(
+        id TEXT PRIMARY KEY, root_id TEXT NOT NULL, source_file_id TEXT NOT NULL,
+        title TEXT NOT NULL DEFAULT 'Legacy title',
+        authors_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(authors_json)),
+        author_sort TEXT, language TEXT, publisher TEXT, published_at TEXT, series TEXT,
+        subjects_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(subjects_json)),
+        identifiers_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(identifiers_json)),
+        metadata_complete INTEGER NOT NULL DEFAULT 0 CHECK(metadata_complete IN (0, 1)),
+        cover_media_type TEXT, cover_cache_key TEXT, updated_at TEXT NOT NULL
+      ) STRICT;
+      CREATE VIRTUAL TABLE books_fts USING fts5(
+        book_id UNINDEXED, title, authors, subjects, publisher, series, identifiers,
+        source_filename, tokenize = 'unicode61 remove_diacritics 2'
+      );
       INSERT INTO books(id, root_id, source_file_id, cover_cache_key, updated_at) VALUES
         ('with-cover', 'root-retained', 'source-cover', 'v1-retained.jpg', '2025-01-01T00:00:00.000Z'),
         ('without-cover', 'root-retained', 'source-plain', NULL, '2025-01-01T00:00:00.000Z');
@@ -497,6 +510,7 @@ describe("catalog database", () => {
     expect(replacement.bookId).toBe(original.bookId);
     expect(replacementMatch.managedToken).not.toBe(originalToken);
     expect(replacementMatch.deliveries).toEqual([]);
+    expect(replacementMatch.staleManagedTokens).toEqual([originalToken]);
     expect(database.getDelivery(historicDelivery.id)).not.toBeNull();
     database.close();
   });

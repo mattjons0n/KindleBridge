@@ -5,6 +5,7 @@ import { MAX_KINDLE_ARTIFACT_BYTES } from "../book-limits";
 
 interface ConversionRequest {
   readonly input: ArrayBuffer;
+  readonly overridesApplied?: boolean;
 }
 
 interface WorkerScope extends EventTarget {
@@ -50,6 +51,7 @@ workerScope.addEventListener("message", (rawEvent) => {
         metadata,
         kindleDocumentType: prepared.metadata.documentType,
         embeddedCover: prepared.metadata.embeddedCover,
+        overridesApplied: event.data.overridesApplied === true,
       }, [transferable]);
     } catch (error) {
       workerScope.postMessage({

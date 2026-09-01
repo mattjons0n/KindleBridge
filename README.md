@@ -11,9 +11,11 @@ The repository now contains the implemented household-library flow:
 - a Node.js catalog service with SQLite migrations, persistent profiles and roots, health/readiness endpoints, and a rebuildable cover/search index;
 - bounded metadata extraction, incremental directory watching, scheduled reconciliation, source-health reporting, and server-sent scan events;
 - a real API-backed cover grid and toggleable multi-select list with profile selection, search, filters, sorting, pagination, source status, bulk actions, and Settings CRUD;
+- non-destructive metadata and cover editing: sparse user overrides and replacement-cover bytes persist under `/data`, while mounted originals and the rebuildable `/cache` remain separate;
 - live Kindle inventory, automatic exact-byte self-test after connection, Calibre-compatible active-library matching, and green checks reserved for strong matches;
 - catalog-driven **Send to Kindle**, including authoritative source validation, browser-local EPUB conversion or AZW3 validation, PDOC preparation, collision-resistant transfer, verification, and delivery recording;
-- explicitly confirmed single/bulk **Remove from Kindle** for exact current-device matches, with exact-handle revalidation and one post-removal inventory refresh;
+- coherent multi-book Send feedback with `Book X of Y`, combined batch/current-book progress, per-title verification, exact partial-failure retry selection, and one final catalog reconciliation;
+- explicitly confirmed single/bulk **Remove from Kindle** for exact current-device matches, including removal-only prior KindleBridge presentations after an edit, with exact-handle revalidation and one post-removal inventory refresh;
 - a hardened, non-root Docker/OCI image and Compose deployment using ordinary read-only library mounts plus persistent `/data` and rebuildable `/cache` volumes.
 
 The original transfer engine was physically validated on an MTP Kindle with USB IDs `0x1949 / 0x9981`: conversion, MTP connection, exact-byte self-test, transfer, opening, chapter navigation, and library-cover display all succeeded. The expanded integrated catalog/inventory/Send/removal journey still requires a fresh physical Kindle run and acceptance against the real household mounts and intended HTTPS LAN/VPN origin. Automated tests do not replace those checks.
@@ -24,14 +26,14 @@ See [`outputs/kindle-bridge-implementation-build-plan.md`](outputs/kindle-bridge
 
 ```text
 Host directories exposed to Docker as read-only mounts
-  -> Docker catalog service: scanner + SQLite/FTS + covers + source API
+  -> Docker catalog service: scanner + SQLite/FTS + durable presentation overlays + source API
   -> same-origin web interface
   -> browser-local boko conversion or AZW3 validation
   -> browser-local WebUSB/MTP
   -> Kindle
 ```
 
-The host is responsible for making local, NAS-, SMB-, or NFS-backed directories available to Docker. Kindle Bridge sees only their container paths, normally below `/libraries`. It never receives storage credentials and never changes an original book. Conversion and PDOC preparation operate only on an in-browser derivative.
+The host is responsible for making local, NAS-, SMB-, or NFS-backed directories available to Docker. Kindle Bridge sees only their container paths, normally below `/libraries`. It never receives storage credentials and never changes an original book. Metadata corrections and selected cover images are stored separately under `/data`; conversion and PDOC preparation apply them only to an in-browser derivative.
 
 Profiles are organizational views over one or more roots. They are deliberately not access-control boundaries: anyone who can reach a no-login deployment can switch profiles. Keep the service on a trusted LAN/VPN or behind an appropriate private HTTPS access layer; do not publish it unauthenticated to the internet.
 
@@ -84,6 +86,7 @@ Important service controls include:
 - `CATALOG_MAX_SOURCE_STREAMS` and `CATALOG_MAX_CONCURRENT_SCANS` for source-download and scan concurrency, plus `CATALOG_SOURCE_RESPONSE_TIMEOUT_MS` and `CATALOG_SCAN_TIMEOUT_MS` for their aggregate deadlines;
 - `CATALOG_COVER_RESPONSE_TIMEOUT_MS`, `CATALOG_SETTINGS_VALIDATION_TIMEOUT_MS`, and `CATALOG_ROOT_POLICY_TIMEOUT_MS` so cache reads, Settings path checks, and startup allowed-root checks cannot retain capacity or resume late database work indefinitely;
 - `CATALOG_METADATA_WORKERS` and `CATALOG_METADATA_TIMEOUT_MS` for the isolated metadata-parser pool;
+- `CATALOG_METADATA_DIRECTORY` for durable replacement covers (normally `/data`) plus optional `CATALOG_GOOGLE_BOOKS_API_KEY` and `CATALOG_COVER_PROVIDER_TIMEOUT_MS` for fixed-endpoint cover search;
 - `CATALOG_QUIET_WINDOW_MS`, `CATALOG_STABILITY_WINDOW_MS`, `CATALOG_RECONCILE_MS`, and `CATALOG_DEEP_RECONCILE_MS` for watcher debounce, changed-file stability, frequent bounded-fingerprint reconciliation, and automatic full deep sweeps. Each root's successful deep completion is stored in SQLite, so restarting the container does not reset or postpone its deadline;
 - `CATALOG_MAX_SCAN_ENTRIES` and `CATALOG_MAX_SCAN_DIRECTORIES` for bounded per-root traversal. A timed-out scan preserves prior catalog rows and its durable scan request, reports `scan_timeout`, and retries with bounded backoff without holding a shared scan slot or startup readiness indefinitely;
 - `CATALOG_COVER_RETENTION_MS` and `CATALOG_COVER_PRUNE_MS` for safe cleanup of rebuildable, unreferenced covers;
@@ -96,12 +99,13 @@ Remote WebUSB use requires a trustworthy HTTPS origin in a supported Chromium de
 1. Click **Connect Kindle** to open the browser's required user-initiated device chooser.
 2. On a clean connection, Kindle Bridge opens one browser-local MTP session, runs the exact-byte create/read/compare/delete self-test, inventories Documents, and compares the result with the selected library. The interface labels those three phases separately. If exact cleanup is pending, it permits only read-only recovery inventory first; acknowledgement must be followed by a new self-test, inventory, and reconciliation.
 3. Confirmed matches receive a green check. For unmanaged books, Kindle Bridge follows Calibre's active-library comparison: punctuation-insensitive exact title plus Calibre-style joined author or `author_sort`, including Calibre's individual-author fallback. A fully parsed exact device row can confirm even if an unrelated file could not be parsed; incomplete metadata still prevents proving that a missing book is absent. Fuzzy evidence remains visibly possible and blocks ordinary Send.
-4. Click **Send to Kindle**. The browser verifies the indexed source size, hash, ETag, and actual format; converts or validates a derivative; checks capacity; transfers without overwrite; verifies the result; and refreshes live reconciliation.
-5. Toggle **List view** to select multiple books for bulk Send or bulk removal. The three-dot menu on every grid/list item also offers **Remove from Kindle** when that catalog book has an exact confirmed association. Removal shows the exact Kindle filenames and sizes, requires confirmation, revalidates every live MTP object before deleting its concrete handle, and refreshes inventory once. Possible, unknown, stale, Kindle-only, protected, folder, cache, or changed objects cannot authorize removal. Library originals are never changed.
+4. Use a book's three-dot menu to open **Edit metadata & cover**. Field overrides, uploaded/dragged/pasted images, and imported Google Books/Open Library covers are saved separately from the source. The catalog uses the effective presentation immediately. If a prior KindleBridge presentation is still on the device, it stays yellow rather than falsely turning the edited book green, but its exact managed identity remains available for removal before the edited presentation is sent.
+5. Click **Send to Kindle**. The browser verifies the indexed source size, hash, presentation version, ETag, and actual format; applies any EPUB overlay to a temporary copy; converts or validates the derivative; checks capacity; transfers without overwrite; verifies the result; and refreshes live reconciliation. Edited AZW3 embedding is deliberately unavailable until a bounded reconstruction path is added; the original remains untouched.
+6. Toggle **List view** to select multiple books for bulk Send or bulk removal. Batch Send retains `Book X of Y`, combines current-book and overall progress, lists verified titles, leaves only unsent titles selected after a failure, and performs one final catalog reconciliation. The three-dot menu on every grid/list item also offers **Remove from Kindle** when that catalog book has an exact confirmed association. A bounded exact prior KindleBridge presentation token can also authorize removal only, without claiming that the current edited presentation is on the device. Removal shows the exact Kindle filenames and sizes, requires confirmation, revalidates every live MTP object before deleting its concrete handle, and refreshes inventory once. Ordinary possible/unknown matches, Kindle-only items, protected files, folders, caches, or changed objects cannot authorize removal. Library originals are never changed.
 
 Browser lifecycle safety is deliberately conservative. A page restored from the browser back/forward cache, or a visible return after the page was observed hidden for at least 60 seconds, invalidates the retained WebUSB/MTP session. In-flight device work is aborted, the session is closed after that work drains, inventory becomes **Last seen**, green-check evidence becomes unknown, and reconnect plus the automatic byte self-test is required before Send. This handles observable browser lifecycle and hidden/visible timing; it does not claim to detect every operating-system sleep or hardware suspend event.
 
-Safety invariants include immutable source mounts, a 200 MiB source limit, bounded parsing, no overwrite, collision-resistant managed filenames, a bounded metadata-only recovery journal, exact-handle cleanup, one active browser-wide device lease, and clean USB/session shutdown. DRM-protected ebooks are unsupported.
+Safety invariants include immutable source mounts, optimistic edit revision/source-hash checks, a 200 MiB source limit, bounded parsing, no overwrite, presentation-version-scoped collision-resistant managed filenames, a bounded metadata-only recovery journal, exact-handle cleanup, one active browser-wide device lease, and clean USB/session shutdown. DRM-protected ebooks are unsupported.
 
 Direct AZW3 sources are supported when their KF8 text is uncompressed or PalmDOC-compressed. HUFF/CDIC-compressed AZW3 is rejected explicitly because this release does not contain a trustworthy bounded HUFF/CDIC decoder; EPUB remains the preferred source path for browser-local conversion.
 

@@ -9,7 +9,7 @@ container evidence passed. `[ ]` deliberately identifies release-host,
 household-data, browser-memory, secure-origin, or physical-device evidence that
 cannot be inferred from mocks or localhost.
 
-The authoritative 2026-08-31 root gate passed 55/55 test files and 666/666 tests, followed
+The authoritative 2026-09-01 root gate passed 59/59 test files and 686/686 tests, followed
 by successful client typechecking, server build, and production Vite build. The
 generic operator template in `deploy/docker/RELEASE_CHECKLIST.md` remains
 unchecked until a concrete release image, host, origin, and Kindle are accepted.
@@ -145,10 +145,29 @@ unchecked until a concrete release image, host, origin, and Kindle are accepted.
 - [x] The vendored converter preflights hostile ZIPs and caps spine/package documents, DOM/attributes/text, IR/styles/semantics, MathML, aggregate chapter cache, normalized XHTML/CSS, and AZW3 output before the corresponding retained allocation crosses its limit.
 - [x] Actual checked-in-WASM regressions cover Epictetus plus archive entry/inflation attacks, a 100,001-node DOM, 4,097 itemrefs, excessive MathML depth, synthesized XHTML beyond 32 MiB, and resource-driven AZW3 output beyond 200 MiB with no partial output.
 
+## Non-destructive metadata and cover presentation
+
+- [x] Sparse field overrides and replacement-cover references are durable `/data` state; source metadata and extracted covers remain rebuildable evidence.
+- [x] Effective metadata drives catalog cards, FTS, facets, completeness, matching, and presentation-version identity without writing a source file.
+- [x] The editor exposes source/effective values, field inheritance/reset, upload/drag/clipboard image input, fixed-provider cover search/import, and custom-cover reset.
+- [x] Metadata and cover writes require both the expected edit revision and current source hash; changed sources/parallel edits fail closed or are explicitly rebased.
+- [x] Replacement covers are bounded, structurally inspected, checksummed, atomically stored, verified on read, and rechecked before concurrent orphan deletion.
+- [x] EPUB overrides are applied to a bounded ephemeral browser copy and verified through the checked-in boko WASM; original bytes remain byte-identical.
+- [x] Non-empty AZW3 overrides stop before MTP because the checked-in converter lacks a bounded reconstruction entrypoint; unchanged AZW3 behavior is preserved.
+- [x] A prior managed presentation remains yellow after an edit but retains bounded exact-token removal-only authority, so it can be removed and resent without falsely greening the current presentation or expanding historical delivery rows.
+
+## Multi-book transfer feedback
+
+- [x] A batch retains `Book X of Y`, the current title, and one combined overall/current-book progress bar across controller messages.
+- [x] Each completed title is visibly marked transferred and verified before advancement.
+- [x] Partial failure names succeeded and failed titles and leaves only failed/not-yet-attempted books selected for retry.
+- [x] Success visibly reports and logs `N of N books transferred and verified.`
+- [x] Per-book MTP verification/inventory refresh remains intact while catalog reconciliations and repetitive metadata diagnostics coalesce into one final batch pass.
+
 ## Container, security, and operations
 
 - [x] Multi-architecture build definition, pinned OCI index, per-architecture base digests, SBOM, and provenance configuration cover `linux/amd64` and `linux/arm64` without host-vendor dependencies.
-- [x] The current schema-v13 `linux/arm64` application image builds and passes the local hardened-container smoke.
+- [x] The prior schema-v13 `linux/arm64` application image built and passed the local hardened-container smoke; schema-v14 image lifecycle acceptance remains a deployment gate.
 - [x] The current image executes as native `linux/arm64` and `linux/amd64` through the available cross-architecture runtime; its verified two-platform OCI index carries an SPDX SBOM and SLSA provenance attestation for each manifest.
 - [x] Container runs as non-root with read-only root filesystem, dropped capabilities, and no-new-privileges.
 - [x] Only `/data`, `/cache`, and bounded cache-backed temporary storage are writable.
@@ -161,9 +180,9 @@ unchecked until a concrete release image, host, origin, and Kindle are accepted.
 
 ## Verification and release evidence
 
-- [x] Root unit, database, filesystem, API, parser-security, browser, MTP-fault, deployment, and integration gate passes: 55/55 files and 666/666 tests, plus client typecheck, server build, and production Vite build.
+- [x] Root unit, database, filesystem, API, parser-security, browser, MTP-fault, deployment, and integration gate passes: 59/59 files and 686/686 tests, plus client typecheck, server build, and production Vite build. The final mixed-presentation audit adjustment additionally passes its focused regression and client typecheck.
 - [x] A directly generated 10,000-row database corpus covers FTS, filtering, pagination, and complete match-index query budgets; no full filesystem scan is inferred from it.
-- [x] Current schema-v13 native `linux/arm64` hardened-container smoke covers health/readiness, API catalog/search/facets/source/cover/delivery, restart persistence, read-only root/source, Host/Origin rejection, and security headers.
+- [x] Prior schema-v13 native `linux/arm64` hardened-container smoke covers health/readiness, API catalog/search/facets/source/cover/delivery, restart persistence, read-only root/source, Host/Origin rejection, and security headers.
 - [x] Current-image restore and catalog/cache rebuild smoke preserves profile/root/stable-book/delivery evidence, recreates derived data, and returns the exact original 459,174-byte source with its indexed SHA-256.
 - [x] The current dual-architecture OCI archive contains verified `linux/amd64` and `linux/arm64` manifests plus per-platform SPDX and SLSA attestations; both architecture images start and serve the persisted catalog.
 - [x] Existing physical Kindle POC evidence remains clearly separated from new automated and container evidence.
@@ -171,7 +190,7 @@ unchecked until a concrete release image, host, origin, and Kindle are accepted.
 
 ## Completed local container gate and explicit external gates
 
-- [x] Current schema-v13 rebuilt-image restore/catalog-rebuild and dual-architecture OCI build/execution completed successfully on the local acceptance runtime.
+- [x] Prior schema-v13 rebuilt-image restore/catalog-rebuild and dual-architecture OCI build/execution completed successfully on the local acceptance runtime.
 - [ ] Peak browser-process memory is measured with the maximum accepted household EPUB on the intended client; the 1.5 GiB planning allowance and enforced allocation limits are not substituted for measurement.
 - [ ] The complete integrated flow is freshly retested on the physical Kindle: chooser, automatic self-test, inventory, matching, Send, open/navigation/cover, reconnect, and durable recovery. This run must also confirm root-cache creation/readback, reuse from another browser installation, A/B rotation, Kindle-UI invisibility, and coexistence with `metadata.calibre`.
 - [ ] The real husband and wife read-only mounts, multiple-root/profile scope, incremental ingestion, mount loss/restoration, backup/restore, rebuild, and byte-identical originals are accepted on the household Docker host.

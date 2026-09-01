@@ -472,7 +472,11 @@ describe("catalog-backed library model", () => {
 
   it("toggles list selection and sends the eligible selection through the bulk hook", async () => {
     const send = vi.fn(async (_request: CatalogSendRequest) => undefined);
-    const { root, view } = await loadedView(fakeApi(), handlers({ onCatalogSendRequested: send }));
+    const finishBatch = vi.fn(async () => undefined);
+    const { root, view } = await loadedView(fakeApi(), handlers({
+      onCatalogSendRequested: send,
+      onCatalogSendBatchFinished: finishBatch,
+    }));
     view.setCatalogKindleStatuses(new Map([
       ["book_time", "not-on-kindle"],
       ["book_dorian", "not-on-kindle"],
@@ -522,18 +526,116 @@ describe("catalog-backed library model", () => {
 
     await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(2));
     expect(send.mock.calls.map(([request]) => request.book.id)).toEqual(["book_time", "book_dorian"]);
-    await vi.waitFor(() => expect(root.querySelector(".library-toast")?.textContent).toContain("2 books were sent"));
+    expect(send.mock.calls.map(([request]) => request.batch?.position)).toEqual([1, 2]);
+    await vi.waitFor(() => expect(finishBatch).toHaveBeenCalledWith(expect.objectContaining({
+      total: 2,
+      succeeded: [
+        { id: "book_time", title: "The Time Machine" },
+        { id: "book_dorian", title: "The Picture of Dorian Gray" },
+      ],
+      unsent: [],
+    })));
+    await vi.waitFor(() => expect(root.querySelector(".library-toast")?.textContent).toContain("2 of 2 books transferred and verified."));
+    expect(root.querySelector(".library-send-sheet")?.textContent).toContain("Batch complete");
     expect(root.querySelector(".library-bulk-selection")?.textContent).toContain("0 selected");
   });
 
-  it("confirms an exact per-item Kindle filename before invoking the removal hook", async () => {
+  it("keeps batch position across controller updates and selects only unsent books after a partial failure", async () => {
+    let resolveFirst!: () => void;
+    let rejectSecond!: (error: unknown) => void;
+    const send = vi.fn((request: CatalogSendRequest): Promise<void> => (
+      request.book.id === "book_time"
+        ? new Promise<void>((resolve) => { resolveFirst = resolve; })
+        : new Promise<void>((_resolve, reject) => { rejectSecond = reject; })
+    ));
+    const finishBatch = vi.fn(async () => undefined);
+    const api = fakeApi();
+    let emitCatalogEvent!: (event: CatalogEvent) => void;
+    vi.mocked(api.subscribeEvents).mockImplementation((onEvent, _onError, onOpen) => {
+      emitCatalogEvent = onEvent;
+      onOpen?.();
+      return () => undefined;
+    });
+    const { root, view } = await loadedView(api, handlers({
+      onCatalogSendRequested: send,
+      onCatalogSendBatchFinished: finishBatch,
+    }));
+    view.setCatalogKindleStatuses(new Map([
+      ["book_time", "not-on-kindle"],
+      ["book_dorian", "not-on-kindle"],
+    ]), new Map([
+      ["prf_personal", { confirmed: 0, possible: 0, notOnKindle: 2, unknown: 0 }],
+    ]));
+    view.setCatalogKindleInventory({
+      deviceLabel: "Current Kindle",
+      scannedAt: new Date().toISOString(),
+      completeness: "complete",
+      total: 0,
+      truncated: false,
+      metadata: { status: "complete", eligible: 0, enriched: 0, failed: 0, skipped: 0, truncated: false },
+      matching: { status: "complete", matchedProfiles: 1, failedProfiles: 0 },
+      items: [],
+    });
+    view.render({
+      ...initialAppState(),
+      device: { kind: "ready", details: { vendorId: 0x1949, productId: 0x9981 } },
+      selfTest: { kind: "passed", byteLength: 1_012 },
+      catalogInventoryState: "ready",
+    });
+    click(root, '[data-ui-action="set-library-layout"][data-layout="list"]');
+    for (const bookId of ["book_time", "book_dorian"]) {
+      const checkbox = root.querySelector<HTMLInputElement>(`[data-book-id="${bookId}"] [data-ui-action="toggle-book-selection"]`)!;
+      checkbox.checked = true;
+      checkbox.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+
+    click(root, '[data-ui-action="bulk-send-to-kindle"]');
+    await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+    view.setCatalogTransferUpdate({ phase: "sending", progress: 50, message: "Sending first book" });
+    emitCatalogEvent({
+      id: "delivery-event-1",
+      type: "delivery.updated",
+      at: new Date().toISOString(),
+      profileId: "prf_personal",
+      bookId: "book_time",
+    });
+    expect(view.catalogKindleStatus("book_dorian")).toBe("not-on-kindle");
+    expect(root.querySelector(".library-sheet-eyebrow")?.textContent).toBe("Book 1 of 2");
+    expect(root.querySelector("#send-preview-title")?.textContent).toBe("The Time Machine");
+    expect(root.querySelector('[role="progressbar"]')?.getAttribute("aria-valuenow")).toBe("25");
+
+    resolveFirst();
+    await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(2));
+    view.setCatalogTransferUpdate({ phase: "sending", progress: 50, message: "Sending second book" });
+    expect(root.querySelector(".library-sheet-eyebrow")?.textContent).toBe("Book 2 of 2");
+    expect(root.querySelector("#send-preview-title")?.textContent).toBe("The Picture of Dorian Gray");
+    expect(root.querySelector(".library-batch-book-list")?.textContent).toContain("The Time Machine");
+    expect(root.querySelector('[role="progressbar"]')?.getAttribute("aria-valuenow")).toBe("75");
+
+    rejectSecond(new Error("USB stalled"));
+    await vi.waitFor(() => expect(root.querySelector(".library-transfer-status.failed")?.textContent).toContain("Failed on “The Picture of Dorian Gray”: USB stalled"));
+    expect(root.querySelector(".library-batch-book-results")?.textContent).toContain("The Time Machine");
+    expect(root.querySelector(".library-batch-failure")?.textContent).toContain("The Picture of Dorian Gray");
+    expect(root.querySelector(".library-batch-retry")?.textContent).toContain("The Picture of Dorian Gray");
+    expect(root.querySelector<HTMLInputElement>('[data-book-id="book_time"] [data-ui-action="toggle-book-selection"]')?.checked).toBe(false);
+    expect(root.querySelector<HTMLInputElement>('[data-book-id="book_dorian"] [data-ui-action="toggle-book-selection"]')?.checked).toBe(true);
+    expect(root.querySelector(".library-bulk-selection")?.textContent).toContain("1 selected");
+    expect(finishBatch).toHaveBeenCalledWith(expect.objectContaining({
+      total: 2,
+      succeeded: [{ id: "book_time", title: "The Time Machine" }],
+      failed: expect.objectContaining({ id: "book_dorian", message: "USB stalled" }),
+      unsent: [{ id: "book_dorian", title: "The Picture of Dorian Gray" }],
+    }));
+  });
+
+  it("removes an exact prior presentation without greening it or authorizing an uncertain match", async () => {
     const remove = vi.fn(async (_request: CatalogRemoveRequest) => undefined);
     const { root, view } = await loadedView(fakeApi(), handlers({ onCatalogRemoveRequested: remove }));
     view.setCatalogKindleStatuses(new Map([
-      ["book_time", "confirmed"],
+      ["book_time", "possible"],
       ["book_dorian", "possible"],
     ]), new Map([
-      ["prf_personal", { confirmed: 1, possible: 1, notOnKindle: 0, unknown: 0 }],
+      ["prf_personal", { confirmed: 0, possible: 2, notOnKindle: 0, unknown: 0 }],
     ]));
     view.setCatalogKindleInventory({
       deviceLabel: "Current Kindle",
@@ -544,7 +646,7 @@ describe("catalog-backed library model", () => {
       metadata: { status: "complete", eligible: 2, enriched: 2, failed: 0, skipped: 0, truncated: false },
       matching: { status: "complete", matchedProfiles: 1, failedProfiles: 0 },
       items: [
-        { id: "mtp-exact", filename: "The Time Machine - exact device copy.azw3", size: 812_345, managed: false, bookId: "book_time", match: "confirmed" },
+        { id: "mtp-exact", filename: "The Time Machine - prior managed copy.azw3", size: 812_345, managed: true, bookId: "book_time", match: "possible", stalePresentation: true },
         { id: "mtp-possible", filename: "Dorian Gray - uncertain.azw3", size: 900_000, managed: false, bookId: "book_dorian", match: "possible" },
       ],
     });
@@ -559,10 +661,11 @@ describe("catalog-backed library model", () => {
     const possibleRemove = root.querySelector<HTMLButtonElement>('[data-book-id="book_dorian"] [data-ui-action="remove-book-from-kindle"]');
     expect(exactRemove).toMatchObject({ disabled: false });
     expect(possibleRemove).toMatchObject({ disabled: true });
+    expect(root.querySelector('[data-book-id="book_time"] .library-kindle-check')?.textContent).toBe("?");
     exactRemove?.click();
 
     const dialog = root.querySelector<HTMLElement>('.library-remove-sheet[role="alertdialog"]');
-    expect(dialog?.textContent).toContain("The Time Machine - exact device copy.azw3");
+    expect(dialog?.textContent).toContain("The Time Machine - prior managed copy.azw3");
     expect(remove).not.toHaveBeenCalled();
     click(root, '[data-ui-action="confirm-remove-from-kindle"]');
 
@@ -573,7 +676,7 @@ describe("catalog-backed library model", () => {
         itemId: "mtp-exact",
         bookId: "book_time",
         title: "The Time Machine",
-        filename: "The Time Machine - exact device copy.azw3",
+        filename: "The Time Machine - prior managed copy.azw3",
         size: 812_345,
       }],
     });

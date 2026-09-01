@@ -2,7 +2,9 @@ import {
   CatalogApiError,
   type CatalogApi,
   type CatalogBook,
+  type CatalogBookMetadataState,
   type CatalogBookPage,
+  type BookMetadataOverrides,
   type CatalogEvent,
   type CatalogFilters,
   type CatalogKindleStatus,
@@ -10,6 +12,8 @@ import {
   type CatalogProfile,
   type CatalogRoot,
   type CatalogServiceStatus,
+  type CoverProvider,
+  type CoverSearchCandidate,
 } from "./catalog-client";
 import {
   catalogQuery,
@@ -62,6 +66,7 @@ export interface CatalogBrowserSnapshot {
   readonly sendPhase?: CatalogTransferPhase;
   readonly sendProgress?: number;
   readonly sendMessage?: string;
+  readonly batchTransfer?: CatalogBatchTransferState;
   readonly announcement?: string;
   readonly kindleStatus: ReadonlyMap<string, CatalogKindleStatus>;
   readonly kindleStatusCountsByProfile: ReadonlyMap<string, CatalogKindleStatusCounts>;
@@ -72,6 +77,26 @@ export interface CatalogBrowserSnapshot {
   readonly bulkActionBusy: boolean;
   readonly bulkActionError?: string;
   readonly pendingRemoval?: CatalogRemoveRequest;
+  readonly metadataEditor?: CatalogMetadataEditorState;
+}
+
+export interface CatalogMetadataEditorState {
+  readonly profileId: string;
+  readonly bookId: string;
+  readonly title: string;
+  readonly loadState: CatalogLoadState;
+  readonly data?: CatalogBookMetadataState;
+  /** Unsaved form values survive cover searches/uploads that re-render the dialog. */
+  readonly draftOverrides: BookMetadataOverrides;
+  readonly busy: boolean;
+  readonly error?: string;
+  readonly coverSearch: {
+    readonly provider: CoverProvider;
+    readonly query: string;
+    readonly loadState: CatalogLoadState;
+    readonly items: readonly CoverSearchCandidate[];
+    readonly error?: string;
+  };
 }
 
 export type CatalogTransferPhase = "preparing" | "converting" | "validating" | "sending" | "verifying" | "complete" | "failed";
@@ -80,6 +105,32 @@ export interface CatalogTransferUpdate {
   readonly phase: CatalogTransferPhase;
   readonly progress?: number;
   readonly message?: string;
+}
+
+export interface CatalogBatchTransferBook {
+  readonly id: string;
+  readonly title: string;
+}
+
+export interface CatalogSendBatchContext {
+  readonly id: string;
+  /** One-based position in the immutable batch order. */
+  readonly position: number;
+  readonly total: number;
+}
+
+export interface CatalogBatchTransferState extends CatalogSendBatchContext {
+  readonly verifiedBooks: readonly CatalogBatchTransferBook[];
+  readonly retryBooks: readonly CatalogBatchTransferBook[];
+  readonly failedBook?: CatalogBatchTransferBook;
+}
+
+export interface CatalogSendBatchResult {
+  readonly id: string;
+  readonly total: number;
+  readonly succeeded: readonly CatalogBatchTransferBook[];
+  readonly unsent: readonly CatalogBatchTransferBook[];
+  readonly failed?: CatalogBatchTransferBook & { readonly message: string };
 }
 
 export type KindleInventoryCompleteness = "complete" | "partial" | "last-seen";
@@ -95,6 +146,8 @@ export interface CatalogKindleInventoryItem {
   readonly managed: boolean;
   readonly bookId?: string;
   readonly match: "confirmed" | "possible" | "unmatched";
+  /** Exact prior Kindle Bridge presentation; removable, but never green/current. */
+  readonly stalePresentation?: boolean;
 }
 
 export interface CatalogKindleInventory {
@@ -127,6 +180,7 @@ export interface CatalogKindleInventory {
 export interface CatalogSendRequest {
   readonly profileId: string;
   readonly book: CatalogBook;
+  readonly batch?: CatalogSendBatchContext;
 }
 
 export interface CatalogRemoveTarget {
@@ -146,6 +200,8 @@ export interface CatalogHardwareHooks {
   readonly onConnectRequested?: () => void | Promise<void>;
   readonly onDisconnectRequested?: () => void | Promise<void>;
   readonly onSendRequested?: (request: CatalogSendRequest) => void | Promise<void>;
+  /** Finalizes one browser-orchestrated batch after its last success or first failure. */
+  readonly onSendBatchFinished?: (result: CatalogSendBatchResult) => void | Promise<void>;
   readonly onRemoveRequested?: (request: CatalogRemoveRequest) => void | Promise<void>;
   readonly onCatalogChanged?: (event: CatalogEvent) => void | Promise<void>;
   /** Reconcile the newly visible profile first when a Kindle is already connected. */
@@ -382,12 +438,15 @@ export class CatalogBrowser {
   #settingsBaselineFingerprint?: string;
   #sendOperationSequence = 0;
   #activeSendOperation?: number;
+  #batchOperationSequence = 0;
   #profileOperation?: CatalogOperationLease;
   #bookOperation?: CatalogOperationLease;
   #settingsLoadOperation?: CatalogOperationLease;
   #settingsMutationOperation?: CatalogOperationLease;
   #eventRefreshOperation?: CatalogOperationLease;
   #rescanOperations = new Map<string, CatalogOperationLease>();
+  #metadataEditorEpoch = 0;
+  #metadataEditorOperation?: CatalogOperationLease;
 
   constructor(
     api: CatalogApi,
@@ -523,11 +582,13 @@ export class CatalogBrowser {
     this.#settingsEpoch += 1;
     this.#profilesReloadEpoch += 1;
     this.#eventRefreshEpoch += 1;
+    this.#metadataEditorEpoch += 1;
     this.#profileOperation?.abort(new DOMException("Catalog browser disposed", "AbortError"));
     this.#bookOperation?.abort(new DOMException("Catalog browser disposed", "AbortError"));
     this.#settingsLoadOperation?.abort(new DOMException("Catalog browser disposed", "AbortError"));
     this.#settingsMutationOperation?.abort(new DOMException("Catalog browser disposed", "AbortError"));
     this.#eventRefreshOperation?.abort(new DOMException("Catalog browser disposed", "AbortError"));
+    this.#metadataEditorOperation?.abort(new DOMException("Catalog browser disposed", "AbortError"));
     for (const operation of this.#rescanOperations.values()) {
       operation.abort(new DOMException("Catalog browser disposed", "AbortError"));
     }
@@ -536,6 +597,7 @@ export class CatalogBrowser {
     this.#settingsLoadOperation = undefined;
     this.#settingsMutationOperation = undefined;
     this.#eventRefreshOperation = undefined;
+    this.#metadataEditorOperation = undefined;
     this.#rescanOperations.clear();
     if (this.#searchTimer !== undefined) window.clearTimeout(this.#searchTimer);
     if (this.#eventTimer !== undefined) window.clearTimeout(this.#eventTimer);
@@ -1244,52 +1306,429 @@ export class CatalogBrowser {
       return;
     }
 
-    const sentBookIds = new Set<string>();
+    const batchId = `catalog-batch-${Date.now().toString(36)}-${(++this.#batchOperationSequence).toString(36)}`;
+    const verifiedBooks: CatalogBatchTransferBook[] = [];
+    let failed: (CatalogBatchTransferBook & { readonly message: string }) | undefined;
+    let failedIndex = -1;
     this.#set({
       bulkActionBusy: true,
       bulkActionError: undefined,
       announcement: undefined,
+      batchTransfer: {
+        id: batchId,
+        position: 1,
+        total: books.length,
+        verifiedBooks: [],
+        retryBooks: [],
+      },
     }, "all");
-    try {
-      for (const book of books) {
-        this.#set({
-          pendingBookId: book.id,
-          pendingBook: book,
-          sendBusy: true,
-          sendPhase: "preparing",
-          sendProgress: 0,
-          sendMessage: `Preparing ${sentBookIds.size + 1} of ${books.length}`,
-        }, "all");
-        await this.#hooks.onSendRequested({ profileId: book.profileId, book });
-        sentBookIds.add(book.id);
-      }
-      const selectedBookIds = new Set(this.#snapshot.selectedBookIds);
-      for (const bookId of sentBookIds) selectedBookIds.delete(bookId);
+    for (let index = 0; index < books.length; index += 1) {
+      const book = books[index]!;
       this.#set({
-        bulkActionBusy: false,
-        sendBusy: false,
-        pendingBookId: undefined,
-        pendingBook: undefined,
-        sendPhase: undefined,
-        sendProgress: undefined,
-        sendMessage: undefined,
-        selectedBookIds,
-        announcement: `${sentBookIds.size} ${sentBookIds.size === 1 ? "book was" : "books were"} sent to the Kindle and verified. Library originals remain unchanged.`,
+        pendingBookId: book.id,
+        pendingBook: book,
+        sendBusy: true,
+        sendPhase: "preparing",
+        sendProgress: 0,
+        sendMessage: "Checking the indexed source",
+        batchTransfer: {
+          id: batchId,
+          position: index + 1,
+          total: books.length,
+          verifiedBooks: [...verifiedBooks],
+          retryBooks: [],
+        },
       }, "all");
-    } catch (error) {
-      const message = errorMessage(error, "The selected books could not all be sent.");
+      try {
+        await this.#hooks.onSendRequested({
+          profileId: book.profileId,
+          book,
+          batch: { id: batchId, position: index + 1, total: books.length },
+        });
+        verifiedBooks.push({ id: book.id, title: book.title });
+        this.#set({
+          sendPhase: "complete",
+          sendProgress: 100,
+          sendMessage: `“${book.title}” transferred and verified.`,
+          batchTransfer: {
+            id: batchId,
+            position: index + 1,
+            total: books.length,
+            verifiedBooks: [...verifiedBooks],
+            retryBooks: [],
+          },
+        }, "all");
+      } catch (error) {
+        failedIndex = index;
+        failed = {
+          id: book.id,
+          title: book.title,
+          message: errorMessage(error, "This book could not be sent."),
+        };
+        break;
+      }
+    }
+
+    const retryBooks = failedIndex < 0
+      ? []
+      : books.slice(failedIndex).map(({ id, title }) => ({ id, title }));
+    const result: CatalogSendBatchResult = {
+      id: batchId,
+      total: books.length,
+      succeeded: [...verifiedBooks],
+      unsent: retryBooks,
+      ...(failed === undefined ? {} : { failed }),
+    };
+    if (failed) {
       this.#set({
-        bulkActionBusy: false,
-        sendBusy: false,
         sendPhase: "failed",
-        sendMessage: message,
-        error: message,
+        sendMessage: `Failed on “${failed.title}”: ${failed.message} Finalizing the Kindle comparison for ${verifiedBooks.length} verified ${verifiedBooks.length === 1 ? "book" : "books"}.`,
+        batchTransfer: {
+          id: batchId,
+          position: failedIndex + 1,
+          total: books.length,
+          verifiedBooks: [...verifiedBooks],
+          retryBooks,
+          failedBook: { id: failed.id, title: failed.title },
+        },
+      }, "all");
+    } else {
+      this.#set({
+        sendPhase: "verifying",
+        sendProgress: 100,
+        sendMessage: "All selected books are verified; completing one final library comparison.",
       }, "all");
     }
+    try {
+      await this.#hooks.onSendBatchFinished?.(result);
+    } catch {
+      // MTP verification is already authoritative. A batch-finalization hook
+      // must never turn verified writes into an ambiguous transfer result.
+    }
+
+    if (failed) {
+      const selectedBookIds = new Set(retryBooks.map(({ id }) => id));
+      const verifiedSummary = `${verifiedBooks.length} of ${books.length} ${verifiedBooks.length === 1 ? "book" : "books"} transferred and verified.`;
+      const retrySummary = `${retryBooks.length} unsent ${retryBooks.length === 1 ? "book remains" : "books remain"} selected for retry.`;
+      const message = `${verifiedSummary} Failed on “${failed.title}”: ${failed.message} ${retrySummary}`;
+      this.#set({
+        bulkActionBusy: false,
+        bulkActionError: message,
+        sendBusy: false,
+        sendPhase: "failed",
+        sendProgress: Math.round(100 * verifiedBooks.length / books.length),
+        sendMessage: message,
+        selectedBookIds,
+        batchTransfer: {
+          id: batchId,
+          position: failedIndex + 1,
+          total: books.length,
+          verifiedBooks: [...verifiedBooks],
+          retryBooks,
+          failedBook: { id: failed.id, title: failed.title },
+        },
+      }, "all");
+      return;
+    }
+
+    const selectedBookIds = new Set(this.#snapshot.selectedBookIds);
+    for (const { id } of verifiedBooks) selectedBookIds.delete(id);
+    const summary = `${verifiedBooks.length} of ${books.length} books transferred and verified.`;
+    this.#set({
+      bulkActionBusy: false,
+      bulkActionError: undefined,
+      sendBusy: false,
+      sendPhase: "complete",
+      sendProgress: 100,
+      sendMessage: summary,
+      selectedBookIds,
+      batchTransfer: {
+        id: batchId,
+        position: books.length,
+        total: books.length,
+        verifiedBooks: [...verifiedBooks],
+        retryBooks: [],
+      },
+      announcement: summary,
+    }, "all");
   }
 
   requestBookRemoval(bookId: string): void {
     this.#requestRemoval([bookId]);
+  }
+
+  async openMetadataEditor(bookId: string): Promise<void> {
+    if (this.#kindleActionBusy()) return;
+    const book = this.#snapshot.page?.items.find((candidate) => candidate.id === bookId);
+    if (!book) return;
+    if (!this.#api.getBookMetadata) {
+      this.#set({ announcement: "This catalog server does not support metadata editing yet." }, "all");
+      return;
+    }
+    this.#metadataEditorOperation?.abort();
+    const operation = createCatalogOperation("Book metadata load", this.#requestTimeoutMs);
+    this.#metadataEditorOperation = operation;
+    const epoch = ++this.#metadataEditorEpoch;
+    this.#set({
+      metadataEditor: {
+        profileId: book.profileId,
+        bookId: book.id,
+        title: book.title,
+        loadState: "loading",
+        draftOverrides: {},
+        busy: false,
+        coverSearch: {
+          provider: "google-books",
+          query: [book.title, ...book.authors].filter(Boolean).join(" "),
+          loadState: "idle",
+          items: [],
+        },
+      },
+      announcement: undefined,
+    }, "all");
+    try {
+      const data = await operation.wait(this.#api.getBookMetadata(book.profileId, book.id, operation.signal));
+      if (epoch !== this.#metadataEditorEpoch || this.#snapshot.metadataEditor?.bookId !== book.id) return;
+      this.#set({
+        metadataEditor: {
+          ...this.#snapshot.metadataEditor,
+          title: data.book.title,
+          loadState: "ready",
+          data,
+          draftOverrides: { ...data.overrides },
+          error: undefined,
+        },
+      }, "all");
+    } catch (error) {
+      if (epoch !== this.#metadataEditorEpoch || this.#snapshot.metadataEditor?.bookId !== book.id) return;
+      this.#set({
+        metadataEditor: {
+          ...this.#snapshot.metadataEditor,
+          loadState: "error",
+          error: errorMessage(error, "This book's editable metadata could not be loaded."),
+        },
+      }, "all");
+    } finally {
+      if (this.#metadataEditorOperation === operation) {
+        operation.dispose();
+        this.#metadataEditorOperation = undefined;
+      }
+    }
+  }
+
+  closeMetadataEditor(): void {
+    if (this.#snapshot.metadataEditor?.busy) return;
+    this.#metadataEditorEpoch += 1;
+    this.#metadataEditorOperation?.abort();
+    this.#metadataEditorOperation = undefined;
+    this.#set({ metadataEditor: undefined }, "all");
+  }
+
+  setMetadataEditorDraft(changes: BookMetadataOverrides): void {
+    const editor = this.#snapshot.metadataEditor;
+    if (!editor || editor.busy) return;
+    this.#snapshot = {
+      ...this.#snapshot,
+      metadataEditor: { ...editor, draftOverrides: changes, error: undefined },
+    };
+  }
+
+  async saveBookMetadata(): Promise<void> {
+    const editor = this.#snapshot.metadataEditor;
+    const data = editor?.data;
+    if (!editor || !data || editor.busy || !this.#api.updateBookMetadata) return;
+    const expectedContentHash = data.book.contentHash;
+    if (!expectedContentHash) {
+      this.#set({ metadataEditor: { ...editor, error: "The current source version is unavailable. Close and reopen the editor before saving." } }, "all");
+      return;
+    }
+    const removedFields = (Object.keys(data.overrides) as Array<keyof BookMetadataOverrides>)
+      .filter((field) => !Object.hasOwn(editor.draftOverrides, field));
+    if (removedFields.length === 0 && Object.keys(editor.draftOverrides).length === 0 && !data.sourceChanged) {
+      this.#set({ announcement: "Metadata already uses the read-only source values." }, "all");
+      return;
+    }
+    await this.#runMetadataMutation(
+      "Saving book metadata",
+      async (signal) => {
+        let current = data;
+        if (removedFields.length > 0) {
+          if (!this.#api.resetBookMetadata) throw new Error("This catalog server cannot return fields to their source values.");
+          current = await this.#api.resetBookMetadata(editor.profileId, editor.bookId, {
+            expectedRevision: current.revision,
+            expectedContentHash: current.book.contentHash ?? expectedContentHash,
+            fields: removedFields,
+          }, signal);
+        }
+        if (Object.keys(editor.draftOverrides).length > 0 || data.sourceChanged) {
+          current = await this.#api.updateBookMetadata!(editor.profileId, editor.bookId, {
+            expectedRevision: current.revision,
+            expectedContentHash: current.book.contentHash ?? expectedContentHash,
+            changes: editor.draftOverrides,
+          }, signal);
+        }
+        return current;
+      },
+      "Metadata saved. The original library file remains unchanged.",
+      true,
+    );
+  }
+
+  async resetBookMetadata(): Promise<void> {
+    const editor = this.#snapshot.metadataEditor;
+    const data = editor?.data;
+    if (!editor || !data || editor.busy || !this.#api.resetBookMetadata) return;
+    const expectedContentHash = data.book.contentHash;
+    if (!expectedContentHash) {
+      this.#set({ metadataEditor: { ...editor, error: "The current source version is unavailable. Close and reopen the editor before resetting." } }, "all");
+      return;
+    }
+    await this.#runMetadataMutation(
+      "Resetting book metadata",
+      (signal) => this.#api.resetBookMetadata!(editor.profileId, editor.bookId, {
+        expectedRevision: data.revision,
+        expectedContentHash,
+      }, signal),
+      "Metadata reset to the read-only source values.",
+      true,
+    );
+  }
+
+  async uploadBookCover(image: Blob): Promise<void> {
+    const editor = this.#snapshot.metadataEditor;
+    const data = editor?.data;
+    if (!editor || !data || editor.busy || !this.#api.uploadBookCover) return;
+    const expectedContentHash = data.book.contentHash;
+    if (!expectedContentHash) {
+      this.#set({ metadataEditor: { ...editor, error: "The current source version is unavailable. Close and reopen the editor before saving a cover." } }, "all");
+      return;
+    }
+    if (image.size <= 0 || image.size > 12 * 1024 * 1024 || !["image/jpeg", "image/png", "image/webp"].includes(image.type)) {
+      this.#set({
+        metadataEditor: {
+          ...editor,
+          error: "Choose a non-empty JPEG, PNG, or WebP image no larger than 12 MiB.",
+        },
+      }, "all");
+      return;
+    }
+    await this.#runMetadataMutation(
+      "Saving custom cover",
+      (signal) => this.#api.uploadBookCover!(
+        editor.profileId,
+        editor.bookId,
+        image,
+        data.revision,
+        expectedContentHash,
+        signal,
+      ),
+      "Custom cover saved without changing the original library file.",
+      false,
+    );
+  }
+
+  async resetBookCover(): Promise<void> {
+    const editor = this.#snapshot.metadataEditor;
+    const data = editor?.data;
+    if (!editor || !data || editor.busy || !data.coverOverride || !this.#api.deleteBookCover) return;
+    const expectedContentHash = data.book.contentHash;
+    if (!expectedContentHash) {
+      this.#set({ metadataEditor: { ...editor, error: "The current source version is unavailable. Close and reopen the editor before resetting the cover." } }, "all");
+      return;
+    }
+    await this.#runMetadataMutation(
+      "Resetting custom cover",
+      (signal) => this.#api.deleteBookCover!(
+        editor.profileId,
+        editor.bookId,
+        data.revision,
+        expectedContentHash,
+        signal,
+      ),
+      "Custom cover removed; the source cover is active again.",
+      false,
+    );
+  }
+
+  async searchBookCovers(provider: CoverProvider, query: string): Promise<void> {
+    const editor = this.#snapshot.metadataEditor;
+    const normalizedQuery = query.trim();
+    if (!editor || editor.busy || !this.#api.searchBookCovers || !normalizedQuery) return;
+    this.#metadataEditorOperation?.abort();
+    const operation = createCatalogOperation("Cover search", this.#requestTimeoutMs);
+    this.#metadataEditorOperation = operation;
+    const epoch = ++this.#metadataEditorEpoch;
+    this.#set({
+      metadataEditor: {
+        ...editor,
+        error: undefined,
+        coverSearch: { provider, query: normalizedQuery, loadState: "loading", items: [] },
+      },
+    }, "all");
+    try {
+      const result = await operation.wait(this.#api.searchBookCovers(
+        editor.profileId,
+        editor.bookId,
+        provider,
+        normalizedQuery,
+        operation.signal,
+      ));
+      const current = this.#snapshot.metadataEditor;
+      if (epoch !== this.#metadataEditorEpoch || current?.bookId !== editor.bookId) return;
+      this.#set({
+        metadataEditor: {
+          ...current,
+          coverSearch: {
+            provider: result.provider,
+            query: normalizedQuery,
+            loadState: "ready",
+            items: result.items,
+          },
+        },
+      }, "all");
+    } catch (error) {
+      const current = this.#snapshot.metadataEditor;
+      if (epoch !== this.#metadataEditorEpoch || current?.bookId !== editor.bookId) return;
+      this.#set({
+        metadataEditor: {
+          ...current,
+          coverSearch: {
+            provider,
+            query: normalizedQuery,
+            loadState: "error",
+            items: [],
+            error: errorMessage(error, "Cover search failed."),
+          },
+        },
+      }, "all");
+    } finally {
+      if (this.#metadataEditorOperation === operation) {
+        operation.dispose();
+        this.#metadataEditorOperation = undefined;
+      }
+    }
+  }
+
+  async importBookCover(candidateId: string): Promise<void> {
+    const editor = this.#snapshot.metadataEditor;
+    const data = editor?.data;
+    if (!editor || !data || editor.busy || !this.#api.importBookCover) return;
+    const expectedContentHash = data.book.contentHash;
+    if (!expectedContentHash) {
+      this.#set({ metadataEditor: { ...editor, error: "The current source version is unavailable. Close and reopen the editor before importing a cover." } }, "all");
+      return;
+    }
+    await this.#runMetadataMutation(
+      "Importing cover",
+      (signal) => this.#api.importBookCover!(editor.profileId, editor.bookId, {
+        expectedRevision: data.revision,
+        expectedContentHash,
+        provider: editor.coverSearch.provider,
+        candidateId,
+      }, signal),
+      "Selected cover saved without changing the original library file.",
+      false,
+    );
   }
 
   requestSelectedBookRemoval(): void {
@@ -1337,7 +1776,7 @@ export class CatalogBrowser {
     if (this.#kindleActionBusy()) return;
     const book = this.#snapshot.page?.items.find((candidate) => candidate.id === bookId);
     if (!book) return;
-    this.#set({ pendingBookId: book.id, pendingBook: book, announcement: undefined, sendPhase: undefined, sendProgress: undefined, sendMessage: undefined }, "all");
+    this.#set({ pendingBookId: book.id, pendingBook: book, announcement: undefined, sendPhase: undefined, sendProgress: undefined, sendMessage: undefined, batchTransfer: undefined }, "all");
     // The card action is the user's explicit Send command. Keep the sheet as
     // live progress/retry UI, but do not require a second confirmation click.
     void this.confirmSend();
@@ -1346,7 +1785,7 @@ export class CatalogBrowser {
   closeSend(): void {
     if (this.#kindleActionBusy()) return;
     this.#activeSendOperation = undefined;
-    this.#set({ pendingBookId: undefined, pendingBook: undefined, sendPhase: undefined, sendProgress: undefined, sendMessage: undefined }, "all");
+    this.#set({ pendingBookId: undefined, pendingBook: undefined, sendPhase: undefined, sendProgress: undefined, sendMessage: undefined, batchTransfer: undefined, bulkActionError: undefined }, "all");
   }
 
   async confirmSend(): Promise<void> {
@@ -1363,7 +1802,7 @@ export class CatalogBrowser {
     }
     const operation = ++this.#sendOperationSequence;
     this.#activeSendOperation = operation;
-    this.#set({ sendBusy: true, sendPhase: "preparing", sendProgress: 0, sendMessage: "Checking the indexed source" }, "all");
+    this.#set({ sendBusy: true, sendPhase: "preparing", sendProgress: 0, sendMessage: "Checking the indexed source", batchTransfer: undefined }, "all");
     try {
       await this.#hooks.onSendRequested({ profileId, book });
       if (this.#activeSendOperation !== operation) return;
@@ -1404,7 +1843,9 @@ export class CatalogBrowser {
       // The awaited hardware hook owns operation lifetime. A controller may
       // publish a terminal presentation update just before its promise settles;
       // keep navigation/close locked until confirmSend observes that settlement.
-      sendBusy: this.#activeSendOperation === undefined ? !terminal : true,
+      sendBusy: this.#snapshot.bulkActionBusy
+        ? true
+        : this.#activeSendOperation === undefined ? !terminal : true,
       sendPhase: update.phase,
       sendProgress: progress,
       sendMessage: update.message,
@@ -1487,7 +1928,12 @@ export class CatalogBrowser {
     }
     if (inventory.completeness !== "last-seen") {
       for (const item of inventory.items.slice(0, 10_000)) {
-        if (item.bookId && item.match !== "unmatched") statuses.set(item.bookId, item.match);
+        if (!item.bookId || item.match === "unmatched") continue;
+        // One exact current copy keeps the book confirmed even when another
+        // device item is an exact prior-presentation removal target.
+        if (item.match === "confirmed" || statuses.get(item.bookId) !== "confirmed") {
+          statuses.set(item.bookId, item.match);
+        }
       }
     }
     const countsByProfile = inventory.completeness === "last-seen"
@@ -1522,6 +1968,83 @@ export class CatalogBrowser {
 
   #kindleActionBusy(): boolean {
     return this.#snapshot.sendBusy || this.#snapshot.bulkActionBusy;
+  }
+
+  async #runMetadataMutation(
+    label: string,
+    request: (signal: AbortSignal) => Promise<CatalogBookMetadataState>,
+    announcement: string,
+    replaceDraft: boolean,
+  ): Promise<void> {
+    const editor = this.#snapshot.metadataEditor;
+    if (!editor || editor.busy) return;
+    this.#metadataEditorOperation?.abort();
+    const operation = createCatalogOperation(label, this.#settingsMutationTimeoutMs);
+    this.#metadataEditorOperation = operation;
+    const epoch = ++this.#metadataEditorEpoch;
+    this.#set({
+      metadataEditor: { ...editor, busy: true, error: undefined },
+    }, "all");
+    try {
+      const data = await operation.wait(request(operation.signal));
+      const current = this.#snapshot.metadataEditor;
+      if (epoch !== this.#metadataEditorEpoch || current?.bookId !== editor.bookId) return;
+      const page = this.#snapshot.page
+        ? {
+            ...this.#snapshot.page,
+            items: this.#snapshot.page.items.map((book) => book.id === data.book.id ? data.book : book),
+          }
+        : undefined;
+      const kindleStatus = new Map(this.#snapshot.kindleStatus);
+      if (kindleStatus.has(data.book.id)) kindleStatus.set(data.book.id, "unknown");
+      const kindleStatusCountsByProfile = new Map(this.#snapshot.kindleStatusCountsByProfile);
+      kindleStatusCountsByProfile.delete(data.book.profileId);
+      this.#set({
+        ...(page === undefined ? {} : { page }),
+        ...(this.#snapshot.pendingBook?.id === data.book.id ? { pendingBook: data.book } : {}),
+        kindleStatus,
+        kindleStatusCountsByProfile,
+        metadataEditor: {
+          ...current,
+          title: data.book.title,
+          data,
+          draftOverrides: replaceDraft ? { ...data.overrides } : current.draftOverrides,
+          busy: false,
+          error: undefined,
+        },
+        announcement,
+      }, "all");
+      void this.#refreshMetadataAffectedCatalog(data.book.profileId);
+    } catch (error) {
+      const current = this.#snapshot.metadataEditor;
+      if (epoch !== this.#metadataEditorEpoch || current?.bookId !== editor.bookId) return;
+      const conflict = error instanceof CatalogApiError && (error.status === 409 || error.status === 412);
+      this.#set({
+        metadataEditor: {
+          ...current,
+          busy: false,
+          error: conflict
+            ? "This book changed after the editor opened. Close and reopen it to load the current source and edits before trying again."
+            : errorMessage(error, `${label} failed.`),
+        },
+      }, "all");
+    } finally {
+      if (this.#metadataEditorOperation === operation) {
+        operation.dispose();
+        this.#metadataEditorOperation = undefined;
+      }
+    }
+  }
+
+  async #refreshMetadataAffectedCatalog(profileId: string): Promise<void> {
+    try {
+      const facets = await this.#api.getFilters(profileId);
+      if (profileId === this.#snapshot.filters.profileId) this.#set({ facets }, "all");
+      if (profileId === this.#snapshot.filters.profileId) await this.reloadBooks(true);
+    } catch {
+      // The successful overlay mutation remains authoritative. The live event
+      // stream and the next ordinary page load will retry derived UI data.
+    }
   }
 
   #bookSourceAvailable(book: CatalogBook): boolean {
@@ -1559,7 +2082,10 @@ export class CatalogBrowser {
       if (
         !item.bookId
         || !requestedBookIds.has(item.bookId)
-        || item.match !== "confirmed"
+        || (
+          item.match !== "confirmed"
+          && !(item.stalePresentation === true && item.managed === true && item.match === "possible")
+        )
         || seenItems.has(item.id)
       ) continue;
       const book = booksById.get(item.bookId);
@@ -1796,6 +2322,13 @@ export class CatalogBrowser {
   }
 
   #scheduleEventRefresh(event: CatalogEvent): void {
+    if (event.type === "delivery.updated" && this.#snapshot.batchTransfer && this.#snapshot.bulkActionBusy) {
+      // The controller's batch finalizer loads one authoritative match index
+      // after the latest verified device inventory. Processing each delivery
+      // hint here would revoke the next book's already-proven absence verdict
+      // and perform the same catalog refresh repeatedly.
+      return;
+    }
     const configurationEvent = /^(?:profile|root)\.(?:created|updated|deleted)$/u.test(event.type);
     const selectedSettingsId = this.#snapshot.settingsLibraryId;
     const selectedSettingsAffected = configurationEvent

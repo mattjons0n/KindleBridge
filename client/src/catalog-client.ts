@@ -2,8 +2,30 @@ import { MAX_BOOK_SOURCE_BYTES } from "./book-limits";
 import {
   MAX_CATALOG_JSON_RESPONSE_BYTES,
   MAX_MATCH_INDEX_RESPONSE_BYTES,
+  MAX_STALE_MANAGED_TOKENS_PER_BOOK,
   METADATA_CLAIM_BITMAP_BASE64_LENGTH,
   METADATA_CLAIM_BITMAP_BYTES,
+} from "../../shared/catalog-contracts.js";
+import type {
+  BookCoverOverride,
+  BookMetadataPatchInput,
+  BookMetadataResetInput,
+  BookMetadataOverrides,
+  CoverImportInput,
+  CoverProvider,
+  CoverSearchCandidate,
+  EditableBookMetadata,
+} from "../../shared/catalog-contracts.js";
+
+export type {
+  BookCoverOverride,
+  BookMetadataPatchInput,
+  BookMetadataResetInput,
+  BookMetadataOverrides,
+  CoverImportInput,
+  CoverProvider,
+  CoverSearchCandidate,
+  EditableBookMetadata,
 } from "../../shared/catalog-contracts.js";
 
 export type CatalogRootStatus =
@@ -79,19 +101,41 @@ export interface CatalogBook {
   readonly publisher?: string;
   readonly publishedAt?: string;
   readonly series?: string;
+  readonly seriesIndex?: number;
+  readonly description?: string;
   readonly subjects: readonly string[];
   readonly identifiers: readonly string[];
   readonly format: CatalogBookFormat;
   readonly size: number;
   readonly contentHash?: string;
+  readonly presentationVersion?: string;
   readonly addedAt: string;
   readonly updatedAt: string;
   readonly metadataComplete: boolean;
   readonly available: boolean;
   readonly coverUrl?: string;
   readonly sourceUrl?: string;
+  readonly metadataEdited?: boolean;
+  readonly coverEdited?: boolean;
+  readonly metadataRevision?: number;
   /** Optional until the browser's Kindle reconciliation layer supplies it. */
   readonly kindleStatus?: CatalogKindleStatus;
+}
+
+export interface CatalogBookMetadataState {
+  readonly book: CatalogBook;
+  readonly sourceMetadata: EditableBookMetadata;
+  readonly sourceCoverUrl: string | null;
+  readonly overrides: BookMetadataOverrides;
+  readonly revision: number;
+  readonly basedOnContentHash: string;
+  readonly sourceChanged: boolean;
+  readonly coverOverride: BookCoverOverride | null;
+}
+
+export interface CatalogCoverSearchResult {
+  readonly provider: CoverProvider;
+  readonly items: readonly CoverSearchCandidate[];
 }
 
 export interface CatalogBookPage {
@@ -217,7 +261,10 @@ export interface CatalogMatchIndexEntry {
   readonly sourceFormat: CatalogBookFormat;
   readonly sourceSize: number;
   readonly contentHash: string;
+  readonly presentationVersion?: string;
   readonly managedToken?: string;
+  /** Exact prior KindleBridge presentation identities; removal-only evidence. */
+  readonly staleManagedTokens?: readonly string[];
   readonly identifiers: readonly string[];
   readonly title: string;
   readonly authors: readonly string[];
@@ -240,6 +287,8 @@ export interface CatalogBookSource {
   readonly blob: Blob;
   readonly contentLength?: number;
   readonly etag?: string;
+  /** Effective source-plus-overlay identity captured by the source response. */
+  readonly presentationVersion?: string;
 }
 
 export interface CatalogApi {
@@ -261,6 +310,48 @@ export interface CatalogApi {
   queryBooks(profileId: string, query?: CatalogBookMatchQuery, signal?: AbortSignal): Promise<CatalogBookPage>;
   getFilters(profileId: string, signal?: AbortSignal): Promise<CatalogFilters>;
   getBook(profileId: string, bookId: string, signal?: AbortSignal): Promise<CatalogBook>;
+  getBookMetadata?(profileId: string, bookId: string, signal?: AbortSignal): Promise<CatalogBookMetadataState>;
+  updateBookMetadata?(
+    profileId: string,
+    bookId: string,
+    input: BookMetadataPatchInput,
+    signal?: AbortSignal,
+  ): Promise<CatalogBookMetadataState>;
+  resetBookMetadata?(
+    profileId: string,
+    bookId: string,
+    input: BookMetadataResetInput,
+    signal?: AbortSignal,
+  ): Promise<CatalogBookMetadataState>;
+  uploadBookCover?(
+    profileId: string,
+    bookId: string,
+    image: Blob,
+    expectedRevision: number,
+    expectedContentHash: string,
+    signal?: AbortSignal,
+  ): Promise<CatalogBookMetadataState>;
+  deleteBookCover?(
+    profileId: string,
+    bookId: string,
+    expectedRevision: number,
+    expectedContentHash: string,
+    signal?: AbortSignal,
+  ): Promise<CatalogBookMetadataState>;
+  searchBookCovers?(
+    profileId: string,
+    bookId: string,
+    provider: CoverProvider,
+    query: string,
+    signal?: AbortSignal,
+  ): Promise<CatalogCoverSearchResult>;
+  importBookCover?(
+    profileId: string,
+    bookId: string,
+    input: CoverImportInput,
+    signal?: AbortSignal,
+  ): Promise<CatalogBookMetadataState>;
+  getBookCover?(profileId: string, bookId: string, signal?: AbortSignal): Promise<Blob>;
   getMatchIndex(profileId: string, signal?: AbortSignal): Promise<CatalogMatchIndex>;
   getBookSource(profileId: string, bookId: string, signal?: AbortSignal): Promise<CatalogBookSource>;
   createDelivery(input: CreateDeliveryInput, idempotencyKey: string, signal?: AbortSignal): Promise<unknown>;
@@ -480,6 +571,14 @@ function stringArray(value: unknown): readonly string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 }
 
+function nullableText(value: unknown): string | null {
+  return typeof value === "string" ? value : null;
+}
+
+function nullableNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
 function rootStatus(value: unknown): CatalogRootStatus {
   const normalized = textValue(value).toLocaleLowerCase().replaceAll("_", "-");
   if (normalized === "healthy" || normalized === "ready") return "available";
@@ -564,21 +663,134 @@ function parseBook(value: unknown): CatalogBook {
     publisher: optionalText(item.publisher),
     publishedAt: optionalText(item.publishedAt),
     series: optionalText(item.series),
+    seriesIndex: typeof item.seriesIndex === "number" && Number.isFinite(item.seriesIndex)
+      ? item.seriesIndex
+      : undefined,
+    description: optionalText(item.description),
     subjects: stringArray(item.subjects),
     identifiers: stringArray(item.identifiers),
     format: textValue(item.format, "EPUB").toLocaleUpperCase(),
     size: numberValue(item.size),
     contentHash: optionalText(item.contentHash),
+    presentationVersion: optionalText(item.presentationVersion),
     addedAt: textValue(item.addedAt),
     updatedAt: textValue(item.updatedAt),
     metadataComplete: booleanValue(item.metadataComplete),
     available: booleanValue(item.available, true),
     coverUrl: optionalText(item.coverUrl),
     sourceUrl: optionalText(item.sourceUrl),
+    metadataEdited: booleanValue(item.metadataEdited),
+    coverEdited: booleanValue(item.coverEdited),
+    metadataRevision: numberValue(item.metadataRevision),
     kindleStatus: ["confirmed", "possible", "not-on-kindle", "unknown"].includes(kindle)
       ? kindle as CatalogKindleStatus
       : undefined,
   };
+}
+
+const EDITABLE_METADATA_FIELDS = [
+  "title",
+  "authors",
+  "authorSort",
+  "language",
+  "publisher",
+  "publishedAt",
+  "series",
+  "seriesIndex",
+  "description",
+  "subjects",
+  "identifiers",
+] as const;
+
+function parseEditableMetadata(value: unknown): EditableBookMetadata {
+  const item = record(value);
+  return {
+    title: textValue(item.title, "Untitled"),
+    authors: [...stringArray(item.authors)],
+    authorSort: nullableText(item.authorSort),
+    language: nullableText(item.language),
+    publisher: nullableText(item.publisher),
+    publishedAt: nullableText(item.publishedAt),
+    series: nullableText(item.series),
+    seriesIndex: nullableNumber(item.seriesIndex),
+    description: nullableText(item.description),
+    subjects: [...stringArray(item.subjects)],
+    identifiers: [...stringArray(item.identifiers)],
+  };
+}
+
+function parseMetadataOverrides(value: unknown): BookMetadataOverrides {
+  const item = record(value);
+  const parsed: Record<string, unknown> = {};
+  for (const field of EDITABLE_METADATA_FIELDS) {
+    if (!Object.hasOwn(item, field)) continue;
+    if (field === "authors" || field === "subjects" || field === "identifiers") {
+      parsed[field] = [...stringArray(item[field])];
+    } else if (field === "seriesIndex") {
+      parsed[field] = nullableNumber(item[field]);
+    } else if (field === "title") {
+      parsed[field] = textValue(item[field], "Untitled");
+    } else {
+      parsed[field] = nullableText(item[field]);
+    }
+  }
+  return parsed as BookMetadataOverrides;
+}
+
+function parseCoverOverride(value: unknown): BookCoverOverride | null {
+  if (value === null || value === undefined) return null;
+  const item = record(value);
+  const mediaType = textValue(item.mediaType);
+  if (!["image/jpeg", "image/png", "image/webp"].includes(mediaType)) return null;
+  const sourceKind = item.sourceKind === "provider" ? "provider" as const : "upload" as const;
+  const provider = item.provider === "google-books" || item.provider === "open-library"
+    ? item.provider
+    : null;
+  return {
+    assetKey: textValue(item.assetKey),
+    mediaType: mediaType as BookCoverOverride["mediaType"],
+    byteLength: numberValue(item.byteLength),
+    width: numberValue(item.width),
+    height: numberValue(item.height),
+    sourceKind,
+    provider,
+    providerReference: nullableText(item.providerReference),
+    sourceUrl: nullableText(item.sourceUrl),
+  };
+}
+
+function parseBookMetadataState(value: unknown): CatalogBookMetadataState {
+  const item = record(value);
+  return {
+    book: parseBook(item.book),
+    sourceMetadata: parseEditableMetadata(item.sourceMetadata),
+    sourceCoverUrl: nullableText(item.sourceCoverUrl),
+    overrides: parseMetadataOverrides(item.overrides),
+    revision: numberValue(item.revision),
+    basedOnContentHash: textValue(item.basedOnContentHash),
+    sourceChanged: booleanValue(item.sourceChanged),
+    coverOverride: parseCoverOverride(item.coverOverride),
+  };
+}
+
+function parseCoverSearchResult(value: unknown): CatalogCoverSearchResult {
+  const item = record(value);
+  const provider = item.provider === "open-library" ? "open-library" as const : "google-books" as const;
+  const items = Array.isArray(item.items) ? item.items.flatMap((entry): CoverSearchCandidate[] => {
+    const candidate = record(entry);
+    const candidateId = textValue(candidate.candidateId);
+    const thumbnailUrl = textValue(candidate.thumbnailUrl);
+    if (!candidateId || !thumbnailUrl) return [];
+    return [{
+      candidateId,
+      title: textValue(candidate.title, "Untitled"),
+      authors: [...stringArray(candidate.authors)],
+      publishedAt: nullableText(candidate.publishedAt),
+      identifiers: [...stringArray(candidate.identifiers)],
+      thumbnailUrl,
+    }];
+  }) : [];
+  return { provider, items };
 }
 
 function filterOptions(value: unknown): readonly CatalogFilterOption[] {
@@ -661,13 +873,18 @@ function parseMatchIndex(value: unknown): CatalogMatchIndex {
         deliveredAt: optionalText(value.deliveredAt),
       };
     }) : [];
+    const staleManagedTokens = stringArray(candidate.staleManagedTokens)
+      .filter((token) => /^kb-[a-f0-9]{20}$/u.test(token))
+      .slice(0, MAX_STALE_MANAGED_TOKENS_PER_BOOK);
     return {
       bookId: textValue(candidate.bookId),
       sourceFilename: textValue(candidate.sourceFilename),
       sourceFormat: textValue(candidate.sourceFormat).toLocaleUpperCase("en-US"),
       sourceSize: numberValue(candidate.sourceSize),
       contentHash: textValue(candidate.contentHash),
+      presentationVersion: optionalText(candidate.presentationVersion),
       managedToken: optionalText(candidate.managedToken),
+      staleManagedTokens,
       identifiers: stringArray(candidate.identifiers),
       title: textValue(candidate.title, "Untitled"),
       authors: stringArray(candidate.authors),
@@ -697,28 +914,56 @@ function eventSourceFactory(url: string): EventStreamLike {
   return new EventSource(url) as unknown as EventStreamLike;
 }
 
-async function boundedSourceBlob(response: Response, signal: AbortSignal): Promise<{ blob: Blob; contentLength?: number }> {
+interface BoundedBlobPolicy {
+  readonly maximumBytes: number;
+  readonly tooLargeCode: string;
+  readonly lengthMissingCode: string;
+  readonly lengthMismatchCode: string;
+  readonly description: string;
+}
+
+const SOURCE_BLOB_POLICY: BoundedBlobPolicy = {
+  maximumBytes: MAX_CATALOG_SOURCE_BYTES,
+  tooLargeCode: "REQUEST_TOO_LARGE",
+  lengthMissingCode: "CATALOG_SOURCE_LENGTH_MISSING",
+  lengthMismatchCode: "CATALOG_SOURCE_LENGTH_MISMATCH",
+  description: "catalog source",
+};
+
+const COVER_BLOB_POLICY: BoundedBlobPolicy = {
+  maximumBytes: 12 * 1024 * 1024,
+  tooLargeCode: "COVER_TOO_LARGE",
+  lengthMissingCode: "CATALOG_COVER_LENGTH_MISSING",
+  lengthMismatchCode: "CATALOG_COVER_LENGTH_MISMATCH",
+  description: "book cover",
+};
+
+async function boundedBlob(
+  response: Response,
+  signal: AbortSignal,
+  policy: BoundedBlobPolicy,
+): Promise<{ blob: Blob; contentLength?: number }> {
   const rawLength = response.headers.get("Content-Length");
   const parsedLength = rawLength === null ? undefined : Number(rawLength);
   const contentLength = parsedLength !== undefined && Number.isSafeInteger(parsedLength) && parsedLength >= 0
     ? parsedLength
     : undefined;
-  if (contentLength !== undefined && contentLength > MAX_CATALOG_SOURCE_BYTES) {
-    cancelResponse(response, "catalog source limit exceeded");
-    throw new CatalogApiError(413, "REQUEST_TOO_LARGE", "The catalog source exceeds the 200 MB limit");
+  if (contentLength !== undefined && contentLength > policy.maximumBytes) {
+    cancelResponse(response, `${policy.description} limit exceeded`);
+    throw new CatalogApiError(413, policy.tooLargeCode, `The ${policy.description} exceeds its safe size limit`);
   }
 
   if (!response.body) {
     // A browser without a readable response body may rely on a trustworthy,
     // already-bounded Content-Length. Refuse an unbounded fallback allocation.
     if (contentLength === undefined) {
-      throw new CatalogApiError(502, "CATALOG_SOURCE_LENGTH_MISSING", "The catalog source length is unavailable");
+      throw new CatalogApiError(502, policy.lengthMissingCode, `The ${policy.description} length is unavailable`);
     }
     const blob = await waitForAbort(response.blob(), signal, {
       onAbort: (reason) => cancelResponse(response, reason),
     });
-    if (blob.size > MAX_CATALOG_SOURCE_BYTES) {
-      throw new CatalogApiError(413, "REQUEST_TOO_LARGE", "The catalog source exceeds the 200 MB limit");
+    if (blob.size > policy.maximumBytes) {
+      throw new CatalogApiError(413, policy.tooLargeCode, `The ${policy.description} exceeds its safe size limit`);
     }
     return { blob, contentLength };
   }
@@ -734,9 +979,9 @@ async function boundedSourceBlob(response: Response, signal: AbortSignal): Promi
       });
       if (result.done) break;
       received += result.value.byteLength;
-      if (received > MAX_CATALOG_SOURCE_BYTES) {
-        cancelReader(reader, "catalog source limit exceeded");
-        throw new CatalogApiError(413, "REQUEST_TOO_LARGE", "The catalog source exceeds the 200 MB limit");
+      if (received > policy.maximumBytes) {
+        cancelReader(reader, `${policy.description} limit exceeded`);
+        throw new CatalogApiError(413, policy.tooLargeCode, `The ${policy.description} exceeds its safe size limit`);
       }
       chunks.push(Uint8Array.from(result.value));
     }
@@ -744,12 +989,16 @@ async function boundedSourceBlob(response: Response, signal: AbortSignal): Promi
     releaseReader(reader);
   }
   if (contentLength !== undefined && received !== contentLength) {
-    throw new CatalogApiError(502, "CATALOG_SOURCE_LENGTH_MISMATCH", "The catalog source length did not match its response headers");
+    throw new CatalogApiError(502, policy.lengthMismatchCode, `The ${policy.description} length did not match its response headers`);
   }
   return {
     blob: new Blob(chunks, { type: response.headers.get("Content-Type") ?? "application/octet-stream" }),
     ...(contentLength === undefined ? {} : { contentLength }),
   };
+}
+
+async function boundedSourceBlob(response: Response, signal: AbortSignal): Promise<{ blob: Blob; contentLength?: number }> {
+  return boundedBlob(response, signal, SOURCE_BLOB_POLICY);
 }
 
 interface BoundedJsonPolicy {
@@ -915,6 +1164,111 @@ export class HttpCatalogClient implements CatalogApi {
     return parseBook(await this.#json(`/profiles/${encodePath(profileId)}/books/${encodePath(bookId)}`, { signal }));
   }
 
+  async getBookMetadata(profileId: string, bookId: string, signal?: AbortSignal): Promise<CatalogBookMetadataState> {
+    return parseBookMetadataState(await this.#json(
+      `/profiles/${encodePath(profileId)}/books/${encodePath(bookId)}/metadata`,
+      { signal },
+    ));
+  }
+
+  async updateBookMetadata(
+    profileId: string,
+    bookId: string,
+    input: BookMetadataPatchInput,
+    signal?: AbortSignal,
+  ): Promise<CatalogBookMetadataState> {
+    return parseBookMetadataState(await this.#json(
+      `/profiles/${encodePath(profileId)}/books/${encodePath(bookId)}/metadata`,
+      this.#write("PATCH", input, signal),
+    ));
+  }
+
+  async resetBookMetadata(
+    profileId: string,
+    bookId: string,
+    input: BookMetadataResetInput,
+    signal?: AbortSignal,
+  ): Promise<CatalogBookMetadataState> {
+    return parseBookMetadataState(await this.#json(
+      `/profiles/${encodePath(profileId)}/books/${encodePath(bookId)}/metadata/reset`,
+      this.#write("POST", input, signal),
+    ));
+  }
+
+  async uploadBookCover(
+    profileId: string,
+    bookId: string,
+    image: Blob,
+    expectedRevision: number,
+    expectedContentHash: string,
+    signal?: AbortSignal,
+  ): Promise<CatalogBookMetadataState> {
+    const params = new URLSearchParams({
+      expectedRevision: String(expectedRevision),
+      expectedContentHash,
+    });
+    return parseBookMetadataState(await this.#json(
+      `/profiles/${encodePath(profileId)}/books/${encodePath(bookId)}/cover?${params.toString()}`,
+      {
+        method: "PUT",
+        signal,
+        headers: { "Content-Type": image.type || "application/octet-stream" },
+        body: image,
+      },
+    ));
+  }
+
+  async deleteBookCover(
+    profileId: string,
+    bookId: string,
+    expectedRevision: number,
+    expectedContentHash: string,
+    signal?: AbortSignal,
+  ): Promise<CatalogBookMetadataState> {
+    const params = new URLSearchParams({
+      expectedRevision: String(expectedRevision),
+      expectedContentHash,
+    });
+    return parseBookMetadataState(await this.#json(
+      `/profiles/${encodePath(profileId)}/books/${encodePath(bookId)}/cover?${params.toString()}`,
+      { method: "DELETE", signal },
+    ));
+  }
+
+  async searchBookCovers(
+    profileId: string,
+    bookId: string,
+    provider: CoverProvider,
+    query: string,
+    signal?: AbortSignal,
+  ): Promise<CatalogCoverSearchResult> {
+    const params = new URLSearchParams({ provider, q: query, limit: "12" });
+    return parseCoverSearchResult(await this.#json(
+      `/profiles/${encodePath(profileId)}/books/${encodePath(bookId)}/cover-search?${params.toString()}`,
+      { signal },
+    ));
+  }
+
+  async importBookCover(
+    profileId: string,
+    bookId: string,
+    input: CoverImportInput,
+    signal?: AbortSignal,
+  ): Promise<CatalogBookMetadataState> {
+    return parseBookMetadataState(await this.#json(
+      `/profiles/${encodePath(profileId)}/books/${encodePath(bookId)}/cover-import`,
+      this.#write("POST", input, signal),
+    ));
+  }
+
+  async getBookCover(profileId: string, bookId: string, signal?: AbortSignal): Promise<Blob> {
+    return this.#consume(
+      `/profiles/${encodePath(profileId)}/books/${encodePath(bookId)}/cover`,
+      { signal },
+      async (response, requestSignal) => (await boundedBlob(response, requestSignal, COVER_BLOB_POLICY)).blob,
+    );
+  }
+
   async getMatchIndex(profileId: string, signal?: AbortSignal): Promise<CatalogMatchIndex> {
     return this.#consume(`/profiles/${encodePath(profileId)}/match-index`, { signal }, async (response, requestSignal) => (
       parseMatchIndex(await boundedJson(response, MATCH_INDEX_JSON_POLICY, requestSignal))
@@ -927,9 +1281,11 @@ export class HttpCatalogClient implements CatalogApi {
       { signal },
       async (response, requestSignal) => {
         const source = await boundedSourceBlob(response, requestSignal);
+        const presentationVersion = response.headers.get("X-Kindle-Bridge-Presentation-Version");
         return {
           ...source,
           ...(response.headers.get("ETag") ? { etag: response.headers.get("ETag")! } : {}),
+          ...(presentationVersion ? { presentationVersion } : {}),
         };
       },
       this.#sourceRequestTimeoutMs,

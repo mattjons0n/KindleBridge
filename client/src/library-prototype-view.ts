@@ -1,5 +1,12 @@
 import type { CatalogBrowserSnapshot } from "./catalog-browser";
-import type { CatalogBook, CatalogFilterOption, CatalogProfile } from "./catalog-client";
+import type {
+  BookMetadataOverrides,
+  CatalogBook,
+  CatalogBookMetadataState,
+  CatalogFilterOption,
+  CatalogProfile,
+  EditableBookMetadata,
+} from "./catalog-client";
 import {
   bookAuthor,
   bookPublishedYear,
@@ -30,6 +37,19 @@ function sameOriginCoverUrl(book: CatalogBook): string | undefined {
     const url = new URL(book.coverUrl, base);
     const origin = new URL(base).origin;
     if (url.origin !== origin || !url.pathname.startsWith("/api/profiles/")) return undefined;
+    return `${url.pathname}${url.search}`;
+  } catch {
+    return undefined;
+  }
+}
+
+function sameOriginMetadataImageUrl(value: string | null | undefined, revision?: number): string | undefined {
+  if (!value) return undefined;
+  try {
+    const base = typeof window === "undefined" ? "http://127.0.0.1" : window.location.href;
+    const url = new URL(value, base);
+    if (url.origin !== new URL(base).origin || !url.pathname.startsWith("/api/profiles/")) return undefined;
+    if (revision !== undefined) url.searchParams.set("v", String(revision));
     return `${url.pathname}${url.search}`;
   } catch {
     return undefined;
@@ -84,7 +104,12 @@ function sourceBookAvailable(book: CatalogBook, snapshot: CatalogBrowserSnapshot
 function hasExactCurrentKindleAssociation(bookId: string, snapshot: CatalogBrowserSnapshot): boolean {
   return snapshot.kindleInventory?.completeness === "complete"
     && snapshot.kindleInventory.matching?.status === "complete"
-    && snapshot.kindleInventory.items.some((item) => item.bookId === bookId && item.match === "confirmed");
+    && snapshot.kindleInventory.items.some((item) => (
+      item.bookId === bookId && (
+        item.match === "confirmed"
+        || (item.stalePresentation === true && item.managed === true && item.match === "possible")
+      )
+    ));
 }
 
 function deviceReadyToRemove(state: AppState, snapshot: CatalogBrowserSnapshot): boolean {
@@ -200,7 +225,7 @@ function renderBookMenu(
       : !exactAssociation
         ? "No exact current Kindle association"
         : "Complete the Kindle safety and inventory checks first";
-  return `<details class="library-book-menu"><summary aria-label="More actions for ${escapeHtml(book.title)}" title="More actions"><span aria-hidden="true">•••</span></summary><div><button type="button" class="danger" data-ui-action="remove-book-from-kindle" data-book-id="${escapeHtml(book.id)}"${canRemove ? "" : ` disabled title="${escapeHtml(unavailableReason)}"`}>Remove from Kindle</button></div></details>`;
+  return `<details class="library-book-menu"><summary aria-label="More actions for ${escapeHtml(book.title)}" title="More actions"><span aria-hidden="true">•••</span></summary><div><button type="button" data-ui-action="edit-book-metadata" data-book-id="${escapeHtml(book.id)}"${kindleActionBusy ? " disabled" : ""}>Edit metadata &amp; cover</button><button type="button" class="danger" data-ui-action="remove-book-from-kindle" data-book-id="${escapeHtml(book.id)}"${canRemove ? "" : ` disabled title="${escapeHtml(unavailableReason)}"`}>Remove from Kindle</button></div></details>`;
 }
 
 function renderBookCard(book: CatalogBook, snapshot: CatalogBrowserSnapshot, state: AppState): string {
@@ -238,7 +263,7 @@ function renderBookCard(book: CatalogBook, snapshot: CatalogBrowserSnapshot, sta
         <h3>${escapeHtml(book.title)}</h3>
         <p>${escapeHtml(bookAuthor(book))}</p>
         <div class="library-book-meta"><span>${escapeHtml(bookPublishedYear(book))}</span><span>${escapeHtml(book.format.toLocaleUpperCase())}</span><span>${escapeHtml(formatCatalogBytes(book.size))}</span></div>
-        <div class="library-tags">${book.subjects.slice(0, 2).map((subject) => `<span>${escapeHtml(subject)}</span>`).join("")}${book.series ? `<span>${escapeHtml(book.series)}</span>` : ""}${status === "possible" ? "<span>Possible Kindle match</span>" : ""}${currentUnknown ? "<span>Kindle presence unknown</span>" : ""}</div>
+        <div class="library-tags">${book.subjects.slice(0, 2).map((subject) => `<span>${escapeHtml(subject)}</span>`).join("")}${book.series ? `<span>${escapeHtml(book.series)}</span>` : ""}${book.metadataEdited ? "<span>Metadata edited</span>" : ""}${book.coverEdited ? "<span>Custom cover</span>" : ""}${status === "possible" ? "<span>Possible Kindle match</span>" : ""}${currentUnknown ? "<span>Kindle presence unknown</span>" : ""}</div>
       </div>
       <div class="library-card-actions"><button type="button" class="library-send-button${confirmed ? " installed" : ""}" data-ui-action="send-book" data-book-id="${escapeHtml(book.id)}"${confirmed || !available || snapshot.sendBusy || snapshot.bulkActionBusy || deviceBlocksSend ? " disabled" : ""}>${sendLabel}</button>${renderBookMenu(book, snapshot, state)}</div>
     </article>
@@ -408,6 +433,21 @@ function renderLibrarySettings(snapshot: CatalogBrowserSnapshot): string {
   `;
 }
 
+function renderBatchTransferBooks(snapshot: CatalogBrowserSnapshot): string {
+  const batch = snapshot.batchTransfer;
+  if (!batch) return "";
+  const verified = batch.verifiedBooks.length === 0
+    ? '<p class="library-batch-empty">No books verified yet.</p>'
+    : `<ul class="library-batch-book-list">${batch.verifiedBooks.map(({ title }) => `<li><span aria-hidden="true">✓</span>${escapeHtml(title)}</li>`).join("")}</ul>`;
+  const failure = batch.failedBook
+    ? `<div class="library-batch-failure"><strong>Failed</strong><span>${escapeHtml(batch.failedBook.title)}</span></div>`
+    : "";
+  const retry = batch.retryBooks.length === 0
+    ? ""
+    : `<div class="library-batch-retry"><strong>Selected for retry</strong><ul>${batch.retryBooks.map(({ title }) => `<li>${escapeHtml(title)}</li>`).join("")}</ul></div>`;
+  return `<div class="library-batch-book-results"><strong>Transferred and verified</strong>${verified}${failure}${retry}</div>`;
+}
+
 function renderSendPreview(state: AppState, snapshot: CatalogBrowserSnapshot): string {
   if (!snapshot.pendingBookId) return "";
   const book = snapshot.pendingBook;
@@ -419,8 +459,15 @@ function renderSendPreview(state: AppState, snapshot: CatalogBrowserSnapshot): s
   const sourceDone = Boolean(phase);
   const derivativeDone = phase === "sending" || phase === "verifying" || phase === "complete";
   const transferDone = phase === "complete";
-  const buttonAction = transferDone ? "close-send" : ready ? "confirm-catalog-send" : "connect-catalog-device";
-  const buttonLabel = transferDone
+  const batch = snapshot.batchTransfer;
+  const batchSucceeded = Boolean(batch && phase === "complete" && batch.verifiedBooks.length === batch.total);
+  const batchFailed = Boolean(batch?.failedBook && phase === "failed");
+  const buttonAction = batchSucceeded || batchFailed || transferDone
+    ? "close-send"
+    : ready ? "confirm-catalog-send" : "connect-catalog-device";
+  const buttonLabel = batchFailed
+    ? `Review ${batch!.retryBooks.length} selected`
+    : batchSucceeded || transferDone
     ? "Done"
     : phase === "failed"
       ? "Try again"
@@ -434,7 +481,32 @@ function renderSendPreview(state: AppState, snapshot: CatalogBrowserSnapshot): s
               ? state.selfTest.kind === "passed" ? "Kindle inventory unavailable" : "Waiting for safe-write test"
               : "Connect Kindle";
   const progress = snapshot.sendProgress;
-  return `<div class="library-modal-backdrop"${snapshot.sendBusy ? "" : ' data-ui-action="close-send"'} aria-hidden="true"></div><section class="library-send-sheet" role="dialog" aria-modal="true" aria-labelledby="send-preview-title" data-send-book-id="${escapeHtml(book.id)}" tabindex="-1"><button type="button" class="library-sheet-close" data-ui-action="close-send" aria-label="Close send dialog"${snapshot.sendBusy ? " disabled" : ""}>×</button><div class="library-sheet-eyebrow">Send to Kindle</div><h2 id="send-preview-title">${escapeHtml(book.title)}</h2><p class="library-sheet-author">${escapeHtml(bookAuthor(book))}</p><div class="library-send-plan"><div class="${sourceDone ? "done" : ""}"><span>1</span><div><strong>Check source</strong><small>${escapeHtml(book.format.toLocaleUpperCase())} · ${escapeHtml(formatCatalogBytes(book.size))}</small></div></div><div class="${derivativeDone ? "done" : phase === "converting" || phase === "validating" ? "active" : ""}"><span>2</span><div><strong>${book.format.toLocaleLowerCase() === "epub" ? "Convert a copy locally" : "Validate Kindle file"}</strong><small>${book.format.toLocaleLowerCase() === "epub" ? "boko WASM → AZW3 personal document" : "BOOKMOBI and cover checks"}</small></div></div><div class="${transferDone ? "done" : phase === "sending" || phase === "verifying" ? "active" : ""}"><span>3</span><div><strong>Send and verify</strong><small>Collision-safe WebUSB/MTP transfer</small></div></div></div>${phase ? `<div class="library-transfer-status${phase === "failed" ? " failed" : ""}" role="status"><strong>${escapeHtml(phase === "complete" ? "Complete" : phase === "failed" ? "Transfer failed" : phase.replace(/^./u, (value) => value.toLocaleUpperCase()))}</strong><span>${escapeHtml(snapshot.sendMessage ?? "Working locally in this browser")}</span>${progress === undefined ? "" : `<div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progress}"><span style="width:${progress}%"></span></div>`}</div>` : ""}<div class="library-original-note"><strong>Original protected</strong><span>The source in the container-mounted library remains unchanged.</span></div><button type="button" class="primary library-confirm-send" data-ui-action="${buttonAction}"${snapshot.sendBusy || connecting || (connected && !ready && !transferDone) ? " disabled" : ""}>${buttonLabel}</button></section>`;
+  const overallProgress = batch
+    ? phase === "failed"
+      ? Math.round(100 * batch.verifiedBooks.length / batch.total)
+      : Math.round(100 * ((batch.position - 1) + (progress ?? 0) / 100) / batch.total)
+    : progress;
+  const heading = batchSucceeded
+    ? "Batch complete"
+    : batchFailed
+      ? `Stopped at “${book.title}”`
+      : book.title;
+  const author = batchSucceeded
+    ? `${batch!.total} selected books`
+    : bookAuthor(book);
+  const statusTitle = batchSucceeded
+    ? "Batch complete"
+    : batchFailed
+      ? "Batch stopped"
+      : phase === "complete"
+        ? batch ? "Verified" : "Complete"
+        : phase === "failed"
+          ? "Transfer failed"
+          : phase?.replace(/^./u, (value) => value.toLocaleUpperCase());
+  const progressDetail = batch && overallProgress !== undefined
+    ? `<small class="library-batch-progress-detail">Overall ${overallProgress}% · Current book ${progress ?? 0}%</small>`
+    : "";
+  return `<div class="library-modal-backdrop"${snapshot.sendBusy ? "" : ' data-ui-action="close-send"'} aria-hidden="true"></div><section class="library-send-sheet" role="dialog" aria-modal="true" aria-labelledby="send-preview-title" data-send-book-id="${escapeHtml(book.id)}" tabindex="-1"><button type="button" class="library-sheet-close" data-ui-action="close-send" aria-label="Close send dialog"${snapshot.sendBusy ? " disabled" : ""}>×</button><div class="library-sheet-eyebrow">${batch ? `Book ${batch.position} of ${batch.total}` : "Send to Kindle"}</div><h2 id="send-preview-title">${escapeHtml(heading)}</h2><p class="library-sheet-author">${escapeHtml(author)}</p><div class="library-send-plan"><div class="${sourceDone ? "done" : ""}"><span>1</span><div><strong>Check source</strong><small>${escapeHtml(book.format.toLocaleUpperCase())} · ${escapeHtml(formatCatalogBytes(book.size))}</small></div></div><div class="${derivativeDone ? "done" : phase === "converting" || phase === "validating" ? "active" : ""}"><span>2</span><div><strong>${book.format.toLocaleLowerCase() === "epub" ? "Convert a copy locally" : "Validate Kindle file"}</strong><small>${book.format.toLocaleLowerCase() === "epub" ? "boko WASM → AZW3 personal document" : "BOOKMOBI and cover checks"}</small></div></div><div class="${transferDone ? "done" : phase === "sending" || phase === "verifying" ? "active" : ""}"><span>3</span><div><strong>Send and verify</strong><small>Collision-safe WebUSB/MTP transfer</small></div></div></div>${phase ? `<div class="library-transfer-status${phase === "failed" ? " failed" : ""}" role="status"><strong>${escapeHtml(statusTitle ?? "Working")}</strong><span>${escapeHtml(snapshot.sendMessage ?? "Working locally in this browser")}</span>${progressDetail}${overallProgress === undefined ? "" : `<div class="progress-track" role="progressbar" aria-label="${batch ? "Overall batch progress" : "Book transfer progress"}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${overallProgress}"><span style="width:${overallProgress}%"></span></div>`}</div>` : ""}${renderBatchTransferBooks(snapshot)}<div class="library-original-note"><strong>Original protected</strong><span>The source in the container-mounted library remains unchanged.</span></div><button type="button" class="primary library-confirm-send" data-ui-action="${buttonAction}"${snapshot.sendBusy || connecting || (connected && !ready && !transferDone && !batchFailed) ? " disabled" : ""}>${buttonLabel}</button></section>`;
 }
 
 function renderRemovalConfirmation(snapshot: CatalogBrowserSnapshot): string {
@@ -451,6 +523,101 @@ function renderRemovalConfirmation(snapshot: CatalogBrowserSnapshot): string {
       ? `Remove ${fileCount === 1 ? "file" : `${fileCount} files`}`
       : "Reconnect to remove";
   return `<div class="library-modal-backdrop" data-ui-action="cancel-remove-from-kindle" aria-hidden="true"></div><section class="library-remove-sheet" role="alertdialog" aria-modal="true" aria-labelledby="remove-kindle-title" aria-describedby="remove-kindle-description" tabindex="-1"><div class="library-sheet-eyebrow">Kindle cleanup</div><h2 id="remove-kindle-title">Remove ${bookCount === 1 ? `“${escapeHtml(request.targets[0]!.title)}”` : `${bookCount} books`} from this Kindle?</h2><p id="remove-kindle-description">This deletes only the ${fileCount} exact matched ${fileCount === 1 ? "file" : "files"} shown below from the connected Kindle. Library originals are not changed.</p>${snapshot.bulkActionError ? `<div class="library-transfer-status failed" role="alert"><strong>Removal did not complete</strong><span>${escapeHtml(snapshot.bulkActionError)}</span></div>` : ""}<ul class="library-remove-targets">${request.targets.map((target) => `<li><span><strong>${escapeHtml(target.title)}</strong><small>${escapeHtml(target.filename)}</small></span><span>${escapeHtml(formatCatalogBytes(target.size))}</span></li>`).join("")}</ul><div class="library-remove-warning" role="note"><strong>This cannot be undone on the Kindle.</strong><span>You can send the library copy again later.</span></div><div class="library-remove-actions"><button type="button" data-ui-action="cancel-remove-from-kindle"${snapshot.bulkActionBusy ? " disabled" : ""}>Cancel</button><button type="button" class="danger" data-ui-action="confirm-remove-from-kindle"${removalLocked ? " disabled" : ""}>${actionLabel}</button></div></section>`;
+}
+
+type MetadataField = keyof EditableBookMetadata;
+
+function metadataValue(value: EditableBookMetadata[MetadataField] | undefined): string {
+  if (Array.isArray(value)) return value.join("\n");
+  return value === null || value === undefined ? "" : String(value);
+}
+
+function metadataSourceSummary(value: EditableBookMetadata[MetadataField]): string {
+  if (Array.isArray(value)) return value.length > 0 ? value.join(" · ") : "Not set";
+  return value === null || value === "" ? "Not set" : String(value);
+}
+
+function renderMetadataField(
+  data: CatalogBookMetadataState,
+  draft: BookMetadataOverrides,
+  field: MetadataField,
+  label: string,
+  kind: "text" | "textarea" | "number" = "text",
+  wide = false,
+): string {
+  const overridden = Object.hasOwn(draft, field);
+  const value = overridden ? draft[field] : data.sourceMetadata[field];
+  const id = `metadata-${field}`;
+  const control = kind === "textarea"
+    ? `<textarea id="${id}" data-metadata-field="${field}" rows="${field === "description" ? 5 : 3}"${overridden ? "" : " disabled"}>${escapeHtml(metadataValue(value))}</textarea>`
+    : `<input id="${id}" data-metadata-field="${field}" type="${kind}"${kind === "number" ? ' min="0" step="any"' : ""} value="${escapeHtml(metadataValue(value))}" autocomplete="off"${overridden ? "" : " disabled"} />`;
+  return `<div class="metadata-field${wide ? " wide" : ""}" data-metadata-field-row="${field}"><div class="metadata-field-head"><label for="${id}">${escapeHtml(label)}</label><label class="metadata-override-toggle"><input type="checkbox" data-metadata-override="${field}"${overridden ? " checked" : ""} /><span>${overridden ? "Override active" : "Use source"}</span></label></div>${control}<small><strong>Source:</strong> ${escapeHtml(metadataSourceSummary(data.sourceMetadata[field]))}</small></div>`;
+}
+
+function renderMetadataCover(label: string, url: string | undefined, fallback: string, edited = false): string {
+  return `<figure class="metadata-cover-preview${edited ? " edited" : ""}">${url ? `<img src="${escapeHtml(url)}" alt="${escapeHtml(label)}" data-metadata-cover-image />` : `<div class="metadata-cover-placeholder" aria-hidden="true">No cover</div>`}<figcaption><strong>${escapeHtml(label)}</strong><span>${escapeHtml(fallback)}</span></figcaption></figure>`;
+}
+
+function renderMetadataCoverSearch(snapshot: CatalogBrowserSnapshot): string {
+  const editor = snapshot.metadataEditor!;
+  const search = editor.coverSearch;
+  if (search.loadState === "loading") {
+    return '<div class="metadata-cover-search-status" role="status">Searching cover providers…</div>';
+  }
+  if (search.loadState === "error") {
+    return `<div class="metadata-cover-search-status error" role="alert">${escapeHtml(search.error ?? "Cover search failed.")}</div>`;
+  }
+  if (search.loadState === "ready" && search.items.length === 0) {
+    return '<div class="metadata-cover-search-status">No covers found. Try title plus author or another provider.</div>';
+  }
+  if (search.items.length === 0) return "";
+  const disabled = editor.busy || !editor.data?.book.contentHash;
+  return `<div class="metadata-cover-results" aria-label="Cover search results">${search.items.map((candidate) => {
+    const thumbnail = sameOriginMetadataImageUrl(candidate.thumbnailUrl);
+    return `<article>${thumbnail ? `<img src="${escapeHtml(thumbnail)}" alt="Cover candidate for ${escapeHtml(candidate.title)}" loading="lazy" data-metadata-cover-image />` : '<div class="metadata-cover-placeholder" aria-hidden="true">No preview</div>'}<div><strong>${escapeHtml(candidate.title)}</strong><small>${escapeHtml(candidate.authors.join(", ") || "Unknown author")}${candidate.publishedAt ? ` · ${escapeHtml(candidate.publishedAt)}` : ""}</small><button type="button" data-ui-action="import-metadata-cover" data-candidate-id="${escapeHtml(candidate.candidateId)}"${disabled || !thumbnail ? " disabled" : ""}>Use this cover</button></div></article>`;
+  }).join("")}</div>`;
+}
+
+function renderMetadataEditor(snapshot: CatalogBrowserSnapshot): string {
+  const editor = snapshot.metadataEditor;
+  if (!editor) return "";
+  const closeDisabled = editor.busy ? " disabled" : "";
+  if (editor.loadState === "loading") {
+    return `<div class="library-modal-backdrop" aria-hidden="true"></div><section class="library-metadata-sheet" role="dialog" aria-modal="true" aria-labelledby="metadata-editor-title" aria-describedby="metadata-editor-description" tabindex="-1"><button type="button" class="library-sheet-close" data-ui-action="close-metadata-editor" aria-label="Close metadata editor"${closeDisabled}>×</button><div class="library-loading-state" role="status"><span aria-hidden="true"></span><strong id="metadata-editor-title">Loading “${escapeHtml(editor.title)}”</strong><small id="metadata-editor-description">Reading source metadata and saved presentation edits</small></div></section>`;
+  }
+  const data = editor.data;
+  if (!data) {
+    return `<div class="library-modal-backdrop" data-ui-action="close-metadata-editor" aria-hidden="true"></div><section class="library-metadata-sheet compact" role="dialog" aria-modal="true" aria-labelledby="metadata-editor-title" tabindex="-1"><button type="button" class="library-sheet-close" data-ui-action="close-metadata-editor" aria-label="Close metadata editor">×</button><div class="library-empty-state library-error-state" role="alert"><span aria-hidden="true">!</span><h2 id="metadata-editor-title">Metadata editor unavailable</h2><p>${escapeHtml(editor.error ?? "The editable metadata could not be loaded.")}</p><button type="button" data-ui-action="close-metadata-editor">Close</button></div></section>`;
+  }
+  const draft = editor.draftOverrides;
+  const currentCoverUrl = sameOriginMetadataImageUrl(data.book.coverUrl, data.revision);
+  const sourceCoverUrl = sameOriginMetadataImageUrl(data.sourceCoverUrl);
+  const activeCustomCover = Boolean(data.coverOverride && !data.sourceChanged);
+  const mutationDisabled = editor.busy || !data.book.contentHash;
+  const formatNotice = data.book.format.toLocaleLowerCase() === "azw3"
+    ? '<div class="metadata-format-note warning" role="note"><strong>AZW3 send limitation</strong><span>These edits update the catalog and its search results, but edited metadata or covers cannot yet be embedded into an AZW3 Send. The AZW3 source remains unchanged.</span></div>'
+    : '<div class="metadata-format-note" role="note"><strong>Applied on Send</strong><span>For EPUB, Kindle Bridge embeds these edits in a temporary browser-created derivative. The source EPUB remains byte-for-byte unchanged.</span></div>';
+  const fields = [
+    renderMetadataField(data, draft, "title", "Title"),
+    renderMetadataField(data, draft, "authors", "Authors (one per line)", "textarea"),
+    renderMetadataField(data, draft, "authorSort", "Author sort"),
+    renderMetadataField(data, draft, "language", "Language"),
+    renderMetadataField(data, draft, "publisher", "Publisher"),
+    renderMetadataField(data, draft, "publishedAt", "Published date"),
+    renderMetadataField(data, draft, "series", "Series"),
+    renderMetadataField(data, draft, "seriesIndex", "Series number", "number"),
+    renderMetadataField(data, draft, "description", "Description", "textarea", true),
+    renderMetadataField(data, draft, "subjects", "Subjects (one per line)", "textarea", true),
+    renderMetadataField(data, draft, "identifiers", "Identifiers (one per line)", "textarea", true),
+  ].join("");
+  return `<div class="library-modal-backdrop"${editor.busy ? "" : ' data-ui-action="close-metadata-editor"'} aria-hidden="true"></div><section class="library-metadata-sheet" role="dialog" aria-modal="true" aria-labelledby="metadata-editor-title" aria-describedby="metadata-editor-description" tabindex="-1">
+    <button type="button" class="library-sheet-close" data-ui-action="close-metadata-editor" aria-label="Close metadata editor"${closeDisabled}>×</button>
+    <header class="metadata-editor-head"><div><div class="library-sheet-eyebrow">Presentation overlay</div><h2 id="metadata-editor-title">Edit metadata &amp; cover</h2><p id="metadata-editor-description">Change how “${escapeHtml(data.book.title)}” appears in Kindle Bridge and future browser-created transfers.</p></div><span class="metadata-revision-chip">Revision ${data.revision}</span></header>
+    ${editor.error ? `<div class="metadata-editor-error" role="alert"><strong>Changes were not saved</strong><span>${escapeHtml(editor.error)}</span></div>` : ""}
+    ${data.sourceChanged ? '<div class="metadata-editor-rebase" role="status"><strong>The read-only source changed</strong><span>The prior metadata and custom cover are retained but inactive. Saving now will explicitly rebase your chosen overrides and saved cover onto this current source version.</span></div>' : ""}
+    <div class="metadata-editor-body"><section class="metadata-fields-panel" aria-labelledby="metadata-fields-title"><div class="metadata-section-head"><div><h3 id="metadata-fields-title">Book details</h3><p>Turn on an override only for fields Kindle Bridge should replace.</p></div><span>${Object.keys(draft).length} overridden</span></div><form class="metadata-editor-form" data-metadata-book-id="${escapeHtml(editor.bookId)}" novalidate>${fields}</form><div class="metadata-panel-actions"><button type="button" data-ui-action="reset-book-metadata"${mutationDisabled || Object.keys(data.overrides).length === 0 ? " disabled" : ""}>Reset metadata</button><button type="button" class="primary" data-ui-action="save-book-metadata"${mutationDisabled ? " disabled" : ""}>${editor.busy ? "Saving…" : "Save metadata"}</button></div></section>
+    <section class="metadata-cover-panel" aria-labelledby="metadata-cover-title"><div class="metadata-section-head"><div><h3 id="metadata-cover-title">Cover</h3><p>Current presentation beside the cover read from the source.</p></div>${activeCustomCover ? '<span>Custom</span>' : data.coverOverride ? '<span>Saved for prior source</span>' : '<span>Source</span>'}</div><div class="metadata-cover-comparison">${renderMetadataCover("Current cover", currentCoverUrl, activeCustomCover && data.coverOverride ? `${data.coverOverride.width} × ${data.coverOverride.height} · custom` : data.coverOverride ? "Source cover · saved custom cover is inactive" : "From source", activeCustomCover)}${renderMetadataCover("Source cover", sourceCoverUrl, "Read-only original")}</div><div class="metadata-cover-local"><label class="metadata-file-button"><input type="file" accept="image/jpeg,image/png,image/webp" data-ui-action="upload-metadata-cover"${mutationDisabled ? " disabled" : ""} /><span>Choose image…</span></label><div class="metadata-cover-dropzone" data-metadata-cover-dropzone tabindex="${mutationDisabled ? "-1" : "0"}" role="button" aria-disabled="${mutationDisabled}" aria-label="Drop or paste a cover image"><strong>Drop an image here</strong><span>or focus this area and paste a copied image</span><small>JPEG, PNG, or WebP · up to 12 MiB</small></div>${data.coverOverride ? `<button type="button" data-ui-action="reset-book-cover"${mutationDisabled ? " disabled" : ""}>Use source cover</button>` : ""}</div><div class="metadata-cover-search"><div class="metadata-cover-search-controls"><label><span>Provider</span><select id="metadata-cover-provider"${editor.busy ? " disabled" : ""}><option value="google-books"${editor.coverSearch.provider === "google-books" ? " selected" : ""}>Google Books</option><option value="open-library"${editor.coverSearch.provider === "open-library" ? " selected" : ""}>Open Library</option></select></label><label><span>Title, author, or ISBN</span><input id="metadata-cover-query" value="${escapeHtml(editor.coverSearch.query)}" autocomplete="off"${editor.busy ? " disabled" : ""} /></label><button type="button" data-ui-action="search-metadata-covers"${editor.busy || !editor.coverSearch.query.trim() ? " disabled" : ""}>Search</button></div>${renderMetadataCoverSearch(snapshot)}</div></section></div>
+    ${formatNotice}<div class="metadata-existing-copy-note" role="note"><strong>Existing Kindle copies are not rewritten.</strong><span>To apply edits to a book already on the Kindle, remove that Kindle copy and send the edited presentation again.</span></div><footer class="metadata-editor-footer"><span>Overrides and custom covers are stored under durable <code>/data</code>; torrent/source files stay untouched.</span><button type="button" data-ui-action="close-metadata-editor"${closeDisabled}>Done</button></footer></section>`;
 }
 
 export function renderKindleDeviceContents(
@@ -488,6 +655,8 @@ export function renderKindleDeviceContents(
       ? item.match === "unmatched" ? "Last seen unmatched" : "Last seen match"
       : item.match === "confirmed"
         ? "✓ In library"
+        : item.stalePresentation
+          ? "Prior Kindle Bridge presentation"
         : item.match === "possible"
           ? "Possible match"
           : item.managed
@@ -631,5 +800,5 @@ export function renderLibraryPrototype(
   return `<header class="library-topbar"><a class="library-brand" href="#library" aria-label="Kindle Bridge library home"><span class="library-brand-mark" aria-hidden="true">K</span><span><strong>Kindle Bridge</strong><small>Home library</small></span></a><div class="library-topbar-status" data-status="${source.tone}"><span class="library-source-dot"></span><span>${escapeHtml(source.title)}</span><small>${escapeHtml(source.detail)}</small></div><button type="button" class="library-device-button${connected ? " connected" : ""}" data-ui-action="${connected ? "show-kindle" : "connect-catalog-device"}"${connecting || disconnecting ? " disabled" : ""}><span class="library-device-icon" aria-hidden="true">▯</span><span><strong>${deviceTitle}</strong><small>${deviceDetail}</small></span></button></header>
     ${topAlertsHtml ? `<div class="library-global-alerts">${topAlertsHtml}</div>` : ""}
     <div class="library-layout"><aside class="library-sidebar" aria-label="Library profiles and views"><div class="library-sidebar-label">Household</div><div class="library-profile-list">${renderProfileRail(snapshot)}</div><div class="library-sidebar-label library-views-label">Browse</div><nav class="library-nav" aria-label="Library views">${renderLibraryNav(snapshot)}</nav><div class="library-source-card"><div class="library-source-card-head"><span class="library-source-icon" aria-hidden="true">⇄</span><span><strong>Container folders</strong><small>${sourceCardDetail}</small></span></div><div class="library-source-progress"><span style="width:${enabledRoots.length ? Math.round(100 * (profile?.availableRootCount ?? 0) / enabledRoots.length) : 0}%"></span></div><p><span>${profile?.bookCount ?? 0} indexed</span><span>${profile ? `${profile.availableRootCount}/${enabledRoots.length} enabled available · ${profile.rootCount} configured` : "Not configured"}</span></p></div><p class="library-profile-note">No sign-in required. Profiles organize views; they are not access controls.</p></aside>
-    <main class="library-main" id="library">${snapshot.loadState === "error" && snapshot.profiles.length === 0 ? `<div class="library-empty-state library-error-state" role="alert"><span aria-hidden="true">!</span><h1>Catalog service unavailable</h1><p>${escapeHtml(snapshot.error ?? "Kindle Bridge could not reach its catalog service.")}</p><button type="button" data-ui-action="retry-catalog">Try again</button></div>` : snapshot.filters.view === "settings" ? renderLibrarySettings(snapshot) : `<section class="library-hero" aria-labelledby="library-heading"><div><div class="library-eyebrow">${escapeHtml(profile?.description ?? "Household collection")}</div><h1 id="library-heading">${escapeHtml(heading)}</h1><p>${profile?.bookCount ?? 0} books from <strong>${escapeHtml(profile?.sourceLabel ?? "configured sources")}</strong></p></div><div class="library-stat-row" aria-label="Library summary"><span><strong>${counts.onKindle}</strong> matched here</span><span><strong>${counts.possible}</strong> possible</span><span>${sendSummary}</span></div></section>${snapshot.filters.view === "on-kindle" ? `<section class="library-kindle-summary" aria-label="Kindle summary"><span class="library-kindle-summary-icon" aria-hidden="true">▯</span><div><strong>${disconnecting ? "Disconnecting Kindle" : connected ? "Connected Kindle" : "Kindle not connected"}</strong><span>${kindleSummaryDetail}</span></div><div class="library-kindle-summary-stats"><span><strong>${counts.onKindle}</strong> confirmed</span><span><strong>${counts.possible}</strong> possible</span></div>${kindleConnectionButton}</section>` : ""}${renderToolbar(snapshot)}<section class="library-results" aria-live="polite">${renderLibraryResults(state, snapshot)}</section>${snapshot.filters.view === "on-kindle" ? renderKindleDeviceContents(snapshot, connected, state.catalogInventoryState) : ""}`}${snapshot.announcement ? `<div class="library-toast" role="status"><span class="library-toast-check">✓</span><span>${escapeHtml(snapshot.announcement)}</span><button type="button" data-ui-action="dismiss-announcement" aria-label="Dismiss notification">×</button></div>` : ""}${renderSendPreview(state, snapshot)}${renderRemovalConfirmation(snapshot)}</main></div>`;
+    <main class="library-main" id="library">${snapshot.loadState === "error" && snapshot.profiles.length === 0 ? `<div class="library-empty-state library-error-state" role="alert"><span aria-hidden="true">!</span><h1>Catalog service unavailable</h1><p>${escapeHtml(snapshot.error ?? "Kindle Bridge could not reach its catalog service.")}</p><button type="button" data-ui-action="retry-catalog">Try again</button></div>` : snapshot.filters.view === "settings" ? renderLibrarySettings(snapshot) : `<section class="library-hero" aria-labelledby="library-heading"><div><div class="library-eyebrow">${escapeHtml(profile?.description ?? "Household collection")}</div><h1 id="library-heading">${escapeHtml(heading)}</h1><p>${profile?.bookCount ?? 0} books from <strong>${escapeHtml(profile?.sourceLabel ?? "configured sources")}</strong></p></div><div class="library-stat-row" aria-label="Library summary"><span><strong>${counts.onKindle}</strong> matched here</span><span><strong>${counts.possible}</strong> possible</span><span>${sendSummary}</span></div></section>${snapshot.filters.view === "on-kindle" ? `<section class="library-kindle-summary" aria-label="Kindle summary"><span class="library-kindle-summary-icon" aria-hidden="true">▯</span><div><strong>${disconnecting ? "Disconnecting Kindle" : connected ? "Connected Kindle" : "Kindle not connected"}</strong><span>${kindleSummaryDetail}</span></div><div class="library-kindle-summary-stats"><span><strong>${counts.onKindle}</strong> confirmed</span><span><strong>${counts.possible}</strong> possible</span></div>${kindleConnectionButton}</section>` : ""}${renderToolbar(snapshot)}<section class="library-results" aria-live="polite">${renderLibraryResults(state, snapshot)}</section>${snapshot.filters.view === "on-kindle" ? renderKindleDeviceContents(snapshot, connected, state.catalogInventoryState) : ""}`}${snapshot.announcement ? `<div class="library-toast" role="status"><span class="library-toast-check">✓</span><span>${escapeHtml(snapshot.announcement)}</span><button type="button" data-ui-action="dismiss-announcement" aria-label="Dismiss notification">×</button></div>` : ""}${renderSendPreview(state, snapshot)}${renderRemovalConfirmation(snapshot)}${renderMetadataEditor(snapshot)}</main></div>`;
 }

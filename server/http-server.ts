@@ -11,9 +11,13 @@ import {
   MAX_MATCH_INDEX_DELIVERIES,
   MAX_MATCH_INDEX_ENTRIES,
   MAX_MATCH_INDEX_RESPONSE_BYTES,
+  type BookMetadataPatchInput,
+  type BookMetadataResetInput,
   type BookSetQuery,
   type CatalogSort,
   type CatalogStatus,
+  type CoverImportInput,
+  type CoverProvider,
   type DeliveryInput,
   type DeliveryStatus,
   type ProfileConfigurationInput,
@@ -24,9 +28,15 @@ import { DEFAULT_METADATA_LIMITS } from "./book-metadata.js";
 import { CatalogDatabase, CatalogDatabaseError } from "./catalog-database.js";
 import { CatalogIndexer } from "./catalog-indexer.js";
 import { CoverCache, CoverCacheError } from "./cover-cache.js";
+import { CoverProviderClient, CoverProviderError } from "./cover-providers.js";
 import { CatalogEventHub } from "./event-hub.js";
 import { AllowedRootPolicy, RootPolicyError } from "./root-policy.js";
 import { isFatalSqliteError } from "./sqlite-health.js";
+import {
+  MAX_METADATA_COVER_BYTES,
+  MetadataCoverStore,
+  MetadataCoverStoreError,
+} from "./metadata-cover-store.js";
 
 export interface CatalogHttpOptions {
   hostname: string;
@@ -49,6 +59,8 @@ export interface CatalogHttpOptions {
   settingsValidationTimeoutMs: number;
   shutdownDrainTimeoutMs: number;
   settingsMode: "read-write" | "read-only";
+  googleBooksApiKey?: string;
+  coverProviderTimeoutMs: number;
   staticDirectory?: string;
 }
 
@@ -73,6 +85,7 @@ const DEFAULT_OPTIONS: Readonly<CatalogHttpOptions> = {
   settingsValidationTimeoutMs: 10_000,
   shutdownDrainTimeoutMs: 20_000,
   settingsMode: "read-write",
+  coverProviderTimeoutMs: 12_000,
 };
 
 class HttpError extends Error {
@@ -152,6 +165,7 @@ export class CatalogHttpServer {
   private readonly immediateShutdownAbort = new AbortController();
   private readonly activeRequestWaiters = new Set<() => void>();
   private readonly rateWindows = new Map<string, { startedAt: number; count: number }>();
+  private readonly coverProviders: CoverProviderClient;
 
   constructor(
     private readonly database: CatalogDatabase,
@@ -160,6 +174,7 @@ export class CatalogHttpServer {
     private readonly coverCache: CoverCache,
     private readonly events: CatalogEventHub,
     options: Partial<CatalogHttpOptions> = {},
+    private readonly metadataCoverStore?: MetadataCoverStore,
   ) {
     this.options = { ...DEFAULT_OPTIONS, ...options };
     if (!Number.isSafeInteger(this.options.settingsValidationTimeoutMs) || this.options.settingsValidationTimeoutMs <= 0) {
@@ -171,6 +186,14 @@ export class CatalogHttpServer {
     if (!Number.isSafeInteger(this.options.coverResponseTimeoutMs) || this.options.coverResponseTimeoutMs <= 0) {
       throw new RangeError("Cover response timeout must be a positive integer.");
     }
+    if (!Number.isSafeInteger(this.options.coverProviderTimeoutMs) || this.options.coverProviderTimeoutMs <= 0) {
+      throw new RangeError("Cover provider timeout must be a positive integer.");
+    }
+    this.coverProviders = new CoverProviderClient(
+      fetch,
+      this.options.googleBooksApiKey,
+      this.options.coverProviderTimeoutMs,
+    );
     this.server = createServer((request, response) => void this.handle(request, response));
     this.server.requestTimeout = 30_000;
     this.server.headersTimeout = 10_000;
@@ -455,6 +478,7 @@ export class CatalogHttpServer {
         const deleted = this.database.deleteProfile(profileId);
         if (deleted) {
           this.indexer.pruneInactiveRoots();
+          await this.pruneMetadataCoverAssets();
           this.events.publish({ type: "profile.deleted", profileId });
         }
         response.writeHead(204).end();
@@ -579,6 +603,7 @@ export class CatalogHttpServer {
         this.assertSettingsWritable();
         if (!this.database.deleteRoot(profileId, rootId)) throw new HttpError(404, "not_found", "Source root not found.");
         this.indexer.pruneInactiveRoots();
+        await this.pruneMetadataCoverAssets();
         this.events.publish({ type: "root.deleted", profileId, rootId });
         response.writeHead(204).end();
         return;
@@ -643,8 +668,48 @@ export class CatalogHttpServer {
         }
         return;
       }
+      if (segments.length === 2 && segments[1] === "metadata" && method === "GET") {
+        const state = this.database.getBookMetadataState(profileId, bookId);
+        if (!state) throw new HttpError(404, "not_found", "Book not found.");
+        sendJson(response, 200, state, this.options.maxCatalogJsonResponseBytes);
+        return;
+      }
+      if (segments.length === 2 && segments[1] === "metadata" && method === "PATCH") {
+        const input = validateBookMetadataPatch(await readJson(request, this.options.maxJsonBodyBytes));
+        const state = this.database.patchBookMetadata(profileId, bookId, input);
+        this.events.publish({ type: "book.updated", profileId, bookId, data: { metadataEdited: true } });
+        sendJson(response, 200, state, this.options.maxCatalogJsonResponseBytes);
+        return;
+      }
+      if (segments.length === 3 && segments[1] === "metadata" && segments[2] === "reset" && method === "POST") {
+        const input = validateBookMetadataReset(await readJson(request, this.options.maxJsonBodyBytes));
+        const state = this.database.resetBookMetadata(profileId, bookId, input);
+        this.events.publish({ type: "book.updated", profileId, bookId, data: { metadataEdited: state.book.metadataEdited } });
+        sendJson(response, 200, state, this.options.maxCatalogJsonResponseBytes);
+        return;
+      }
       if (segments.length === 2 && segments[1] === "cover" && method === "GET") {
-        await this.serveCover(request, response, profileId, bookId);
+        await this.serveCover(request, response, profileId, bookId, url.searchParams.get("source") === "true");
+        return;
+      }
+      if (segments.length === 2 && segments[1] === "cover" && method === "PUT") {
+        await this.replaceBookCover(request, response, url, profileId, bookId);
+        return;
+      }
+      if (segments.length === 2 && segments[1] === "cover" && method === "DELETE") {
+        await this.resetBookCover(response, url, profileId, bookId);
+        return;
+      }
+      if (segments.length === 2 && segments[1] === "cover-search" && method === "GET") {
+        await this.searchBookCovers(response, url, profileId, bookId);
+        return;
+      }
+      if (segments.length === 2 && segments[1] === "cover-preview" && method === "GET") {
+        await this.serveProviderCoverPreview(response, url, profileId, bookId);
+        return;
+      }
+      if (segments.length === 2 && segments[1] === "cover-import" && method === "POST") {
+        await this.importBookCover(request, response, profileId, bookId);
         return;
       }
       if (segments.length === 2 && segments[1] === "source" && method === "GET") {
@@ -660,6 +725,7 @@ export class CatalogHttpServer {
     response: ServerResponse,
     profileId: string,
     bookId: string,
+    sourceOnly = false,
   ): Promise<void> {
     const releaseLargeResponse = await this.acquireBufferedResponse(response);
     const clientAbort = new AbortController();
@@ -690,12 +756,23 @@ export class CatalogHttpServer {
     try {
       throwIfCoverResponseAborted(signal);
       const source = this.database.getBookSource(profileId, bookId);
-      if (!source?.coverKey || !source.coverMediaType) throw new HttpError(404, "cover_not_found", "Cover not found.");
+      const coverKey = sourceOnly ? source?.sourceCoverKey : source?.coverKey;
+      const coverMediaType = sourceOnly ? source?.sourceCoverMediaType : source?.coverMediaType;
+      const coverStorage = sourceOnly ? "cache" : source?.coverStorage;
+      if (!source || !coverKey || !coverMediaType) throw new HttpError(404, "cover_not_found", "Cover not found.");
       let data: Buffer;
       try {
-        data = await abortableCoverResponseOperation(this.coverCache.read(source.coverKey), signal);
+        data = await abortableCoverResponseOperation(
+          coverStorage === "override"
+            ? this.requireMetadataCoverStore().read(coverKey)
+            : this.coverCache.read(coverKey),
+          signal,
+        );
       } catch (error) {
         rethrowCoverResponseAbort(error, signal);
+        if (coverStorage === "override") {
+          throw new HttpError(404, "cover_asset_missing", "The selected cover is unavailable.");
+        }
         this.setOperationalState("cache", "error");
         this.indexer.requestRescan(source.book.rootId);
         throw new HttpError(404, "cover_cache_miss", "Cover is being rebuilt.");
@@ -703,10 +780,10 @@ export class CatalogHttpServer {
       throwIfCoverResponseAborted(signal);
       this.setOperationalState("cache", "ready");
       response.writeHead(200, {
-        "Content-Type": source.coverMediaType,
+        "Content-Type": coverMediaType,
         "Content-Length": data.length,
         "Cache-Control": "private, max-age=86400, immutable",
-        ETag: `"${source.coverKey}"`,
+        ETag: `"${coverKey}"`,
       });
       response.end(data);
     } catch (error) {
@@ -718,6 +795,158 @@ export class CatalogHttpServer {
       response.off("close", clientDisconnected);
       request.socket.off("close", clientDisconnected);
     }
+  }
+
+  private async replaceBookCover(
+    request: IncomingMessage,
+    response: ServerResponse,
+    url: URL,
+    profileId: string,
+    bookId: string,
+  ): Promise<void> {
+    const concurrency = coverConcurrencyFromSearchParams(url.searchParams);
+    const mediaType = imageContentType(request);
+    const data = await readBoundedBody(request, MAX_METADATA_COVER_BYTES);
+    const store = this.requireMetadataCoverStore();
+    const stored = await store.store(data, mediaType);
+    try {
+      const result = this.database.setBookCover(profileId, bookId, concurrency.expectedRevision, concurrency.expectedContentHash, {
+        ...stored,
+        sourceKind: "upload",
+        provider: null,
+        providerReference: null,
+        sourceUrl: null,
+      });
+      if (result.unreferencedAssetKey) {
+        await this.retireMetadataCoverAssetBestEffort(result.unreferencedAssetKey);
+      }
+      this.events.publish({ type: "book.updated", profileId, bookId, data: { coverEdited: true } });
+      sendJson(response, 200, result.state, this.options.maxCatalogJsonResponseBytes);
+    } catch (error) {
+      await store.removeIfUnreferenced(stored.assetKey, this.database.isMetadataCoverReferenced(stored.assetKey)).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  private async resetBookCover(response: ServerResponse, url: URL, profileId: string, bookId: string): Promise<void> {
+    const concurrency = coverConcurrencyFromSearchParams(url.searchParams);
+    const result = this.database.resetBookCover(
+      profileId,
+      bookId,
+      concurrency.expectedRevision,
+      concurrency.expectedContentHash,
+    );
+    if (result.unreferencedAssetKey) {
+      await this.retireMetadataCoverAssetBestEffort(result.unreferencedAssetKey);
+    }
+    this.events.publish({ type: "book.updated", profileId, bookId, data: { coverEdited: false } });
+    sendJson(response, 200, result.state, this.options.maxCatalogJsonResponseBytes);
+  }
+
+  private async searchBookCovers(
+    response: ServerResponse,
+    url: URL,
+    profileId: string,
+    bookId: string,
+  ): Promise<void> {
+    if (!this.database.getBook(profileId, bookId)) throw new HttpError(404, "not_found", "Book not found.");
+    const provider = coverProvider(url.searchParams.get("provider"));
+    const query = requiredString(url.searchParams.get("q"), "q", 500);
+    const rawLimit = url.searchParams.get("limit");
+    const limit = rawLimit === null ? 12 : boundedInteger(rawLimit, "limit", 1, 20);
+    const candidates = await this.coverProviders.search(provider, query, limit);
+    const prefix = `/api/profiles/${encodeURIComponent(profileId)}/books/${encodeURIComponent(bookId)}/cover-preview`;
+    sendJson(response, 200, {
+      provider,
+      items: candidates.map((candidate) => ({
+        ...candidate,
+        thumbnailUrl: `${prefix}?provider=${encodeURIComponent(provider)}&candidateId=${encodeURIComponent(candidate.candidateId)}`,
+      })),
+    }, this.options.maxCatalogJsonResponseBytes);
+  }
+
+  private async serveProviderCoverPreview(
+    response: ServerResponse,
+    url: URL,
+    profileId: string,
+    bookId: string,
+  ): Promise<void> {
+    if (!this.database.getBook(profileId, bookId)) throw new HttpError(404, "not_found", "Book not found.");
+    const provider = coverProvider(url.searchParams.get("provider"));
+    const candidateId = requiredString(url.searchParams.get("candidateId"), "candidateId", 160);
+    const releaseLargeResponse = await this.acquireBufferedResponse(response);
+    try {
+      const cover = await this.coverProviders.fetchCover(provider, candidateId);
+      response.writeHead(200, {
+        "Content-Type": cover.mediaType,
+        "Content-Length": cover.data.length,
+        "Cache-Control": "private, max-age=600",
+        "X-Content-Type-Options": "nosniff",
+      });
+      response.end(cover.data);
+    } catch (error) {
+      releaseLargeResponse();
+      throw error;
+    }
+  }
+
+  private async importBookCover(
+    request: IncomingMessage,
+    response: ServerResponse,
+    profileId: string,
+    bookId: string,
+  ): Promise<void> {
+    const input = validateCoverImport(await readJson(request, this.options.maxJsonBodyBytes));
+    const remote = await this.coverProviders.fetchCover(input.provider, input.candidateId);
+    const store = this.requireMetadataCoverStore();
+    const stored = await store.store(remote.data, remote.mediaType);
+    try {
+      const result = this.database.setBookCover(profileId, bookId, input.expectedRevision, input.expectedContentHash, {
+        ...stored,
+        sourceKind: "provider",
+        provider: input.provider,
+        providerReference: input.candidateId,
+        sourceUrl: remote.sourceUrl,
+      });
+      if (result.unreferencedAssetKey) {
+        await this.retireMetadataCoverAssetBestEffort(result.unreferencedAssetKey);
+      }
+      this.events.publish({ type: "book.updated", profileId, bookId, data: { coverEdited: true } });
+      sendJson(response, 200, result.state, this.options.maxCatalogJsonResponseBytes);
+    } catch (error) {
+      await store.removeIfUnreferenced(stored.assetKey, this.database.isMetadataCoverReferenced(stored.assetKey)).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  private requireMetadataCoverStore(): MetadataCoverStore {
+    if (!this.metadataCoverStore) {
+      throw new HttpError(503, "metadata_cover_unavailable", "Durable metadata-cover storage is unavailable.");
+    }
+    return this.metadataCoverStore;
+  }
+
+  private async retireMetadataCoverAssetBestEffort(assetKey: string): Promise<void> {
+    try {
+      const store = this.requireMetadataCoverStore();
+      await store.removeIfUnreferenced(assetKey, this.database.isMetadataCoverReferenced(assetKey));
+      this.database.pruneUnreferencedMetadataCoverAssetRows();
+    } catch {
+      // The user-visible mutation already committed. Startup and periodic
+      // pruning safely retry orphan cleanup; never misreport that commit as a
+      // failed mutation and invite a stale-revision retry.
+    }
+  }
+
+  private async pruneMetadataCoverAssets(): Promise<void> {
+    if (!this.metadataCoverStore) return;
+    this.database.pruneUnreferencedMetadataCoverAssetRows();
+    await this.metadataCoverStore
+      .pruneOrphans(
+        this.database.referencedMetadataCoverKeys(),
+        (assetKey) => this.database.isMetadataCoverReferenced(assetKey),
+      )
+      .catch(() => undefined);
   }
 
   private async serveSource(
@@ -911,6 +1140,7 @@ export class CatalogHttpServer {
         "Content-Disposition": sourceContentDisposition(source.book.sourceFilename),
         "Cache-Control": "private, no-store",
         ETag: `"sha256-${source.book.contentHash}"`,
+        "X-Kindle-Bridge-Presentation-Version": source.book.presentationVersion,
       });
       await abortableSourceOperation(
         pipeline(
@@ -1420,6 +1650,146 @@ function validateDelivery(value: unknown): DeliveryInput {
   };
 }
 
+const EDITABLE_METADATA_FIELDS = [
+  "title",
+  "authors",
+  "authorSort",
+  "language",
+  "publisher",
+  "publishedAt",
+  "series",
+  "seriesIndex",
+  "description",
+  "subjects",
+  "identifiers",
+] as const;
+
+function validateBookMetadataPatch(value: unknown): BookMetadataPatchInput {
+  const object = objectValue(value);
+  const changesValue = objectValue(object.changes);
+  const allowed = new Set<string>(EDITABLE_METADATA_FIELDS);
+  for (const field of Object.keys(changesValue)) {
+    if (!allowed.has(field)) throw new HttpError(400, "invalid_request", `Metadata field ${field} is not editable.`);
+  }
+  const changes: BookMetadataPatchInput["changes"] = {};
+  if (Object.hasOwn(changesValue, "title")) changes.title = requiredMetadataString(changesValue.title, "title", 500);
+  if (Object.hasOwn(changesValue, "authors")) changes.authors = metadataStringArray(changesValue.authors, "authors", 100, 300);
+  if (Object.hasOwn(changesValue, "authorSort")) changes.authorSort = metadataNullableString(changesValue.authorSort, "authorSort", 500);
+  if (Object.hasOwn(changesValue, "language")) changes.language = metadataNullableString(changesValue.language, "language", 64);
+  if (Object.hasOwn(changesValue, "publisher")) changes.publisher = metadataNullableString(changesValue.publisher, "publisher", 500);
+  if (Object.hasOwn(changesValue, "publishedAt")) changes.publishedAt = metadataNullableString(changesValue.publishedAt, "publishedAt", 64);
+  if (Object.hasOwn(changesValue, "series")) changes.series = metadataNullableString(changesValue.series, "series", 500);
+  if (Object.hasOwn(changesValue, "seriesIndex")) changes.seriesIndex = metadataNullableNumber(changesValue.seriesIndex, "seriesIndex", 0, 1_000_000);
+  if (Object.hasOwn(changesValue, "description")) changes.description = metadataNullableText(changesValue.description, "description", 20_000);
+  if (Object.hasOwn(changesValue, "subjects")) changes.subjects = metadataStringArray(changesValue.subjects, "subjects", 200, 500);
+  if (Object.hasOwn(changesValue, "identifiers")) changes.identifiers = metadataStringArray(changesValue.identifiers, "identifiers", 100, 500);
+  return {
+    expectedRevision: boundedInteger(object.expectedRevision, "expectedRevision", 0, Number.MAX_SAFE_INTEGER),
+    expectedContentHash: contentHash(object.expectedContentHash),
+    changes,
+  };
+}
+
+function validateBookMetadataReset(value: unknown): BookMetadataResetInput {
+  const object = objectValue(value);
+  let fields: BookMetadataResetInput["fields"];
+  if (object.fields !== undefined) {
+    if (!Array.isArray(object.fields) || object.fields.length === 0 || object.fields.length > EDITABLE_METADATA_FIELDS.length) {
+      throw new HttpError(400, "invalid_request", "Metadata reset fields are invalid.");
+    }
+    const allowed = new Set<string>(EDITABLE_METADATA_FIELDS);
+    fields = Array.from(new Set(object.fields.map((field) => {
+      if (typeof field !== "string" || !allowed.has(field)) {
+        throw new HttpError(400, "invalid_request", "Metadata reset field is invalid.");
+      }
+      return field as (typeof EDITABLE_METADATA_FIELDS)[number];
+    })));
+  }
+  return {
+    expectedRevision: boundedInteger(object.expectedRevision, "expectedRevision", 0, Number.MAX_SAFE_INTEGER),
+    expectedContentHash: contentHash(object.expectedContentHash),
+    ...(fields ? { fields } : {}),
+  };
+}
+
+function validateCoverImport(value: unknown): CoverImportInput {
+  const object = objectValue(value);
+  return {
+    expectedRevision: boundedInteger(object.expectedRevision, "expectedRevision", 0, Number.MAX_SAFE_INTEGER),
+    expectedContentHash: contentHash(object.expectedContentHash),
+    provider: coverProvider(object.provider),
+    candidateId: requiredString(object.candidateId, "candidateId", 160),
+  };
+}
+
+function coverConcurrencyFromSearchParams(params: URLSearchParams): {
+  expectedRevision: number;
+  expectedContentHash: string;
+} {
+  return {
+    expectedRevision: boundedInteger(params.get("expectedRevision"), "expectedRevision", 0, Number.MAX_SAFE_INTEGER),
+    expectedContentHash: contentHash(params.get("expectedContentHash")),
+  };
+}
+
+function coverProvider(value: unknown): CoverProvider {
+  if (value !== "google-books" && value !== "open-library") {
+    throw new HttpError(400, "invalid_request", "Cover provider is invalid.");
+  }
+  return value;
+}
+
+function contentHash(value: unknown): string {
+  if (typeof value !== "string" || !/^[a-f0-9]{64}$/u.test(value)) {
+    throw new HttpError(400, "invalid_request", "expectedContentHash is invalid.");
+  }
+  return value;
+}
+
+function requiredMetadataString(value: unknown, field: string, maximum: number): string {
+  if (typeof value !== "string" || !value.trim() || value.length > maximum || value.includes("\0")) {
+    throw new HttpError(400, "invalid_request", `${field} is invalid.`);
+  }
+  return value.trim();
+}
+
+function metadataNullableString(value: unknown, field: string, maximum: number): string | null {
+  if (value === null || value === "") return null;
+  return requiredMetadataString(value, field, maximum);
+}
+
+function metadataNullableText(value: unknown, field: string, maximum: number): string | null {
+  if (value === null || value === "") return null;
+  if (typeof value !== "string" || !value.trim() || value.length > maximum || value.includes("\0")) {
+    throw new HttpError(400, "invalid_request", `${field} is invalid.`);
+  }
+  return value.trim();
+}
+
+function metadataNullableNumber(value: unknown, field: string, minimum: number, maximum: number): number | null {
+  if (value === null || value === "") return null;
+  if (typeof value !== "number" || !Number.isFinite(value) || value < minimum || value > maximum) {
+    throw new HttpError(400, "invalid_request", `${field} is outside its allowed range.`);
+  }
+  return value;
+}
+
+function metadataStringArray(
+  value: unknown,
+  field: string,
+  maximumItems: number,
+  maximumItemLength: number,
+): string[] {
+  if (!Array.isArray(value) || value.length > maximumItems) {
+    throw new HttpError(400, "invalid_request", `${field} must be a bounded array.`);
+  }
+  const result = value.map((item) => requiredMetadataString(item, field, maximumItemLength));
+  if (new Set(result.map((item) => item.toLocaleLowerCase())).size !== result.length) {
+    throw new HttpError(400, "invalid_request", `${field} contains duplicate values.`);
+  }
+  return result;
+}
+
 function queryFromSearchParams(params: URLSearchParams): BookSetQuery {
   const object: Record<string, unknown> = {};
   for (const key of [
@@ -1512,6 +1882,31 @@ async function readJson(request: IncomingMessage, limit: number): Promise<unknow
   }
 }
 
+async function readBoundedBody(request: IncomingMessage, limit: number): Promise<Buffer> {
+  const length = header(request, "content-length");
+  if (length && (!/^\d+$/u.test(length) || Number(length) > limit)) {
+    throw new HttpError(413, "body_too_large", "Cover upload exceeds the configured limit.");
+  }
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of request) {
+    const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array);
+    total += data.length;
+    if (total > limit) throw new HttpError(413, "body_too_large", "Cover upload exceeds the configured limit.");
+    chunks.push(data);
+  }
+  if (total === 0) throw new HttpError(400, "invalid_cover", "Cover upload is empty.");
+  return Buffer.concat(chunks, total);
+}
+
+function imageContentType(request: IncomingMessage): "image/jpeg" | "image/png" | "image/webp" {
+  const value = header(request, "content-type")?.split(";", 1)[0]?.trim().toLocaleLowerCase();
+  if (value !== "image/jpeg" && value !== "image/png" && value !== "image/webp") {
+    throw new HttpError(415, "unsupported_media_type", "Cover must be uploaded as JPEG, PNG, or WebP.");
+  }
+  return value;
+}
+
 function sendJson(
   response: ServerResponse,
   status: number,
@@ -1576,6 +1971,24 @@ function mapError(error: unknown): HttpError {
     return new HttpError(status, error.code, error.message);
   }
   if (error instanceof CoverCacheError) return new HttpError(404, error.code, error.message);
+  if (error instanceof MetadataCoverStoreError) {
+    return new HttpError(
+      error.code === "cover_too_large" ? 413 : error.code === "asset_unavailable" ? 503 : 400,
+      error.code,
+      error.message,
+    );
+  }
+  if (error instanceof CoverProviderError) {
+    return new HttpError(
+      error.code === "invalid_provider" || error.code === "invalid_candidate"
+        ? 400
+        : error.code === "provider_response_too_large"
+          ? 413
+          : 502,
+      error.code,
+      error.message,
+    );
+  }
   return new HttpError(500, "internal_error", "The catalog service could not complete the request.");
 }
 

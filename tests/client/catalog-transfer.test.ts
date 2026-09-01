@@ -18,7 +18,11 @@ describe("catalog transfer preparation", () => {
     const bytes = epubBytes();
     const source = new Blob([Uint8Array.from(bytes)], { type: "application/epub+zip" });
     const output = new Blob([Uint8Array.from([9, 8, 7])]);
-    const convertEpub = vi.fn(async (file: File) => ({
+    const convertEpub = vi.fn(async (
+      file: File,
+      _signal?: AbortSignal,
+      _overrides?: { readonly title?: string; readonly authors?: readonly string[] },
+    ) => ({
       filename: "Example.azw3",
       blob: output,
       metadata: { title: "Example", authors: ["Author"], language: "en", chapters: 1, toc_entries: 1 },
@@ -32,6 +36,7 @@ describe("catalog transfer preparation", () => {
       },
     }));
     const phases: string[] = [];
+    const overrides = { title: "Edited Example", authors: ["Edited Author"] } as const;
 
     const result = await prepareCatalogArtifact({
       id: "book-1",
@@ -39,14 +44,16 @@ describe("catalog transfer preparation", () => {
       format: "EPUB",
       size: source.size,
       contentHash: hash(bytes),
-    }, source, { convertEpub, onPhase: (phase) => phases.push(phase) });
+    }, source, { convertEpub, overrides, onPhase: (phase) => phases.push(phase) });
 
     expect(result.filename).toBe("Example.azw3");
     expect(result.sourceHash).toBe(hash(bytes));
     expect(result.converted).toBe(true);
     expect(result.embeddedCover).toBe(true);
+    expect(result.overridesApplied).toBe(true);
     expect(phases).toEqual(["preparing", "converting", "ready"]);
     expect(convertEpub).toHaveBeenCalledOnce();
+    expect(convertEpub.mock.calls[0]?.[2]).toBe(overrides);
     expect(new Uint8Array(await source.arrayBuffer())).toEqual(bytes);
   });
 
@@ -106,6 +113,28 @@ describe("catalog transfer preparation", () => {
     await expect(prepareCatalogArtifact({
       id: "book-1", title: "Example", format: "EPUB", size: source.size,
     }, source, { convertEpub: vi.fn() })).rejects.toMatchObject({ code: "CATALOG_HASH_MISSING" });
+  });
+
+  it("fails clearly instead of applying variable-length overrides to a copied AZW3", async () => {
+    const bytes = new Uint8Array(78);
+    bytes.set(new TextEncoder().encode("BOOKMOBI"), 60);
+    const source = new Blob([bytes]);
+
+    await expect(prepareCatalogArtifact({
+      id: "book-azw3",
+      title: "Original",
+      format: "AZW3",
+      size: source.size,
+      contentHash: hash(bytes),
+    }, source, {
+      convertEpub: vi.fn(),
+      overrides: { title: "Edited" },
+    })).rejects.toMatchObject({
+      code: "CONVERSION_INVALID_INPUT",
+      message: expect.stringContaining("cannot yet be embedded safely"),
+    });
+
+    expect(new Uint8Array(await source.arrayBuffer())).toEqual(bytes);
   });
 
   it("rejects a source above the browser memory boundary before reading or hashing it", async () => {

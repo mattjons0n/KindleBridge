@@ -210,6 +210,95 @@ describe("HttpCatalogClient", () => {
     expect(JSON.parse(String((fetch.mock.calls[0][1] as RequestInit).body))).toMatchObject({ includeBookIds: ["book_a", "book_b"], excludeBookIds: ["book_c"] });
   });
 
+  it("loads and updates durable metadata overlays without changing the source hash", async () => {
+    const sourceHash = "a".repeat(64);
+    const metadataState = {
+      book: {
+        id: "book_1", profileId: "prf_1", rootId: "root_1", sourceFilename: "book.epub",
+        title: "Edited title", authors: ["Edited author"], authorSort: "Author, Edited",
+        language: "en", publisher: null, publishedAt: "2026", series: null, seriesIndex: null,
+        description: null, subjects: [], identifiers: ["isbn:123"], format: "epub", size: 12,
+        contentHash: sourceHash, presentationVersion: "b".repeat(64), addedAt: "2026-01-01T00:00:00Z",
+        updatedAt: "2026-01-02T00:00:00Z", metadataComplete: true, available: true,
+        coverUrl: null, sourceUrl: "/api/source", metadataEdited: true, coverEdited: false,
+        metadataRevision: 2,
+      },
+      sourceMetadata: {
+        title: "Source title", authors: ["Source author"], authorSort: "Author, Source",
+        language: "en", publisher: null, publishedAt: "2026", series: null, seriesIndex: null,
+        description: null, subjects: [], identifiers: ["isbn:123"],
+      },
+      overrides: { title: "Edited title", authors: ["Edited author"] },
+      revision: 2,
+      basedOnContentHash: sourceHash,
+      sourceChanged: false,
+      coverOverride: null,
+    };
+    const fetch = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => jsonResponse(metadataState));
+    const client = new HttpCatalogClient({ fetch });
+
+    await expect(client.getBookMetadata("prf_1", "book_1")).resolves.toMatchObject({
+      revision: 2,
+      basedOnContentHash: sourceHash,
+      book: { title: "Edited title", contentHash: sourceHash, metadataEdited: true },
+      overrides: { title: "Edited title" },
+    });
+    await client.updateBookMetadata("prf_1", "book_1", {
+      expectedRevision: 2,
+      expectedContentHash: sourceHash,
+      changes: { publisher: "New publisher" },
+    });
+
+    expect(fetch.mock.calls[1]?.[0]).toBe("/api/profiles/prf_1/books/book_1/metadata");
+    expect(fetch.mock.calls[1]?.[1]).toMatchObject({ method: "PATCH" });
+    expect(JSON.parse(String((fetch.mock.calls[1]?.[1] as RequestInit).body))).toEqual({
+      expectedRevision: 2,
+      expectedContentHash: sourceHash,
+      changes: { publisher: "New publisher" },
+    });
+  });
+
+  it("uses bounded same-origin cover search and raw cover upload routes", async () => {
+    const sourceHash = "c".repeat(64);
+    const search = {
+      provider: "google-books",
+      items: [{
+        candidateId: "volume-1",
+        title: "Book",
+        authors: ["Author"],
+        publishedAt: "2024",
+        identifiers: ["ISBN_13:123"],
+        thumbnailUrl: "/api/profiles/prf_1/books/book_1/cover-search/preview?candidate=volume-1",
+      }],
+    };
+    const state = {
+      book: {
+        id: "book_1", profileId: "prf_1", rootId: "root_1", sourceFilename: "book.epub",
+        title: "Book", authors: ["Author"], authorSort: "Author", language: "en", publisher: null,
+        publishedAt: null, series: null, seriesIndex: null, description: null, subjects: [], identifiers: [],
+        format: "epub", size: 12, contentHash: sourceHash, presentationVersion: "d".repeat(64),
+        addedAt: "", updatedAt: "", metadataComplete: true, available: true,
+        coverUrl: "/api/profiles/prf_1/books/book_1/cover", sourceUrl: "/api/source",
+        metadataEdited: false, coverEdited: true, metadataRevision: 1,
+      },
+      sourceMetadata: { title: "Book", authors: ["Author"], authorSort: "Author", language: "en", publisher: null, publishedAt: null, series: null, seriesIndex: null, description: null, subjects: [], identifiers: [] },
+      overrides: {}, revision: 1, basedOnContentHash: sourceHash, sourceChanged: false,
+      coverOverride: { assetKey: "asset", mediaType: "image/jpeg", byteLength: 4, width: 1, height: 1, sourceKind: "upload", provider: null, providerReference: null, sourceUrl: null },
+    };
+    const fetch = vi.fn()
+      .mockResolvedValueOnce(jsonResponse(search))
+      .mockResolvedValueOnce(jsonResponse(state));
+    const client = new HttpCatalogClient({ fetch });
+
+    const found = await client.searchBookCovers("prf_1", "book_1", "google-books", "Book Author");
+    expect(found.items[0]?.thumbnailUrl).toContain("/api/profiles/");
+    await client.uploadBookCover("prf_1", "book_1", new Blob(["jpeg"], { type: "image/jpeg" }), 0, sourceHash);
+
+    expect(String(fetch.mock.calls[0]?.[0])).toContain("cover-search?provider=google-books&q=Book+Author&limit=12");
+    expect(String(fetch.mock.calls[1]?.[0])).toContain(`cover?expectedRevision=0&expectedContentHash=${sourceHash}`);
+    expect(fetch.mock.calls[1]?.[1]).toMatchObject({ method: "PUT", body: expect.any(Blob) });
+  });
+
   it("saves profile and roots atomically with an idempotency key", async () => {
     const fetch = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => jsonResponse({
       profile: { id: "prf_new", name: "Research", description: null, initial: "R", sourceLabel: "research", enabled: true, rootCount: 1, availableRootCount: 0, bookCount: 0 },
@@ -287,9 +376,9 @@ describe("HttpCatalogClient", () => {
   });
 
   it("parses match-index data without requiring raw device identity", async () => {
-    const fetch = vi.fn(async () => jsonResponse({ profileId: "prf_1", generatedAt: "2026-08-29T12:00:00Z", metadataClaims: { complete: true, collisionBitmap: EMPTY_METADATA_CLAIM_BITMAP }, entries: [{ bookId: "book_1", sourceFilename: "book.epub", sourceFormat: "epub", sourceSize: 100, contentHash: "hash", identifiers: ["isbn:1"], title: "Book", authors: ["Author"], authorSort: "Author, Test", deliveries: [{ deviceKey: "digest", filename: "book.azw3", artifactHash: "artifact", artifactSize: 120, objectIdentity: "persistent", managedToken: "kb-token", status: "delivered", deliveredAt: "2026-08-29T12:05:00Z" }] }] }));
+    const fetch = vi.fn(async () => jsonResponse({ profileId: "prf_1", generatedAt: "2026-08-29T12:00:00Z", metadataClaims: { complete: true, collisionBitmap: EMPTY_METADATA_CLAIM_BITMAP }, entries: [{ bookId: "book_1", sourceFilename: "book.epub", sourceFormat: "epub", sourceSize: 100, contentHash: "hash", identifiers: ["isbn:1"], title: "Book", authors: ["Author"], authorSort: "Author, Test", staleManagedTokens: ["kb-0123456789abcdefabcd"], deliveries: [{ deviceKey: "digest", filename: "book.azw3", artifactHash: "artifact", artifactSize: 120, objectIdentity: "persistent", managedToken: "kb-token", status: "delivered", deliveredAt: "2026-08-29T12:05:00Z" }] }] }));
     const client = new HttpCatalogClient({ fetch });
-    await expect(client.getMatchIndex("prf_1")).resolves.toEqual(expect.objectContaining({ metadataClaims: { complete: true, collisionBitmap: EMPTY_METADATA_CLAIM_BITMAP }, entries: [expect.objectContaining({ sourceFilename: "book.epub", sourceFormat: "EPUB", authorSort: "Author, Test", deliveries: [expect.objectContaining({ managedToken: "kb-token" })] })] }));
+    await expect(client.getMatchIndex("prf_1")).resolves.toEqual(expect.objectContaining({ metadataClaims: { complete: true, collisionBitmap: EMPTY_METADATA_CLAIM_BITMAP }, entries: [expect.objectContaining({ sourceFilename: "book.epub", sourceFormat: "EPUB", authorSort: "Author, Test", staleManagedTokens: ["kb-0123456789abcdefabcd"], deliveries: [expect.objectContaining({ managedToken: "kb-token" })] })] }));
   });
 
   it.each([
@@ -380,6 +469,24 @@ describe("HttpCatalogClient", () => {
       status: 413,
     });
     expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it("retains the source response presentation version for pre-transfer race checks", async () => {
+    const presentationVersion = "e".repeat(64);
+    const response = new Response(Uint8Array.from([1, 2, 3]), {
+      headers: {
+        "Content-Type": "application/epub+zip",
+        "Content-Length": "3",
+        ETag: `"sha256-${"a".repeat(64)}"`,
+        "X-Kindle-Bridge-Presentation-Version": presentationVersion,
+      },
+    });
+    const client = new HttpCatalogClient({ fetch: vi.fn(async () => response) });
+
+    await expect(client.getBookSource("prf_1", "book_1")).resolves.toMatchObject({
+      contentLength: 3,
+      presentationVersion,
+    });
   });
 
   it("cancels a source stream that exceeds the limit even when length headers are absent", async () => {

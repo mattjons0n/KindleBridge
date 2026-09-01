@@ -1490,6 +1490,163 @@ describe("AppController local conversion flow", () => {
     expect(app.root.querySelector('[data-book-id="book-1"] .library-kindle-check')).toBeNull();
   });
 
+  it("removes an exact prior KindleBridge presentation without treating it as current", async () => {
+    const priorToken = "kb-0123456789abcdefabcd";
+    const contentHash = createHash("sha256")
+      .update(Uint8Array.from([0x50, 0x4b, 0x03, 0x04, 1, 2, 3, 4]))
+      .digest("hex");
+    const app = harness(true, {}, (api) => {
+      vi.mocked(api.getMatchIndex).mockResolvedValue({
+        profileId: "profile-1",
+        generatedAt: "2026-09-01T00:00:00.000Z",
+        entries: [{
+          bookId: "book-1",
+          sourceFilename: "book.epub",
+          sourceFormat: "EPUB",
+          sourceSize: 8,
+          contentHash,
+          presentationVersion: "b".repeat(64),
+          staleManagedTokens: [priorToken],
+          identifiers: [],
+          title: "Book",
+          authors: ["Author"],
+          deliveries: [],
+        }],
+      });
+    });
+    const object = {
+      handle: 41,
+      storageId: 0x10001,
+      parentHandle: 0x37,
+      objectFormat: 0xb00a,
+      protectionStatus: 0,
+      associationType: 0,
+      size: 512,
+      filename: `Book-${priorToken}.azw3`,
+      relativePath: `Book-${priorToken}.azw3`,
+      depth: 1,
+      kind: "file" as const,
+      managedToken: priorToken,
+      metadataAdjusted: false,
+      bookMetadataState: "managed-token" as const,
+    };
+    vi.mocked(app.connection.refreshInventory).mockResolvedValueOnce(completeKindleInventory([object]));
+    const removeBooks = vi.mocked(app.connection.removeBooksAndRefreshInventory!);
+    removeBooks.mockResolvedValueOnce({
+      removals: [{
+        handle: object.handle,
+        storageId: object.storageId,
+        parentHandle: object.parentHandle,
+        filename: object.filename,
+        size: object.size,
+        objectFormat: object.objectFormat,
+        removed: true,
+      }],
+      inventory: completeKindleInventory([]),
+      inventoryRefresh: "complete",
+    });
+
+    await vi.waitFor(() => expect(app.root.querySelector('[data-book-id="book-1"]')).not.toBeNull());
+    await app.controller.connect();
+    expect(app.controller.latestCatalogInventory?.items[0]).toMatchObject({
+      id: "mtp-00000029",
+      bookId: "book-1",
+      match: "possible",
+      managed: true,
+      stalePresentation: true,
+    });
+
+    await app.controller.removeCatalogBooks({
+      profileId: "profile-1",
+      targets: [{
+        itemId: "mtp-00000029",
+        bookId: "book-1",
+        title: "Book",
+        filename: object.filename,
+        size: object.size,
+      }],
+    });
+
+    expect(removeBooks).toHaveBeenCalledWith(
+      [object.handle],
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      expect.objectContaining({ signal: expect.any(AbortSignal), deviceMetadataCache: "read-write" }),
+    );
+  });
+
+  it("keeps a current copy confirmed while bulk-removing it with an exact prior presentation", async () => {
+    const priorToken = "kb-0123456789abcdefabcd";
+    const presentationVersion = "b".repeat(64);
+    const currentToken = await createManagedFilenameToken("book-1", presentationVersion);
+    const contentHash = createHash("sha256")
+      .update(Uint8Array.from([0x50, 0x4b, 0x03, 0x04, 1, 2, 3, 4]))
+      .digest("hex");
+    const app = harness(true, {}, (api) => {
+      vi.mocked(api.getMatchIndex).mockResolvedValue({
+        profileId: "profile-1",
+        generatedAt: "2026-09-01T00:00:00.000Z",
+        entries: [{
+          bookId: "book-1",
+          sourceFilename: "book.epub",
+          sourceFormat: "EPUB",
+          sourceSize: 8,
+          contentHash,
+          presentationVersion,
+          staleManagedTokens: [priorToken],
+          identifiers: [],
+          title: "Book",
+          authors: ["Author"],
+          deliveries: [],
+        }],
+      });
+    });
+    const managedObject = (handle: number, token: string) => ({
+      handle,
+      storageId: 0x10001,
+      parentHandle: 0x37,
+      objectFormat: 0xb00a,
+      protectionStatus: 0,
+      associationType: 0,
+      size: 512,
+      filename: `Book-${token}.azw3`,
+      relativePath: `Book-${token}.azw3`,
+      depth: 1,
+      kind: "file" as const,
+      managedToken: token,
+      metadataAdjusted: false,
+      bookMetadataState: "managed-token" as const,
+    });
+    const current = managedObject(41, currentToken);
+    const prior = managedObject(42, priorToken);
+    vi.mocked(app.connection.refreshInventory).mockResolvedValueOnce(completeKindleInventory([current, prior]));
+
+    await vi.waitFor(() => expect(app.root.querySelector('[data-book-id="book-1"]')).not.toBeNull());
+    await app.controller.connect();
+    expect(app.root.querySelector('[data-book-id="book-1"] .library-kindle-check')?.getAttribute("aria-label"))
+      .toBe("Already on this Kindle");
+    expect(app.controller.latestCatalogInventory?.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "mtp-00000029", match: "confirmed" }),
+      expect.objectContaining({ id: "mtp-0000002a", match: "possible", stalePresentation: true }),
+    ]));
+
+    await app.controller.removeCatalogBooks({
+      profileId: "profile-1",
+      targets: [current, prior].map((object) => ({
+        itemId: `mtp-${object.handle.toString(16).padStart(8, "0")}`,
+        bookId: "book-1",
+        title: "Book",
+        filename: object.filename,
+        size: object.size,
+      })),
+    });
+
+    expect(app.connection.removeBooksAndRefreshInventory).toHaveBeenCalledWith(
+      [current.handle, prior.handle],
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      expect.objectContaining({ signal: expect.any(AbortSignal), deviceMetadataCache: "read-write" }),
+    );
+  });
+
   it("rejects a stale removal target before invoking the Kindle device API", async () => {
     const app = harness(true);
     const object = {
@@ -1534,7 +1691,7 @@ describe("AppController local conversion flow", () => {
       }],
     })).rejects.toMatchObject({
       code: "INVALID_STATE",
-      message: expect.stringContaining("changed or is no longer an exact confirmed match"),
+      message: expect.stringContaining("changed or is no longer an exact removable match"),
     });
 
     expect(removeBooks).not.toHaveBeenCalled();
@@ -1791,6 +1948,283 @@ describe("AppController local conversion flow", () => {
     expect(app.connection.disconnect).not.toHaveBeenCalled();
     expect(app.controller.state.device.kind).toBe("ready");
     expect(new Uint8Array(await new Blob([Uint8Array.from(app.sourceBytes)]).arrayBuffer())).toEqual(app.sourceBytes);
+  });
+
+  it("applies the durable presentation overlay to a temporary conversion and managed identity", async () => {
+    const presentationVersion = "e".repeat(64);
+    const cover = new Blob([Uint8Array.from([0xff, 0xd8, 0xff, 0xd9])], { type: "image/jpeg" });
+    const app = harness();
+    const editedBook: CatalogBook = {
+      ...app.book,
+      title: "Edited title",
+      authors: ["Edited author"],
+      presentationVersion,
+      metadataEdited: true,
+      coverEdited: true,
+      metadataRevision: 3,
+      coverUrl: "/api/profiles/profile-1/books/book-1/cover",
+    };
+    const metadataState = {
+      book: editedBook,
+      sourceMetadata: {
+        title: app.book.title,
+        authors: [...app.book.authors],
+        authorSort: app.book.authorSort,
+        language: null,
+        publisher: null,
+        publishedAt: null,
+        series: null,
+        seriesIndex: null,
+        description: null,
+        subjects: [],
+        identifiers: [],
+      },
+      sourceCoverUrl: null,
+      overrides: { title: "Edited title", authors: ["Edited author"] },
+      revision: 3,
+      basedOnContentHash: app.book.contentHash!,
+      sourceChanged: false,
+      coverOverride: {
+        assetKey: "cover-asset",
+        mediaType: "image/jpeg" as const,
+        byteLength: cover.size,
+        width: 1,
+        height: 1,
+        sourceKind: "upload" as const,
+        provider: null,
+        providerReference: null,
+        sourceUrl: null,
+      },
+    };
+    vi.mocked(app.catalogApi.listBooks).mockResolvedValue({ items: [editedBook], total: 1, limit: 24, offset: 0 });
+    vi.mocked(app.catalogApi.getBook).mockResolvedValue(editedBook);
+    app.catalogApi.getBookMetadata = vi.fn(async () => metadataState);
+    app.catalogApi.getBookCover = vi.fn(async () => cover);
+    vi.mocked(app.catalogApi.getMatchIndex).mockResolvedValue({
+      profileId: "profile-1",
+      generatedAt: "2026-08-29T00:00:00.000Z",
+      entries: [{
+        bookId: editedBook.id,
+        sourceFilename: editedBook.sourceFilename,
+        sourceFormat: editedBook.format,
+        sourceSize: editedBook.size,
+        contentHash: editedBook.contentHash!,
+        presentationVersion,
+        identifiers: editedBook.identifiers,
+        title: editedBook.title,
+        authors: editedBook.authors,
+        deliveries: [],
+      }],
+    });
+
+    await app.controller.connect();
+    await app.controller.sendCatalogBook({ profileId: "profile-1", book: editedBook });
+
+    expect(app.convert).toHaveBeenCalledWith(
+      expect.any(File),
+      expect.any(AbortSignal),
+      {
+        title: "Edited title",
+        authors: ["Edited author"],
+        cover: { blob: cover, mediaType: "image/jpeg" },
+      },
+    );
+    const expectedToken = await createManagedFilenameToken(editedBook.id, presentationVersion);
+    expect(app.connection.sendAzW3AndRefreshInventory).toHaveBeenCalledWith(
+      expect.any(Blob),
+      "book.azw3",
+      expect.objectContaining({ managedToken: expectedToken }),
+      expect.any(Object),
+    );
+    expect(app.catalogApi.getBookMetadata).toHaveBeenCalledTimes(2);
+  });
+
+  it("stops before MTP if a metadata overlay changes during derivative preparation", async () => {
+    const presentationVersion = "e".repeat(64);
+    const app = harness();
+    const editedBook: CatalogBook = {
+      ...app.book,
+      presentationVersion,
+      metadataEdited: true,
+      metadataRevision: 1,
+    };
+    const state = {
+      book: editedBook,
+      sourceMetadata: {
+        title: app.book.title,
+        authors: [...app.book.authors],
+        authorSort: app.book.authorSort,
+        language: null,
+        publisher: null,
+        publishedAt: null,
+        series: null,
+        seriesIndex: null,
+        description: null,
+        subjects: [],
+        identifiers: [],
+      },
+      sourceCoverUrl: null,
+      overrides: { title: "Edited title" },
+      revision: 1,
+      basedOnContentHash: app.book.contentHash!,
+      sourceChanged: false,
+      coverOverride: null,
+    };
+    vi.mocked(app.catalogApi.listBooks).mockResolvedValue({ items: [editedBook], total: 1, limit: 24, offset: 0 });
+    vi.mocked(app.catalogApi.getBook).mockResolvedValue(editedBook);
+    app.catalogApi.getBookMetadata = vi.fn()
+      .mockResolvedValueOnce(state)
+      .mockResolvedValueOnce({
+        ...state,
+        revision: 2,
+        book: { ...editedBook, metadataRevision: 2, presentationVersion: "f".repeat(64) },
+      });
+    vi.mocked(app.catalogApi.getMatchIndex).mockResolvedValue({
+      profileId: "profile-1",
+      generatedAt: "2026-08-29T00:00:00.000Z",
+      entries: [{
+        bookId: editedBook.id,
+        sourceFilename: editedBook.sourceFilename,
+        sourceFormat: editedBook.format,
+        sourceSize: editedBook.size,
+        contentHash: editedBook.contentHash!,
+        presentationVersion,
+        identifiers: editedBook.identifiers,
+        title: editedBook.title,
+        authors: editedBook.authors,
+        deliveries: [],
+      }],
+    });
+
+    await app.controller.connect();
+    await expect(
+      app.controller.sendCatalogBook({ profileId: "profile-1", book: editedBook }),
+    ).rejects.toMatchObject({
+      code: "CATALOG_SOURCE_CHANGED",
+      message: expect.stringContaining("changed during preparation"),
+    });
+    expect(app.convert).toHaveBeenCalledOnce();
+    expect(app.connection.sendAzW3AndRefreshInventory).not.toHaveBeenCalled();
+  });
+
+  it("stops before MTP if an initially unedited book gains its first overlay during preparation", async () => {
+    const app = harness();
+    const initialVersion = app.book.contentHash!;
+    const editedBook: CatalogBook = {
+      ...app.book,
+      title: "New cross-tab title",
+      presentationVersion: "f".repeat(64),
+      metadataEdited: true,
+      metadataRevision: 1,
+    };
+    vi.mocked(app.catalogApi.getBook)
+      .mockResolvedValueOnce({ ...app.book, presentationVersion: initialVersion })
+      .mockResolvedValueOnce(editedBook);
+    vi.mocked(app.catalogApi.getBookSource).mockResolvedValueOnce({
+      blob: new Blob([Uint8Array.from(app.sourceBytes)]),
+      contentLength: app.sourceBytes.byteLength,
+      etag: `"sha256-${app.book.contentHash}"`,
+      presentationVersion: initialVersion,
+    });
+
+    await app.controller.connect();
+    await expect(
+      app.controller.sendCatalogBook({ profileId: "profile-1", book: app.book }),
+    ).rejects.toMatchObject({
+      code: "CATALOG_SOURCE_CHANGED",
+      message: expect.stringContaining("presentation metadata changed during preparation"),
+    });
+
+    expect(app.convert).toHaveBeenCalledOnce();
+    expect(app.connection.sendAzW3AndRefreshInventory).not.toHaveBeenCalled();
+  });
+
+  it("keeps per-book MTP verification but reconciles and logs metadata diagnostics once per batch", async () => {
+    const app = harness();
+    const secondBook: CatalogBook = {
+      ...app.book,
+      id: "book-2",
+      title: "Second book",
+      sourceFilename: "second-book.epub",
+    };
+    vi.mocked(app.catalogApi.getBook).mockImplementation(async (_profileId, bookId) => (
+      bookId === secondBook.id ? secondBook : app.book
+    ));
+    vi.mocked(app.catalogApi.getMatchIndex).mockImplementation(async () => ({
+      profileId: "profile-1",
+      generatedAt: "2026-08-29T00:00:00.000Z",
+      entries: [app.book, secondBook].map((book) => ({
+        bookId: book.id,
+        sourceFilename: book.sourceFilename,
+        sourceFormat: book.format,
+        sourceSize: book.size,
+        contentHash: book.contentHash!,
+        identifiers: book.identifiers,
+        title: book.title,
+        authors: book.authors,
+        deliveries: [],
+      })),
+    }));
+    const deviceObjects: KindleInventorySnapshot["objects"][number][] = [];
+    vi.mocked(app.connection.sendAzW3AndRefreshInventory).mockImplementation(async (blob, filename, options) => {
+      const transfer = await app.connection.sendAzW3(blob, filename, options);
+      deviceObjects.push({
+        handle: transfer.handle,
+        storageId: transfer.storageId,
+        parentHandle: transfer.parentHandle,
+        objectFormat: 0xb00a,
+        protectionStatus: 0,
+        associationType: 0,
+        size: transfer.size,
+        filename: transfer.filename,
+        relativePath: transfer.filename,
+        depth: 1,
+        kind: "file",
+        managedToken: transfer.filename.match(/kb-[a-f0-9]{20}/u)?.[0],
+        metadataAdjusted: false,
+      });
+      const refreshed = {
+        ...completeKindleInventory([...deviceObjects]),
+        metadataCacheDiagnostics: {
+          evidence: {}, hits: {}, portable: {}, browser: {},
+        },
+      } as unknown as KindleInventorySnapshot;
+      return { transfer, inventory: refreshed, inventoryRefresh: "complete" as const };
+    });
+
+    await app.controller.connect();
+    const batchId = "batch-two-books";
+    await app.controller.sendCatalogBook({
+      profileId: "profile-1",
+      book: app.book,
+      batch: { id: batchId, position: 1, total: 2 },
+    });
+    expect(app.connection.sendAzW3AndRefreshInventory).toHaveBeenCalledOnce();
+    expect(app.catalogApi.getMatchIndex).toHaveBeenCalledTimes(1);
+    expect(app.controller.log.entries.filter(({ message }) => message === "Kindle metadata cache diagnostics")).toHaveLength(0);
+
+    await app.controller.sendCatalogBook({
+      profileId: "profile-1",
+      book: secondBook,
+      batch: { id: batchId, position: 2, total: 2 },
+    });
+    expect(app.connection.sendAzW3AndRefreshInventory).toHaveBeenCalledTimes(2);
+    expect(app.catalogApi.getMatchIndex).toHaveBeenCalledTimes(1);
+
+    await app.controller.finishCatalogSendBatch({
+      id: batchId,
+      total: 2,
+      succeeded: [
+        { id: app.book.id, title: app.book.title },
+        { id: secondBook.id, title: secondBook.title },
+      ],
+      unsent: [],
+    });
+
+    expect(app.catalogApi.getMatchIndex).toHaveBeenCalledTimes(2);
+    expect(app.controller.log.entries.filter(({ message }) => message === "Kindle metadata cache diagnostics")).toHaveLength(1);
+    expect(app.controller.log.entries.some(({ message }) => message === "2 of 2 books transferred and verified.")).toBe(true);
+    expect(app.connection.disconnect).not.toHaveBeenCalled();
   });
 
   it("does not use an absence verdict for a source version replaced before catalog invalidation arrives", async () => {
