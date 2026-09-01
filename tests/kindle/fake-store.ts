@@ -59,6 +59,7 @@ export class FakeKindleObjectStore implements KindleObjectStore {
   readonly objectData = new Map<number, Uint8Array>();
   readonly ownedHandles = new Set<number>();
   readonly deletedHandles: number[] = [];
+  readonly conditionallyDeletedHandles: number[] = [];
   readonly createRequests: KindleCreateObjectRequest[] = [];
   readonly childListFailures = new Map<number, unknown>();
   readonly metadataFailures = new Map<number, unknown>();
@@ -256,6 +257,41 @@ export class FakeKindleObjectStore implements KindleObjectStore {
         size: request.size,
       });
     }
+  }
+
+  async deleteExistingKindleBookObject(
+    snapshot: KindleStoredObjectInfo,
+    _options?: KindleOperationOptions,
+  ): Promise<void> {
+    const current = this.objects.get(snapshot.handle);
+    const extension = snapshot.filename.split(".").at(-1)?.toLocaleLowerCase("en-US");
+    if (
+      !current
+      || JSON.stringify(current) !== JSON.stringify(snapshot)
+      || snapshot.objectFormat === MTP_OBJECT_FORMAT_ASSOCIATION
+      || snapshot.associationType !== 0
+      || snapshot.protectionStatus !== 0
+      || isKindleBridgeDeviceMetadataCacheFilename(snapshot.filename)
+      || !extension
+      || !new Set(["azw", "azw3", "azw8", "kfx", "mobi", "prc"]).has(extension)
+    ) {
+      throw Object.assign(new Error(`Conditional book deletion mismatch for ${snapshot.handle}`), {
+        code: "MTP_OBJECT_DELETE_MISMATCH",
+      });
+    }
+    const siblings = [...this.objects.values()].filter((info) => (
+      info.storageId === snapshot.storageId && info.parentHandle === snapshot.parentHandle
+    ));
+    if (!siblings.some(({ handle }) => handle === snapshot.handle)) {
+      throw Object.assign(new Error(`Conditional book parent mismatch for ${snapshot.handle}`), {
+        code: "MTP_OBJECT_DELETE_MISMATCH",
+      });
+    }
+    if (this.failDelete) throw new Error("simulated delete failure");
+    this.conditionallyDeletedHandles.push(snapshot.handle);
+    this.deletedHandles.push(snapshot.handle);
+    this.objects.delete(snapshot.handle);
+    this.objectData.delete(snapshot.handle);
   }
 
   async inspectKindleBridgeMetadataCacheObject(

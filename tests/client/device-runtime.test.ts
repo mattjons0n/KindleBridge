@@ -319,6 +319,72 @@ describe("openKindle cross-layer orchestration", () => {
     await connection.disconnect();
   });
 
+  it("removes selected handles sequentially under one device operation and refreshes inventory once", async () => {
+    const device = new FakeUsbDevice();
+    const session = { isOpen: true, close: vi.fn(async () => undefined) };
+    const transport = { close: vi.fn(async () => undefined) };
+    const lease = { release: vi.fn(async () => undefined) };
+    const initialInventory = {
+      status: "complete" as const,
+      storageId: STORAGE_ID,
+      documentsHandle: DOCUMENTS_HANDLE,
+      objects: [{ handle: 11 }, { handle: 12 }],
+      issues: [],
+      issueCount: 0,
+      scannedObjectCount: 2,
+    } as never;
+    const refreshedInventory = {
+      status: "complete" as const,
+      storageId: STORAGE_ID,
+      documentsHandle: DOCUMENTS_HANDLE,
+      objects: [],
+      issues: [],
+      issueCount: 0,
+      scannedObjectCount: 0,
+    } as never;
+    const removals = [
+      { handle: 11, storageId: STORAGE_ID, parentHandle: DOCUMENTS_HANDLE, filename: "a.azw3", size: 1, objectFormat: 0x3000, removed: true as const },
+      { handle: 12, storageId: STORAGE_ID, parentHandle: DOCUMENTS_HANDLE, filename: "b.mobi", size: 2, objectFormat: 0x3000, removed: true as const },
+    ];
+    const kindle = {
+      runSelfTest: vi.fn(async () => ({
+        filename: "kindle-poc-byte-test.txt",
+        handle: 70,
+        bytesVerified: KINDLE_SELF_TEST_PAYLOAD.byteLength,
+        cleanedUp: true as const,
+      })),
+      inventory: vi.fn()
+        .mockResolvedValueOnce(initialInventory)
+        .mockResolvedValueOnce(refreshedInventory),
+      removeBooks: vi.fn(async () => removals),
+    };
+    const connection = new ConnectedKindle(
+      device,
+      { vendorId: device.vendorId, productId: device.productId, documentsHandle: DOCUMENTS_HANDLE },
+      transport as never,
+      session as never,
+      kindle as never,
+      lease as never,
+    );
+
+    await connection.runSelfTest();
+    await connection.refreshInventory();
+    await expect(connection.removeBooksAndRefreshInventory([11, 12])).resolves.toEqual({
+      removals,
+      inventory: refreshedInventory,
+      inventoryRefresh: "complete",
+    });
+    expect(kindle.removeBooks).toHaveBeenCalledWith(
+      initialInventory,
+      [11, 12],
+      {},
+    );
+    expect(kindle.inventory).toHaveBeenCalledTimes(2);
+    expect(connection.latestInventory).toBe(refreshedInventory);
+
+    await connection.disconnect();
+  });
+
   it("bounds the complete book transaction before an unbounded collision scan can upload", async () => {
     const device = new FakeUsbDevice();
     const session = { isOpen: true, close: vi.fn(async () => undefined) };

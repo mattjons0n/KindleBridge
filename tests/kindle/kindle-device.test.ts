@@ -166,6 +166,70 @@ describe("KindleDevice policy", () => {
     expect(store.metadataRequests.slice(requestCountAfterSelfTest)).toEqual([11, 12]);
   });
 
+  it("conditionally removes only selected live book handles and refreshes from a fresh relist", async () => {
+    const store = new FakeKindleObjectStore();
+    store.objects.set(11, objectInfo(11, {
+      parentHandle: 10,
+      filename: "first.azw3",
+      compressedSize: 123,
+    }));
+    store.objects.set(12, objectInfo(12, {
+      parentHandle: 10,
+      filename: "second.mobi",
+      compressedSize: 456,
+    }));
+    const device = kindle(store);
+
+    await device.runSelfTest();
+    const inventory = await device.inventory({ bookMetadata: false });
+    await expect(device.removeBooks(inventory, [12, 11])).resolves.toEqual([
+      expect.objectContaining({ handle: 12, filename: "second.mobi", removed: true }),
+      expect.objectContaining({ handle: 11, filename: "first.azw3", removed: true }),
+    ]);
+
+    expect(store.conditionallyDeletedHandles).toEqual([12, 11]);
+    expect(store.objects.has(10)).toBe(true);
+    expect((await device.inventory({ bookMetadata: false })).objects).toEqual([]);
+  });
+
+  it("refuses changed, non-book, duplicate, and partial-inventory removal authority", async () => {
+    const store = new FakeKindleObjectStore();
+    store.objects.set(11, objectInfo(11, {
+      parentHandle: 10,
+      filename: "live.azw3",
+      compressedSize: 123,
+    }));
+    store.objects.set(12, objectInfo(12, {
+      parentHandle: 10,
+      filename: "notes.txt",
+      compressedSize: 20,
+    }));
+    const device = kindle(store);
+    await device.runSelfTest();
+    const inventory = await device.inventory({ bookMetadata: false });
+
+    await expect(device.removeBooks(inventory, [12])).rejects.toMatchObject({
+      code: "MTP_BOOK_REMOVAL_REJECTED",
+    });
+    await expect(device.removeBooks(inventory, [11, 11])).rejects.toMatchObject({
+      code: "MTP_BOOK_REMOVAL_REJECTED",
+    });
+    await expect(device.removeBooks({ ...inventory, status: "partial" }, [11])).rejects.toMatchObject({
+      code: "MTP_BOOK_REMOVAL_REJECTED",
+    });
+
+    store.objects.set(11, objectInfo(11, {
+      parentHandle: 10,
+      filename: "changed.azw3",
+      compressedSize: 123,
+    }));
+    await expect(device.removeBooks(inventory, [11])).rejects.toMatchObject({
+      code: "MTP_OBJECT_DELETE_MISMATCH",
+    });
+    expect(store.conditionallyDeletedHandles).toEqual([]);
+    expect(store.objects.has(11)).toBe(true);
+  });
+
   it("cleans up the exact created handle after a readback mismatch", async () => {
     const store = new FakeKindleObjectStore();
     store.corruptReadback = true;

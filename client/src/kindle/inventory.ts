@@ -283,6 +283,33 @@ export interface KindleInventorySnapshot {
   readonly metadataCacheDiagnostics?: KindleInventoryMetadataCacheDiagnostics;
 }
 
+// Exact device ObjectInfo is intentionally kept out of the presentation
+// snapshot. This page-local capability ties destructive removal authority to
+// the genuine snapshot returned by a live inventory, while retaining raw
+// fields (including an otherwise unusable modification-date token) for the
+// mandatory read-before-delete comparison.
+const exactObjectInfoByInventory = new WeakMap<
+  KindleInventorySnapshot,
+  ReadonlyMap<number, KindleStoredObjectInfo>
+>();
+
+export function exactKindleObjectInfoFromInventory(
+  inventory: KindleInventorySnapshot,
+  handle: number,
+): KindleStoredObjectInfo | undefined {
+  return exactObjectInfoByInventory.get(inventory)?.get(handle);
+}
+
+/** Carries the opaque exact-removal capability across a metadata-only clone. */
+export function retainExactKindleObjectInfoAuthority(
+  source: KindleInventorySnapshot,
+  derived: KindleInventorySnapshot,
+): KindleInventorySnapshot {
+  const exact = exactObjectInfoByInventory.get(source);
+  if (exact !== undefined) exactObjectInfoByInventory.set(derived, exact);
+  return derived;
+}
+
 /**
  * Current-session object metadata captured by KindleDevice's collision scan.
  * Inventory still re-lists the live child handles and uses this seed only when
@@ -1193,6 +1220,7 @@ export async function buildKindleInventory(
     ...(options.inactivityTimeoutMs === undefined ? {} : { inactivityTimeoutMs: options.inactivityTimeoutMs }),
   };
   const objects: KindleInventoryObject[] = [];
+  const exactObjectInfo = new Map<number, KindleStoredObjectInfo>();
   const issues: KindleInventoryIssue[] = [];
   let missingModificationDateObjectCount = 0;
   let invalidModificationDateObjectCount = 0;
@@ -1353,6 +1381,7 @@ export async function buildKindleInventory(
         ...(managedToken === undefined ? {} : { managedToken }),
         metadataAdjusted,
       });
+      exactObjectInfo.set(handle, Object.freeze({ ...info }));
       if (isMetadataCacheDiagnosticCandidate(object) && modificationDate === undefined) {
         if (info.modificationDate.length === 0) missingModificationDateObjectCount += 1;
         else invalidModificationDateObjectCount += 1;
@@ -1404,7 +1433,7 @@ export async function buildKindleInventory(
     },
     modificationDateProbe,
   );
-  return Object.freeze({
+  const inventory: KindleInventorySnapshot = Object.freeze({
     status: issueCount === 0 ? "complete" : "partial",
     storageId: target.storageId,
     documentsHandle: target.documentsHandle,
@@ -1415,4 +1444,6 @@ export async function buildKindleInventory(
     bookMetadata: enrichment.summary,
     metadataCacheDiagnostics: enrichment.cacheDiagnostics,
   });
+  exactObjectInfoByInventory.set(inventory, exactObjectInfo);
+  return inventory;
 }

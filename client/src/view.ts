@@ -3,6 +3,7 @@ import {
   CatalogBrowser,
   type CatalogHardwareHooks,
   type CatalogKindleInventory,
+  type CatalogRemoveRequest,
   type CatalogSendRequest,
   type CatalogTransferUpdate,
 } from "./catalog-browser";
@@ -43,6 +44,7 @@ export interface AppViewHandlers {
   readonly onCatalogConnectRequested?: () => void | Promise<void>;
   readonly onCatalogDisconnectRequested?: () => void | Promise<void>;
   readonly onCatalogSendRequested?: (request: CatalogSendRequest) => void | Promise<void>;
+  readonly onCatalogRemoveRequested?: (request: CatalogRemoveRequest) => void | Promise<void>;
   readonly onCatalogChanged?: (event: CatalogEvent) => void | Promise<void>;
   readonly onCatalogProfileChanged?: (profileId: string) => void | Promise<void>;
 }
@@ -260,6 +262,7 @@ export class AppView {
   #state: AppState;
   #profileDraft: TargetProfile;
   #catalogDialogReturnBookId?: string;
+  #catalogRemovalReturnBookId?: string;
   #settingsDeleteReturnLibraryId?: string;
 
   constructor(
@@ -278,6 +281,7 @@ export class AppView {
       onConnectRequested: handlers.onCatalogConnectRequested,
       onDisconnectRequested: handlers.onCatalogDisconnectRequested,
       onSendRequested: handlers.onCatalogSendRequested,
+      onRemoveRequested: handlers.onCatalogRemoveRequested,
       onCatalogChanged: handlers.onCatalogChanged,
       onActiveProfileChanged: handlers.onCatalogProfileChanged,
     };
@@ -600,6 +604,34 @@ export class AppView {
         this.#catalog.openSend(bookId);
       }
     }));
+    scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="set-library-layout"]').forEach((button) => button.addEventListener("click", () => {
+      const layout = button.dataset.layout;
+      if (layout === "grid" || layout === "list") this.#catalog.setLayout(layout);
+    }));
+    scope.querySelectorAll<HTMLInputElement>('input[data-ui-action="toggle-book-selection"]').forEach((input) => input.addEventListener("change", () => {
+      const bookId = input.dataset.bookId;
+      if (bookId) this.#catalog.toggleBookSelection(bookId, input.checked);
+    }));
+    scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="select-visible-books"]').forEach((button) => button.addEventListener("click", () => this.#catalog.toggleVisibleBookSelection()));
+    scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="clear-book-selection"]').forEach((button) => button.addEventListener("click", () => this.#catalog.clearBookSelection()));
+    scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="bulk-send-to-kindle"]').forEach((button) => button.addEventListener("click", () => { void this.#catalog.sendSelectedBooks(); }));
+    scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="remove-book-from-kindle"]').forEach((button) => button.addEventListener("click", () => {
+      const bookId = button.dataset.bookId;
+      if (!bookId) return;
+      this.#catalogRemovalReturnBookId = bookId;
+      this.#catalog.requestBookRemoval(bookId);
+    }));
+    scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="bulk-remove-from-kindle"]').forEach((button) => button.addEventListener("click", () => {
+      this.#catalogRemovalReturnBookId = undefined;
+      this.#catalog.requestSelectedBookRemoval();
+    }));
+    scope.querySelectorAll<HTMLElement>('[data-ui-action="cancel-remove-from-kindle"]').forEach((element) => element.addEventListener("click", () => this.#closeCatalogRemovalDialog()));
+    scope.querySelector<HTMLButtonElement>('button[data-ui-action="confirm-remove-from-kindle"]')?.addEventListener("click", () => {
+      void this.#catalog.confirmBookRemoval().then(() => {
+        if (this.#catalog.snapshot.pendingRemoval) return;
+        this.#restoreCatalogRemovalFocus();
+      });
+    });
     scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="clear-filters"]').forEach((button) => button.addEventListener("click", () => this.#catalog.clearFilters()));
     scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="retry-catalog"]').forEach((button) => button.addEventListener("click", () => { void this.#catalog.retry(); }));
     scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="catalog-page"]').forEach((button) => button.addEventListener("click", () => {
@@ -613,7 +645,10 @@ export class AppView {
     scope.querySelectorAll<HTMLElement>('[data-ui-action="close-send"]').forEach((element) => element.addEventListener("click", () => this.#closeCatalogDialog()));
     scope.querySelector<HTMLButtonElement>('button[data-ui-action="confirm-catalog-send"]')?.addEventListener("click", () => { void this.#catalog.confirmSend(); });
     scope.querySelector<HTMLButtonElement>('button[data-ui-action="dismiss-announcement"]')?.addEventListener("click", () => this.#catalog.dismissAnnouncement());
-    if (scope === this.#root) this.#activateCatalogDialog();
+    if (scope === this.#root) {
+      this.#activateCatalogDialog();
+      this.#activateCatalogRemovalDialog();
+    }
   }
 
   #closeCatalogDialog(): void {
@@ -628,6 +663,65 @@ export class AppView {
         ?? this.#root.querySelector<HTMLElement>('.library-nav-item[aria-current="page"]')
         ?? this.#root.querySelector<HTMLElement>(".library-brand"))?.focus();
     });
+  }
+
+  #closeCatalogRemovalDialog(): void {
+    if (this.#catalog.snapshot.bulkActionBusy) return;
+    this.#catalog.cancelBookRemoval();
+    this.#restoreCatalogRemovalFocus();
+  }
+
+  #restoreCatalogRemovalFocus(): void {
+    const returnBookId = this.#catalogRemovalReturnBookId;
+    this.#catalogRemovalReturnBookId = undefined;
+    window.queueMicrotask(() => {
+      const trigger = returnBookId
+        ? [...this.#root.querySelectorAll<HTMLElement>(".library-book-menu > summary")]
+            .find((summary) => summary.closest<HTMLElement>("[data-book-id]")?.dataset.bookId === returnBookId)
+        : this.#root.querySelector<HTMLElement>('button[data-ui-action="bulk-remove-from-kindle"]');
+      (trigger
+        ?? this.#root.querySelector<HTMLElement>('.library-nav-item[aria-current="page"]')
+        ?? this.#root.querySelector<HTMLElement>(".library-brand"))?.focus();
+    });
+  }
+
+  #activateCatalogRemovalDialog(): void {
+    const dialog = this.#root.querySelector<HTMLElement>('.library-remove-sheet[role="alertdialog"]');
+    if (!dialog) return;
+    [
+      this.#root.querySelector<HTMLElement>(".library-topbar"),
+      this.#root.querySelector<HTMLElement>(".library-sidebar"),
+      ...this.#root.querySelectorAll<HTMLElement>(".library-main > :not(.library-remove-sheet):not(.library-modal-backdrop)"),
+      this.#root.querySelector<HTMLElement>(".library-global-alerts"),
+      this.#root.querySelector<HTMLElement>(".poc-lab"),
+      this.#root.querySelector<HTMLElement>(".footer"),
+    ].filter((element): element is HTMLElement => element !== null)
+      .forEach((element) => element.setAttribute("inert", ""));
+    dialog.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        this.#closeCatalogRemovalDialog();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = [...dialog.querySelectorAll<HTMLElement>('button:not([disabled]), [tabindex]:not([tabindex="-1"])')];
+      if (focusable.length === 0) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+      const first = focusable[0]!;
+      const last = focusable.at(-1)!;
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    });
+    (dialog.querySelector<HTMLElement>('button[data-ui-action="cancel-remove-from-kindle"]:not([disabled])')
+      ?? dialog).focus();
   }
 
   #activateCatalogDialog(): void {

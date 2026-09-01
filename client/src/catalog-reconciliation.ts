@@ -8,7 +8,6 @@ import type {
   CatalogMatchIndex,
   CatalogMatchIndexEntry,
 } from "./catalog-client";
-import { decodeMetadataClaimBitmap } from "./catalog-client";
 import {
   createManagedFilenameToken,
   hasSufficientKindleObjectDistinguishability,
@@ -32,9 +31,8 @@ export interface ReconcileCatalogOptions {
   /** Opaque installation-HMAC device identity. It is never rendered or logged. */
   readonly deviceKey?: string;
   /**
-   * True only when every enabled catalog claimant participated. If another
-   * profile is deferred, metadata alone cannot prove that its single Kindle
-   * candidate is globally unique; source-scoped managed/delivery evidence can.
+   * Retained for compatibility with older callers. Matching is scoped to the
+   * selected profile, just as Calibre matches against its active library.
    */
   readonly metadataClaimScopeComplete?: boolean;
 }
@@ -84,8 +82,9 @@ function expectedArtifactSize(
 
 /**
  * Reconciles compact, profile-scoped catalog indexes entirely in the browser.
- * Raw Kindle identifiers and inventory never leave the browser. Only a unique
- * strong match in a complete inventory can become `confirmed`.
+ * Raw Kindle identifiers and inventory never leave the browser. Strong
+ * evidence in a complete inventory becomes `confirmed` within the selected
+ * profile; indistinguishable catalog rows are allocated deterministically.
  */
 export async function reconcileCatalogIndexes(
   indexes: readonly CatalogMatchIndex[],
@@ -105,14 +104,10 @@ export async function reconcileCatalogIndexes(
   const statusCountsByProfile = new Map<string, CatalogKindleStatusCounts>();
   const associations = new Map<number, ObjectAssociation>();
   const confirmedClaims = new Map<number, Set<string>>();
+  const possibleClaims = new Map<string, Set<number>>();
 
   for (const index of indexes) {
-    const decodedClaimCollisions = index.metadataClaims
-      ? decodeMetadataClaimBitmap(index.metadataClaims.collisionBitmap)
-      : undefined;
-    const metadataSummaryIncomplete = index.metadataClaims?.complete !== true
-      || decodedClaimCollisions === undefined;
-    for (const [entryPosition, entry] of index.entries.entries()) {
+    for (const entry of index.entries) {
       const managedToken = managedTokenFromIndex(entry)
         ?? await createManagedFilenameToken(entry.bookId, entry.contentHash);
       const deliveries = entry.deliveries
@@ -131,25 +126,22 @@ export async function reconcileCatalogIndexes(
       const match = matchCatalogBookToKindle({
         title: entry.title,
         authors: entry.authors,
+        authorSort: entry.authorSort,
         identifiers: entry.identifiers,
         expectedArtifactSize: expectedArtifactSize(entry, deliveries),
         sourceFilename: entry.sourceFilename,
         managedToken,
         deliveries,
       }, objects, snapshot.status, snapshot.bookMetadata?.status ?? "disabled");
-      const metadataDerivedConfirmation = match.status === "confirmed"
-        && (match.evidence === "identifier-title-author" || match.evidence === "title-author-size");
-      const globalClaimCollision = decodedClaimCollisions !== undefined
-        && ((decodedClaimCollisions[entryPosition >>> 3] ?? 0) & (1 << (entryPosition & 7))) !== 0;
-      const effectiveMatchStatus = metadataDerivedConfirmation
-        && (options.metadataClaimScopeComplete === false || metadataSummaryIncomplete || globalClaimCollision)
-        ? "possible" as const
-        : match.status;
+      const effectiveMatchStatus = match.status;
       const status: CatalogKindleStatus = effectiveMatchStatus === "absent"
         ? metadataCanProveAbsence ? "not-on-kindle" : "unknown"
         : effectiveMatchStatus;
       statuses.set(entry.bookId, status);
       if (effectiveMatchStatus === "absent") continue;
+      if (effectiveMatchStatus === "possible" && match.candidates.length > 0) {
+        possibleClaims.set(entry.bookId, new Set(match.candidates.map((candidate) => candidate.handle)));
+      }
       for (const candidate of match.candidates) {
         if (effectiveMatchStatus === "confirmed") {
           const claims = confirmedClaims.get(candidate.handle) ?? new Set<string>();
@@ -164,15 +156,38 @@ export async function reconcileCatalogIndexes(
     }
   }
 
-  // A one-to-one result inside each book is not enough: two distinct catalog
-  // books can independently claim the same unmanaged Kindle object. Neither
-  // claim is unique across the whole comparison, so both must remain visibly
-  // uncertain instead of receiving green checks.
+  // Calibre resolves indistinguishable active-library records to one stable
+  // database row. Mirror that behavior using the backend's stable book IDs,
+  // while associating every same-book device copy consistently. A book that
+  // loses one contested object remains confirmed if it wins another.
+  const assignedConfirmedBooks = new Set<string>();
+  const confirmedBookIds = new Set<string>();
   for (const [handle, claims] of confirmedClaims) {
-    if (claims.size <= 1) continue;
-    for (const bookId of claims) statuses.set(bookId, "possible");
-    const firstBookId = claims.values().next().value as string;
-    associations.set(handle, { bookId: firstBookId, status: "possible" });
+    const orderedClaims = [...claims].sort((left, right) => left < right ? -1 : left > right ? 1 : 0);
+    const selectedBookId = orderedClaims[0];
+    if (!selectedBookId) continue;
+    assignedConfirmedBooks.add(selectedBookId);
+    for (const bookId of orderedClaims) confirmedBookIds.add(bookId);
+    associations.set(handle, { bookId: selectedBookId, status: "confirmed" });
+  }
+  for (const bookId of confirmedBookIds) {
+    if (assignedConfirmedBooks.has(bookId)) continue;
+    statuses.set(bookId, metadataCanProveAbsence ? "not-on-kindle" : "unknown");
+  }
+
+  // A weak candidate is no longer ambiguous when every object it could mean
+  // has been authoritatively allocated to another active-library record. This
+  // mirrors Calibre's one-record device mapping and prevents a deterministic
+  // winner from leaving unrelated catalog rows yellow forever.
+  for (const [bookId, handles] of possibleClaims) {
+    if (statuses.get(bookId) !== "possible" || handles.size === 0) continue;
+    const allAllocatedElsewhere = [...handles].every((handle) => {
+      const association = associations.get(handle);
+      return association?.status === "confirmed" && association.bookId !== bookId;
+    });
+    if (allAllocatedElsewhere) {
+      statuses.set(bookId, metadataCanProveAbsence ? "not-on-kindle" : "unknown");
+    }
   }
 
   for (const index of indexes) {

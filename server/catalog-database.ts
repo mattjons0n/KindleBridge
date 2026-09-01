@@ -166,6 +166,7 @@ interface MatchBookRow extends Row {
   id: string;
   title: string;
   authors_json: string;
+  author_sort: string | null;
   identifiers_json: string;
   format: string;
   size: number;
@@ -2351,6 +2352,7 @@ export class CatalogDatabase {
               bookId: String(row.id),
               title: String(row.title),
               authors: parseStringArray(row.authors_json),
+              authorSort: stringOrNull(row.author_sort),
               identifiers: parseStringArray(row.identifiers_json),
               sourceFormat: String(row.format) as BookFormat,
               sourceSize: Number(row.size),
@@ -2468,7 +2470,9 @@ export class CatalogDatabase {
            ) AS delivery_count,
            (SELECT coalesce(sum(
                length(CAST(b.id AS BLOB)) + length(CAST(b.title AS BLOB))
-               + length(CAST(b.authors_json AS BLOB)) + length(CAST(b.identifiers_json AS BLOB))
+               + length(CAST(b.authors_json AS BLOB))
+               + coalesce(length(CAST(b.author_sort AS BLOB)), 0)
+               + length(CAST(b.identifiers_json AS BLOB))
                + length(CAST(sf.format AS BLOB)) + length(CAST(sf.content_hash AS BLOB))
                + length(CAST(sf.relative_path AS BLOB))
              ), 0)
@@ -2758,6 +2762,8 @@ export class CatalogDatabase {
         sink.string(String(row.title));
         sink.raw(',"authors":');
         sink.raw(String(row.authors_json));
+        sink.raw(',"authorSort":');
+        sink.nullableString(stringOrNull(row.author_sort));
         sink.raw(',"identifiers":');
         sink.raw(String(row.identifiers_json));
         sink.raw(',"sourceFormat":');
@@ -2792,7 +2798,7 @@ export class CatalogDatabase {
   ): void {
     const books = this.database
       .prepare(
-        `SELECT b.id, b.title, b.authors_json, b.identifiers_json,
+        `SELECT b.id, b.title, b.authors_json, b.author_sort, b.identifiers_json,
            sf.format, sf.size, sf.content_hash, sf.relative_path
          FROM books b
          JOIN source_files sf ON sf.id = b.source_file_id

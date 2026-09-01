@@ -287,9 +287,9 @@ describe("HttpCatalogClient", () => {
   });
 
   it("parses match-index data without requiring raw device identity", async () => {
-    const fetch = vi.fn(async () => jsonResponse({ profileId: "prf_1", generatedAt: "2026-08-29T12:00:00Z", metadataClaims: { complete: true, collisionBitmap: EMPTY_METADATA_CLAIM_BITMAP }, entries: [{ bookId: "book_1", sourceFilename: "book.epub", sourceFormat: "epub", sourceSize: 100, contentHash: "hash", identifiers: ["isbn:1"], title: "Book", authors: ["Author"], deliveries: [{ deviceKey: "digest", filename: "book.azw3", artifactHash: "artifact", artifactSize: 120, objectIdentity: "persistent", managedToken: "kb-token", status: "delivered", deliveredAt: "2026-08-29T12:05:00Z" }] }] }));
+    const fetch = vi.fn(async () => jsonResponse({ profileId: "prf_1", generatedAt: "2026-08-29T12:00:00Z", metadataClaims: { complete: true, collisionBitmap: EMPTY_METADATA_CLAIM_BITMAP }, entries: [{ bookId: "book_1", sourceFilename: "book.epub", sourceFormat: "epub", sourceSize: 100, contentHash: "hash", identifiers: ["isbn:1"], title: "Book", authors: ["Author"], authorSort: "Author, Test", deliveries: [{ deviceKey: "digest", filename: "book.azw3", artifactHash: "artifact", artifactSize: 120, objectIdentity: "persistent", managedToken: "kb-token", status: "delivered", deliveredAt: "2026-08-29T12:05:00Z" }] }] }));
     const client = new HttpCatalogClient({ fetch });
-    await expect(client.getMatchIndex("prf_1")).resolves.toEqual(expect.objectContaining({ metadataClaims: { complete: true, collisionBitmap: EMPTY_METADATA_CLAIM_BITMAP }, entries: [expect.objectContaining({ sourceFilename: "book.epub", sourceFormat: "EPUB", deliveries: [expect.objectContaining({ managedToken: "kb-token" })] })] }));
+    await expect(client.getMatchIndex("prf_1")).resolves.toEqual(expect.objectContaining({ metadataClaims: { complete: true, collisionBitmap: EMPTY_METADATA_CLAIM_BITMAP }, entries: [expect.objectContaining({ sourceFilename: "book.epub", sourceFormat: "EPUB", authorSort: "Author, Test", deliveries: [expect.objectContaining({ managedToken: "kb-token" })] })] }));
   });
 
   it.each([

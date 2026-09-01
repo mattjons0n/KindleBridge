@@ -48,7 +48,7 @@ Milestones 0–9 now implement the production software that was absent from that
 - a reproducibly rebuilt boko artifact with pre-retention archive, spine, DOM/IR/style, MathML, normalized XHTML/CSS, cache, and 200 MiB AZW3-output limits plus actual-WASM hostile-input regressions;
 - strict host/origin controls and documented private HTTPS reverse-proxy/VPN operation.
 
-The original automated baseline was 18 test files and 133 passing tests; it is historical. The authoritative 2026-08-30 root `npm run check` completed with 53/53 test files and 628/628 tests, followed by successful client typechecking, server build, and production Vite build. Physical success still applies only to the earlier transfer POC. A fresh physical integrated journey, real household-mount/private-origin checks, and measured peak browser memory remain Milestone 10.
+The original automated baseline was 18 test files and 133 passing tests; it is historical. The authoritative 2026-08-31 root gate completed with 55/55 test files and 666/666 tests, followed by successful client typechecking, server build, and production Vite build. Physical success still applies only to the earlier transfer POC. A fresh physical integrated journey, real household-mount/private-origin checks, and measured peak browser memory remain Milestone 10.
 
 ## 3. Implemented architecture
 
@@ -148,7 +148,7 @@ Exit gate:
 
 - The target Docker environment and network boundary are documented.
 - A public unauthenticated route is explicitly rejected.
-- The expanded root `npm run check` gate passes at 53/53 files and 628/628 tests, with client typechecking and both production builds green.
+- The expanded root gate passes at 55/55 files and 666/666 tests, with client typechecking and both production builds green.
 
 ### Milestone 1 — Full-stack foundation — Implemented
 
@@ -294,8 +294,8 @@ Tasks:
 - Add a stable, non-secret, source-version-scoped managed token to every Kindle Bridge filename and store it in a durable delivery record. Bind it to both the opaque book ID and indexed content hash so replaced bytes cannot inherit an old delivery's green state.
 - Keep session-local MTP handles out of durable identity decisions.
 - Implement the matcher as pure, exhaustively tested browser code using the shared catalog contracts, with three results: `confirmed`, `possible`, and `absent`.
-- Use evidence in this order: managed token plus delivery record; proven persistent object identity; exact embedded identifier with normalized title/author; exact normalized title/author/size; fuzzy evidence as possible only.
-- Build a compact active-profile match index for browser-side reconciliation so raw device serials and book bytes never reach the server. In the same bounded SQLite snapshot, include a fixed-width collision summary of other enabled/available household claimants so globally unique unmanaged evidence can confirm without downloading every profile; incomplete or colliding summaries fail yellow.
+- Use evidence in this order: managed token plus delivery record; proven persistent object identity; exact embedded identifier with Calibre-compatible title/author; exact Calibre-compatible title/author/size; fuzzy evidence as possible only. Calibre-compatible comparison removes punctuation from the title key and checks joined authors, `author_sort`, and each individual device author.
+- Build a compact active-profile match index for browser-side reconciliation so raw device serials and book bytes never reach the server. Scope ordinary unmanaged matching to the selected profile, as Calibre scopes device matching to its active library; allocate indistinguishable active-library rows deterministically.
 - Let Kindle-state catalog queries accept only bounded confirmed/possible book ID sets and re-scope every ID to the active profile.
 - Show Kindle-only/unmanaged objects separately. Never overwrite, rename, or delete them.
 
@@ -303,7 +303,7 @@ Exit gate:
 
 - Only `confirmed` receives the green check.
 - Ambiguous title, duplicate title, missing identifier, unmanaged file, renamed managed file, multiple deliveries, cross-profile, and reconnect cases have tests.
-- A failed or partial inventory cannot silently turn a possible match into confirmed.
+- A partial hierarchy inventory cannot silently turn weak evidence into confirmed. A fully parsed exact object may confirm even when an unrelated object's metadata failed, while incomplete metadata keeps absence unknown.
 
 ### Milestone 8 — One-click Send to Kindle — Implemented; physical acceptance pending
 
@@ -326,7 +326,7 @@ Tasks:
 Exit gate:
 
 - One click advances through **Preparing**, **Converting** when needed, **Sending**, and **Verifying**.
-- Existing Kindle objects are never overwritten, broadly deleted, moved, or renamed.
+- Existing Kindle objects are never overwritten, broadly deleted, moved, or renamed. A separate user-confirmed removal action may delete only exact current confirmed book handles after live revalidation and exact absence verification.
 - Host-mounted source hashes are identical before and after the operation.
 - Network loss, changed source, conversion failure, insufficient space, USB loss at every write phase, delivery-record failure, and retry are tested.
 - Actual checked-in WASM tests cover normal Epictetus conversion plus archive entry/inflation attacks, a 100,001-node wide DOM, 4,097 OPF itemrefs, excessive MathML depth, synthesized XHTML beyond 32 MiB, and resource-driven AZW3 output beyond 200 MiB without returning partial bytes.
@@ -472,9 +472,9 @@ Mocks can prove behavior, not Kindle acceptance. Any release that changes conver
 
 ## 10. Completion and next gate
 
-The read-only catalog slice and the later watcher, inventory, reconciliation, Send, converter-hardening, recovery, and Docker software are implemented. The authoritative root gate passes at 53/53 files and 628/628 tests with typechecking and production builds. The current schema-v13 local image passes restore/rebuild, hardened native arm64, cross-runtime amd64, and attested dual-architecture OCI acceptance. Before household release:
+The read-only catalog slice and the later watcher, inventory, reconciliation, Send, exact removal, converter-hardening, recovery, and Docker software are implemented. The authoritative root gate passes at 55/55 files and 666/666 tests with typechecking and production builds. The current schema-v13 local image passes restore/rebuild, hardened native arm64, cross-runtime amd64, and attested dual-architecture OCI acceptance. Before household release:
 
-1. Repeat the expanded journey on the physical Kindle: user-initiated chooser, automatic exact-byte self-test, complete/partial inventory behavior, confirmed/possible matching, catalog-driven Send, Kindle indexing/open/navigation/cover, reconnect, durable match recovery, and root-cache creation/reuse/A-B rotation from a second browser installation without surfacing the cache in the Kindle library or changing `metadata.calibre`.
+1. Repeat the expanded journey on the physical Kindle: user-initiated chooser, automatic exact-byte self-test, complete/partial inventory behavior, confirmed/possible matching, catalog-driven Send, exact single/bulk removal, Kindle indexing/open/navigation/cover, reconnect, durable match recovery, and root-cache creation/reuse/A-B rotation from a second browser installation without surfacing the cache in the Kindle library or changing `metadata.calibre`.
 2. Configure the real husband and wife read-only host mounts, including multiple roots, and verify profile scope, incremental ingestion, source health, byte-identical originals, mount loss/restoration, backup/restore, and rebuild on the intended host.
 3. Verify the intended LAN/VPN exposure and exact trusted HTTPS origin on the client that will use WebUSB. The no-login service must not be publicly reachable.
 4. Measure peak browser memory with the largest accepted household EPUB on the intended WebUSB client and record the result against the documented planning allowance.

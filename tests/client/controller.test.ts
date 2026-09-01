@@ -50,6 +50,35 @@ function fakeDevice(): UsbDeviceLike {
   };
 }
 
+function completeKindleInventory(
+  objects: KindleInventorySnapshot["objects"],
+): KindleInventorySnapshot {
+  const bookCount = objects.filter(({ kind }) => kind === "file").length;
+  return {
+    status: "complete",
+    storageId: 0x10001,
+    documentsHandle: 0x37,
+    objects,
+    issues: [],
+    issueCount: 0,
+    scannedObjectCount: objects.length,
+    bookMetadata: {
+      status: "complete",
+      eligibleObjectCount: bookCount,
+      attemptedObjectCount: bookCount,
+      parsedObjectCount: bookCount,
+      enrichedObjectCount: bookCount,
+      failedObjectCount: 0,
+      skippedObjectCount: 0,
+      indistinguishableObjectCount: 0,
+      readByteCount: 0,
+      budgetedByteCount: 0,
+      truncated: false,
+      truncationReasons: [],
+    },
+  };
+}
+
 class FakeBrowserLifecycle implements BrowserLifecycleSource {
   visibilityState: DocumentVisibilityState = "visible";
   readonly #listeners = new Map<string, Set<(event: Event) => void>>();
@@ -154,6 +183,19 @@ function harness(
     }),
     sendAzW3AndRefreshInventory: vi.fn(async (blob, filename, options) => ({
       transfer: await connection.sendAzW3(blob, filename, options),
+      inventory,
+      inventoryRefresh: "complete" as const,
+    })),
+    removeBooksAndRefreshInventory: vi.fn(async (handles: readonly number[]) => ({
+      removals: handles.map((removedHandle) => ({
+        handle: removedHandle,
+        storageId: inventory.storageId,
+        parentHandle: inventory.documentsHandle,
+        filename: "removed.azw3",
+        size: 0,
+        objectFormat: 0xb00a,
+        removed: true as const,
+      })),
       inventory,
       inventoryRefresh: "complete" as const,
     })),
@@ -1192,7 +1234,7 @@ describe("AppController local conversion flow", () => {
     )?.disabled).toBe(false);
   });
 
-  it("keeps cross-profile metadata claims possible while source-scoped managed evidence stays confirmed", async () => {
+  it("uses Calibre-style selected-profile matches without cross-profile downgrades", async () => {
     const sourceBytes = Uint8Array.from([0x50, 0x4b, 0x03, 0x04, 1, 2, 3, 4]);
     const metadataHash = createHash("sha256").update(sourceBytes).digest("hex");
     const managedHash = "b".repeat(64);
@@ -1349,11 +1391,11 @@ describe("AppController local conversion flow", () => {
       "profile-1",
     ]);
     expect(app.root.querySelector('[data-book-id="book-1"] .library-kindle-check')?.getAttribute("aria-label"))
-      .toBe("Possible Kindle match");
+      .toBe("Already on this Kindle");
     expect(app.root.querySelector('[data-book-id="book-managed"] .library-kindle-check')?.getAttribute("aria-label"))
       .toBe("Already on this Kindle");
     expect(app.controller.latestCatalogInventory?.items.find(({ id }) => id === "mtp-00000029")?.match)
-      .toBe("possible");
+      .toBe("confirmed");
     expect(app.controller.latestCatalogInventory?.items.find(({ id }) => id === "mtp-0000002a")?.match)
       .toBe("confirmed");
 
@@ -1368,6 +1410,137 @@ describe("AppController local conversion flow", () => {
       expect(vi.mocked(app.catalogApi.getMatchIndex)).toHaveBeenCalledTimes(2);
       expect(app.root.querySelector('[data-book-id="book-1"] .library-kindle-check')?.getAttribute("aria-label"))
         .toBe("Already on this Kindle");
+    });
+  });
+
+  it("removes an exact confirmed catalog match and reconciles the refreshed Kindle inventory", async () => {
+    const app = harness(true);
+    const object = {
+      handle: 41,
+      storageId: 0x10001,
+      parentHandle: 0x37,
+      objectFormat: 0xb00a,
+      protectionStatus: 0,
+      associationType: 0,
+      size: app.book.size,
+      filename: "Book.azw3",
+      relativePath: "Book.azw3",
+      depth: 1,
+      kind: "file" as const,
+      title: app.book.title,
+      authors: [...app.book.authors],
+      identifiers: [...app.book.identifiers],
+      metadataAdjusted: false,
+      bookMetadataState: "enriched" as const,
+    };
+    const connectedInventory = completeKindleInventory([object]);
+    const refreshedInventory = completeKindleInventory([]);
+    vi.mocked(app.connection.refreshInventory).mockResolvedValueOnce(connectedInventory);
+    const removeBooks = vi.mocked(app.connection.removeBooksAndRefreshInventory!);
+    removeBooks.mockResolvedValueOnce({
+      removals: [{
+        handle: object.handle,
+        storageId: object.storageId,
+        parentHandle: object.parentHandle,
+        filename: object.filename,
+        size: object.size,
+        objectFormat: object.objectFormat,
+        removed: true,
+      }],
+      inventory: refreshedInventory,
+      inventoryRefresh: "complete",
+    });
+
+    await vi.waitFor(() => expect(app.root.querySelector('[data-book-id="book-1"]')).not.toBeNull());
+    await app.controller.connect();
+    expect(app.controller.latestCatalogInventory?.items).toEqual([
+      expect.objectContaining({ id: "mtp-00000029", bookId: app.book.id, match: "confirmed" }),
+    ]);
+
+    await app.controller.removeCatalogBooks({
+      profileId: "profile-1",
+      targets: [{
+        itemId: "mtp-00000029",
+        bookId: app.book.id,
+        title: app.book.title,
+        filename: object.filename,
+        size: object.size,
+      }],
+    });
+
+    expect(removeBooks).toHaveBeenCalledWith(
+      [object.handle],
+      expect.objectContaining({
+        signal: expect.any(AbortSignal),
+        aggregateTimeoutMs: 5 * 60_000,
+      }),
+      expect.objectContaining({
+        signal: expect.any(AbortSignal),
+        deviceMetadataCache: "read-write",
+        onObjectState: expect.any(Function),
+      }),
+    );
+    expect(app.catalogApi.getMatchIndex).toHaveBeenCalledTimes(2);
+    expect(app.controller.latestCatalogInventory).toMatchObject({
+      completeness: "complete",
+      items: [],
+      matching: { status: "complete", matchedProfiles: 1, failedProfiles: 0 },
+    });
+    expect(app.controller.state.catalogInventoryState).toBe("ready");
+    expect(app.root.querySelector('[data-book-id="book-1"] .library-kindle-check')).toBeNull();
+  });
+
+  it("rejects a stale removal target before invoking the Kindle device API", async () => {
+    const app = harness(true);
+    const object = {
+      handle: 41,
+      storageId: 0x10001,
+      parentHandle: 0x37,
+      objectFormat: 0xb00a,
+      protectionStatus: 0,
+      associationType: 0,
+      size: app.book.size,
+      filename: "Book.azw3",
+      relativePath: "Book.azw3",
+      depth: 1,
+      kind: "file" as const,
+      title: app.book.title,
+      authors: [...app.book.authors],
+      identifiers: [...app.book.identifiers],
+      metadataAdjusted: false,
+      bookMetadataState: "enriched" as const,
+    };
+    vi.mocked(app.connection.refreshInventory).mockResolvedValueOnce(
+      completeKindleInventory([object]),
+    );
+    const removeBooks = vi.mocked(app.connection.removeBooksAndRefreshInventory!);
+
+    await vi.waitFor(() => expect(app.root.querySelector('[data-book-id="book-1"]')).not.toBeNull());
+    await app.controller.connect();
+    expect(app.controller.latestCatalogInventory?.items[0]).toMatchObject({
+      id: "mtp-00000029",
+      bookId: app.book.id,
+      match: "confirmed",
+    });
+
+    await expect(app.controller.removeCatalogBooks({
+      profileId: "profile-1",
+      targets: [{
+        itemId: "mtp-00000029",
+        bookId: app.book.id,
+        title: app.book.title,
+        filename: "Book-renamed-after-dialog.azw3",
+        size: object.size,
+      }],
+    })).rejects.toMatchObject({
+      code: "INVALID_STATE",
+      message: expect.stringContaining("changed or is no longer an exact confirmed match"),
+    });
+
+    expect(removeBooks).not.toHaveBeenCalled();
+    expect(app.controller.latestCatalogInventory?.items[0]).toMatchObject({
+      id: "mtp-00000029",
+      match: "confirmed",
     });
   });
 
@@ -2081,7 +2254,7 @@ describe("AppController local conversion flow", () => {
     },
   );
 
-  it("keeps a successful Send visibly possible when duplicate managed-token objects are ambiguous", async () => {
+  it("keeps a successful Send confirmed when duplicate device copies share its managed token", async () => {
     const app = harness(true);
     vi.mocked(app.catalogApi.getMatchIndex).mockResolvedValue({
       profileId: "profile-1",
@@ -2157,19 +2330,19 @@ describe("AppController local conversion flow", () => {
     });
     expect(app.connection.sendAzW3AndRefreshInventory).toHaveBeenCalledOnce();
     expect(app.controller.latestCatalogInventory?.items).toHaveLength(2);
-    expect(app.controller.latestCatalogInventory?.items.every(({ match }) => match === "possible")).toBe(true);
+    expect(app.controller.latestCatalogInventory?.items.every(({ match }) => match === "confirmed")).toBe(true);
     const card = app.root.querySelector<HTMLElement>('[data-book-id="book-1"]');
-    expect(card?.textContent).toContain("Possible Kindle match");
-    expect(card?.querySelector('.library-kindle-check[aria-label="Already on this Kindle"]')).toBeNull();
+    expect(card?.textContent).not.toContain("Possible Kindle match");
+    expect(card?.querySelector('.library-kindle-check[aria-label="Already on this Kindle"]')).not.toBeNull();
     expect(card?.querySelector<HTMLButtonElement>('[data-ui-action="send-book"]')).toMatchObject({
       disabled: true,
-      textContent: "Possible match",
+      textContent: "✓ On Kindle",
     });
     await expect(
       app.controller.sendCatalogBook({ profileId: "profile-1", book: app.book }),
     ).rejects.toMatchObject({
       code: "INVALID_STATE",
-      message: expect.stringContaining("may already be on the connected Kindle"),
+      message: expect.stringContaining("already confirmed on the connected Kindle"),
     });
     expect(app.connection.sendAzW3AndRefreshInventory).toHaveBeenCalledOnce();
   });

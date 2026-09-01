@@ -15,7 +15,11 @@ import type {
   SaveCatalogConfigurationInput,
 } from "../../client/src/catalog-client";
 import { CatalogApiError } from "../../client/src/catalog-client";
-import { CatalogBrowser } from "../../client/src/catalog-browser";
+import {
+  CatalogBrowser,
+  type CatalogRemoveRequest,
+  type CatalogSendRequest,
+} from "../../client/src/catalog-browser";
 import { catalogQuery, countLibraryBooks, initialLibraryFilters } from "../../client/src/library-prototype";
 import { DebugLog } from "../../client/src/log";
 import { initialAppState } from "../../client/src/state";
@@ -464,6 +468,117 @@ describe("catalog-backed library model", () => {
       disabled: true,
       textContent: "Possible match",
     });
+  });
+
+  it("toggles list selection and sends the eligible selection through the bulk hook", async () => {
+    const send = vi.fn(async (_request: CatalogSendRequest) => undefined);
+    const { root, view } = await loadedView(fakeApi(), handlers({ onCatalogSendRequested: send }));
+    view.setCatalogKindleStatuses(new Map([
+      ["book_time", "not-on-kindle"],
+      ["book_dorian", "not-on-kindle"],
+    ]), new Map([
+      ["prf_personal", { confirmed: 0, possible: 0, notOnKindle: 2, unknown: 0 }],
+    ]));
+    view.setCatalogKindleInventory({
+      deviceLabel: "Current Kindle",
+      scannedAt: new Date().toISOString(),
+      completeness: "complete",
+      total: 0,
+      truncated: false,
+      metadata: { status: "complete", eligible: 0, enriched: 0, failed: 0, skipped: 0, truncated: false },
+      matching: { status: "complete", matchedProfiles: 1, failedProfiles: 0 },
+      items: [],
+    });
+    view.render({
+      ...initialAppState(),
+      device: { kind: "ready", details: { vendorId: 0x1949, productId: 0x9981 } },
+      selfTest: { kind: "passed", byteLength: 1_012 },
+      catalogInventoryState: "ready",
+    });
+
+    click(root, '[data-ui-action="set-library-layout"][data-layout="list"]');
+    expect(root.querySelector('[data-ui-action="set-library-layout"][data-layout="list"]')?.getAttribute("aria-pressed")).toBe("true");
+    expect(root.querySelectorAll<HTMLInputElement>('[data-ui-action="toggle-book-selection"]')).toHaveLength(2);
+
+    const first = root.querySelector<HTMLInputElement>('[data-book-id="book_time"] [data-ui-action="toggle-book-selection"]')!;
+    first.checked = true;
+    first.dispatchEvent(new Event("change", { bubbles: true }));
+    expect(root.querySelector(".library-bulk-selection")?.textContent).toContain("1 selected");
+
+    click(root, '[data-ui-action="set-library-layout"][data-layout="grid"]');
+    expect(root.querySelector('[data-ui-action="toggle-book-selection"]')).toBeNull();
+    click(root, '[data-ui-action="set-library-layout"][data-layout="list"]');
+    expect(root.querySelector(".library-bulk-selection")?.textContent).toContain("0 selected");
+
+    for (const bookId of ["book_time", "book_dorian"]) {
+      const checkbox = root.querySelector<HTMLInputElement>(`[data-book-id="${bookId}"] [data-ui-action="toggle-book-selection"]`)!;
+      checkbox.checked = true;
+      checkbox.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+    const bulkSend = root.querySelector<HTMLButtonElement>('[data-ui-action="bulk-send-to-kindle"]');
+    expect(bulkSend).toMatchObject({ disabled: false });
+    expect(bulkSend?.dataset.bookCount).toBe("2");
+    bulkSend?.click();
+
+    await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(2));
+    expect(send.mock.calls.map(([request]) => request.book.id)).toEqual(["book_time", "book_dorian"]);
+    await vi.waitFor(() => expect(root.querySelector(".library-toast")?.textContent).toContain("2 books were sent"));
+    expect(root.querySelector(".library-bulk-selection")?.textContent).toContain("0 selected");
+  });
+
+  it("confirms an exact per-item Kindle filename before invoking the removal hook", async () => {
+    const remove = vi.fn(async (_request: CatalogRemoveRequest) => undefined);
+    const { root, view } = await loadedView(fakeApi(), handlers({ onCatalogRemoveRequested: remove }));
+    view.setCatalogKindleStatuses(new Map([
+      ["book_time", "confirmed"],
+      ["book_dorian", "possible"],
+    ]), new Map([
+      ["prf_personal", { confirmed: 1, possible: 1, notOnKindle: 0, unknown: 0 }],
+    ]));
+    view.setCatalogKindleInventory({
+      deviceLabel: "Current Kindle",
+      scannedAt: new Date().toISOString(),
+      completeness: "complete",
+      total: 2,
+      truncated: false,
+      metadata: { status: "complete", eligible: 2, enriched: 2, failed: 0, skipped: 0, truncated: false },
+      matching: { status: "complete", matchedProfiles: 1, failedProfiles: 0 },
+      items: [
+        { id: "mtp-exact", filename: "The Time Machine - exact device copy.azw3", size: 812_345, managed: false, bookId: "book_time", match: "confirmed" },
+        { id: "mtp-possible", filename: "Dorian Gray - uncertain.azw3", size: 900_000, managed: false, bookId: "book_dorian", match: "possible" },
+      ],
+    });
+    view.render({
+      ...initialAppState(),
+      device: { kind: "ready", details: { vendorId: 0x1949, productId: 0x9981 } },
+      selfTest: { kind: "passed", byteLength: 1_012 },
+      catalogInventoryState: "ready",
+    });
+
+    const exactRemove = root.querySelector<HTMLButtonElement>('[data-book-id="book_time"] [data-ui-action="remove-book-from-kindle"]');
+    const possibleRemove = root.querySelector<HTMLButtonElement>('[data-book-id="book_dorian"] [data-ui-action="remove-book-from-kindle"]');
+    expect(exactRemove).toMatchObject({ disabled: false });
+    expect(possibleRemove).toMatchObject({ disabled: true });
+    exactRemove?.click();
+
+    const dialog = root.querySelector<HTMLElement>('.library-remove-sheet[role="alertdialog"]');
+    expect(dialog?.textContent).toContain("The Time Machine - exact device copy.azw3");
+    expect(remove).not.toHaveBeenCalled();
+    click(root, '[data-ui-action="confirm-remove-from-kindle"]');
+
+    await vi.waitFor(() => expect(remove).toHaveBeenCalledOnce());
+    expect(remove).toHaveBeenCalledWith({
+      profileId: "prf_personal",
+      targets: [{
+        itemId: "mtp-exact",
+        bookId: "book_time",
+        title: "The Time Machine",
+        filename: "The Time Machine - exact device copy.azw3",
+        size: 812_345,
+      }],
+    });
+    await vi.waitFor(() => expect(root.querySelector('.library-remove-sheet[role="alertdialog"]')).toBeNull());
+    expect(root.querySelector(".library-toast")?.textContent).toContain("1 exact Kindle file was removed");
   });
 
   it("sends publication-year filters to the server", async () => {

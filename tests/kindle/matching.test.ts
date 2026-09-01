@@ -86,7 +86,7 @@ describe("Kindle inventory matching", () => {
     });
   });
 
-  it("keeps duplicate stable filename tokens ambiguous after reconnect", () => {
+  it("confirms and retains every duplicate carrying the same stable managed token", () => {
     const book = { managedToken: BOOK.managedToken, deliveries: [] };
     const result = matchCatalogBookToKindle(book, [
       object(9, { managedToken: BOOK.managedToken }),
@@ -94,9 +94,10 @@ describe("Kindle inventory matching", () => {
     ], "complete");
 
     expect(result).toMatchObject({
-      status: "possible",
+      status: "confirmed",
       evidence: "managed-token",
-      ambiguous: true,
+      matchedObject: { handle: 9 },
+      ambiguous: false,
     });
     expect(result.candidates.map(({ handle }) => handle)).toEqual([9, 10]);
   });
@@ -114,7 +115,7 @@ describe("Kindle inventory matching", () => {
     expect(result).toMatchObject({ status: "absent", evidence: "none" });
   });
 
-  it("never confirms duplicate strongest evidence", () => {
+  it("confirms multiple device copies at the strongest evidence tier", () => {
     const deliveries = [{
       managedToken: BOOK.managedToken,
       artifactSize: 1_024,
@@ -125,12 +126,12 @@ describe("Kindle inventory matching", () => {
     ], "complete");
 
     expect(result).toMatchObject({
-      status: "possible",
+      status: "confirmed",
       evidence: "delivery-managed-token-size",
-      ambiguous: true,
+      matchedObject: { handle: 1 },
+      ambiguous: false,
     });
     expect(result.candidates.map(({ handle }) => handle)).toEqual([1, 2]);
-    expect(result).not.toHaveProperty("matchedObject");
   });
 
   it("confirms exact identifier, normalized title, and author evidence", () => {
@@ -149,6 +150,134 @@ describe("Kindle inventory matching", () => {
       evidence: "identifier-title-author",
       matchedObject: { handle: 3 },
     });
+  });
+
+  it("confirms Calibre-compatible normalized title and author evidence without an identifier", () => {
+    const result = matchCatalogBookToKindle({
+      title: "  The LEFT Hand—of Darkness ",
+      authors: ["Ursula K. Le Guin"],
+    }, [
+      object(42, {
+        title: "The Left Hand of Darkness",
+        authors: ["Ursula K Le Guin"],
+        identifiers: [],
+      }),
+    ], "complete", "complete");
+
+    expect(result).toMatchObject({
+      status: "confirmed",
+      evidence: "title-author",
+      matchedObject: { handle: 42 },
+      ambiguous: false,
+    });
+  });
+
+  it("uses Calibre's separator-free title key", () => {
+    const result = matchCatalogBookToKindle({
+      title: "The Time Machine",
+      authors: ["H. G. Wells"],
+    }, [object(45, {
+      title: "TheTime-Machine",
+      authors: ["H G Wells"],
+      identifiers: [],
+    })], "complete", "complete");
+
+    expect(result).toMatchObject({ status: "confirmed", evidence: "title-author" });
+  });
+
+  it("matches a device author against Calibre author_sort", () => {
+    const result = matchCatalogBookToKindle({
+      title: "A Wizard of Earthsea",
+      authors: ["Ursula K. Le Guin"],
+      authorSort: "Le Guin, Ursula K.",
+    }, [object(46, {
+      title: "A Wizard of Earthsea",
+      authors: ["Le Guin, Ursula K."],
+      identifiers: [],
+    })], "complete", "complete");
+
+    expect(result).toMatchObject({ status: "confirmed", evidence: "title-author" });
+  });
+
+  it("mirrors Calibre's individual-author fallback for a single-author catalog book", () => {
+    const result = matchCatalogBookToKindle({
+      title: "Collected Essays",
+      authors: ["Primary Author"],
+    }, [object(47, {
+      title: "Collected Essays",
+      authors: ["Primary Author", "Device Contributor"],
+      identifiers: [],
+    })], "complete", "complete");
+
+    expect(result).toMatchObject({ status: "confirmed", evidence: "title-author" });
+  });
+
+  it("keeps one overlapping coauthor possible when the normalized author lists differ", () => {
+    const result = matchCatalogBookToKindle({
+      title: "Collaborative Work",
+      authors: ["Alice Author", "Bob Writer"],
+    }, [object(41, {
+      title: "Collaborative Work",
+      authors: ["Alice Author", "Carol Editor"],
+    })], "complete", "complete");
+
+    expect(result).toMatchObject({
+      status: "possible",
+      evidence: "title-author",
+      candidates: [{ handle: 41 }],
+      ambiguous: true,
+    });
+  });
+
+  it("keeps title-author evidence possible until the hierarchy inventory is complete", () => {
+    const result = matchCatalogBookToKindle({
+      title: BOOK.title,
+      authors: BOOK.authors,
+    }, [object(43, {
+      title: BOOK.title,
+      authors: BOOK.authors,
+    })], "partial", "complete");
+
+    expect(result).toMatchObject({
+      status: "possible",
+      evidence: "title-author",
+      ambiguous: true,
+    });
+  });
+
+  it("confirms an exact parsed object even when unrelated metadata work was partial", () => {
+    const result = matchCatalogBookToKindle({
+      title: BOOK.title,
+      authors: BOOK.authors,
+    }, [object(44, {
+      title: BOOK.title,
+      authors: BOOK.authors,
+    })], "complete", "partial");
+
+    expect(result).toMatchObject({
+      status: "confirmed",
+      evidence: "title-author",
+      matchedObject: { handle: 44 },
+      ambiguous: false,
+    });
+  });
+
+  it("associates multiple Calibre-compatible title-author copies deterministically", () => {
+    const result = matchCatalogBookToKindle({
+      title: BOOK.title,
+      authors: BOOK.authors,
+    }, [
+      object(50, { title: BOOK.title, authors: BOOK.authors }),
+      object(44, { title: BOOK.title, authors: BOOK.authors }),
+    ], "complete", "complete");
+
+    expect(result).toMatchObject({
+      status: "confirmed",
+      evidence: "title-author",
+      matchedObject: { handle: 44 },
+      ambiguous: false,
+    });
+    expect(result.candidates.map(({ handle }) => handle)).toEqual([44, 50]);
   });
 
   it.each([

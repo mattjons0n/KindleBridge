@@ -171,7 +171,7 @@ The final everyday flow on a clean connection is:
 3. Immediately run the existing exact-byte create/read/compare/delete self-test.
 4. Mark the Kindle ready only after cleanup is proven.
 5. Enumerate the Documents hierarchy and build a connection-scoped inventory in the same retained session.
-6. Reconcile the active profile's bounded match index against the inventory in the browser. Its same-snapshot household claimant summary allows globally unique unmanaged matches to be confirmed without loading every profile; an incomplete summary or another claimant fails closed to **Possible match**.
+6. Reconcile the active profile's bounded match index against the inventory in the browser using Calibre-compatible active-library title/author rules. Other household profiles do not downgrade an exact selected-profile match; indistinguishable rows inside the selected profile are assigned deterministically.
 
 If an exact-cleanup record is pending, the retained session instead performs only the read-only recovery inventory needed to present that record. Send remains disabled; acknowledgement must be followed by a new self-test, inventory, and reconciliation before normal readiness can return.
 
@@ -203,7 +203,7 @@ Clicking **Send to Kindle** operates on a logical catalog book:
 6. Prepare only the derivative as PDOC when required for modern Kindle cover display.
 7. Generate a collision-resistant managed filename; never overwrite.
 8. Transfer over the already-tested MTP path and verify returned metadata.
-9. Refresh the live inventory and reconcile it immediately. Show the green check only when that refreshed inventory yields one unique confirmed catalog/device match; an ambiguous result remains **Possible match** even after a successful transfer.
+9. Refresh the live inventory and reconcile it immediately. Show the green check only when that refreshed inventory yields a confirmed active-library association. Multiple exact device copies may associate with the same deterministically allocated catalog row; genuinely fuzzy evidence remains **Possible match**.
 
 V1 supports EPUB plus uncompressed or PalmDOC-compressed KF8/AZW3. HUFF/CDIC AZW3 and other formats receive a clear unsupported-format state until their decoding or conversion path is separately proven.
 

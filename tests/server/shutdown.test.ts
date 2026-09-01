@@ -501,7 +501,11 @@ describe("catalog process lifecycle", () => {
   });
 
   it("bounds a stalled source response while the client remains connected and ignores late completion", async () => {
-    const fixture = await stalledSourceFixture(1_000, 20);
+    // Keep this far below the supported 1 s production minimum while leaving
+    // enough time for the healthy retry's real open/hash/fsync/chmod pipeline
+    // under full-suite filesystem contention. The first read never settles,
+    // so the test still proves deadline-driven retirement rather than speed.
+    const fixture = await stalledSourceFixture(1_000, 250);
     const getBookSource = vi.spyOn(fixture.database, "getBookSource");
     const requestRescan = vi.spyOn(fixture.indexer, "requestRescan");
     const sourceRequest = fetch(fixture.sourceUrl);

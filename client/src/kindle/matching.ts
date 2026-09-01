@@ -21,6 +21,7 @@ export interface KindleDeliveryMatchEvidence {
 export interface KindleCatalogMatchInput {
   readonly title?: string;
   readonly authors?: readonly string[];
+  readonly authorSort?: string;
   readonly identifiers?: readonly string[];
   readonly expectedArtifactSize?: number;
   readonly sourceFilename?: string;
@@ -62,7 +63,7 @@ export interface KindleBookMatchResult {
   readonly evidence: KindleMatchEvidence;
   readonly candidates: readonly KindleObjectMatchInput[];
   readonly matchedObject?: KindleObjectMatchInput;
-  /** True when duplicate or incomplete evidence prevents a green confirmation. */
+  /** True when incomplete or weak evidence prevents a green confirmation. */
   readonly ambiguous: boolean;
 }
 
@@ -126,8 +127,34 @@ function validSize(value: number | undefined): value is number {
 }
 
 function exactTitle(book: KindleCatalogMatchInput, object: KindleObjectMatchInput): boolean {
-  const left = normalizeKindleMetadataWords(book.title);
-  return left.length > 0 && left === normalizeKindleMetadataWords(object.title);
+  const left = calibreMatchKey(book.title);
+  return left.length > 0 && left === calibreMatchKey(object.title);
+}
+
+/** Mirrors Calibre's `(?u)\W|[_]` device-match cleaning rule. */
+function calibreMatchKey(value: string | undefined): string {
+  if (!value) return "";
+  return value.toLowerCase().match(/[\p{L}\p{N}]/gu)?.join("") ?? "";
+}
+
+function calibreAuthorsKey(authors: readonly string[] | undefined): string {
+  // Calibre's authors_to_string joins with " & "; its cleaning rule removes
+  // those separators, leaving the authors concatenated in their stored order.
+  return calibreMatchKey((authors ?? []).filter(Boolean).join(" & "));
+}
+
+function calibreAuthorMatch(book: KindleCatalogMatchInput, object: KindleObjectMatchInput): boolean {
+  const expected = new Set([
+    calibreAuthorsKey(book.authors),
+    calibreMatchKey(book.authorSort),
+  ].filter(Boolean));
+  if (expected.size === 0) return false;
+  const candidateAuthors = object.authors ?? [];
+  const candidates = [
+    calibreAuthorsKey(candidateAuthors),
+    ...candidateAuthors.map((author) => calibreMatchKey(author)),
+  ].filter(Boolean);
+  return candidates.some((candidate) => expected.has(candidate));
 }
 
 function authorOverlap(book: KindleCatalogMatchInput, object: KindleObjectMatchInput): boolean {
@@ -183,7 +210,7 @@ function uniqueObjects(objects: readonly KindleObjectMatchInput[]): KindleObject
   for (const object of objects) {
     if (!byHandle.has(object.handle)) byHandle.set(object.handle, object);
   }
-  return [...byHandle.values()];
+  return [...byHandle.values()].sort((left, right) => left.handle - right.handle);
 }
 
 function candidatesForStrongTier(
@@ -191,7 +218,7 @@ function candidatesForStrongTier(
   objects: readonly KindleObjectMatchInput[],
   evidence: Exclude<
     KindleMatchEvidence,
-    "identifier" | "title-author" | "filename-similarity" | "inventory-partial" | "none"
+    "identifier" | "filename-similarity" | "inventory-partial" | "none"
   >,
 ): KindleObjectMatchInput[] {
   switch (evidence) {
@@ -230,26 +257,32 @@ function candidatesForStrongTier(
     case "identifier-title-author":
       return objectsWithoutConflictingManagedToken(book, objects).filter((object) => identifierOverlap(book, object)
         && exactTitle(book, object)
-        && authorOverlap(book, object));
+        && calibreAuthorMatch(book, object));
     case "title-author-size":
       return validSize(book.expectedArtifactSize)
         ? objectsWithoutConflictingManagedToken(book, objects).filter((object) => exactTitle(book, object)
-          && authorOverlap(book, object)
+          && calibreAuthorMatch(book, object)
           && object.size === book.expectedArtifactSize)
         : [];
+    case "title-author":
+      return objectsWithoutConflictingManagedToken(book, objects)
+        .filter((object) => exactTitle(book, object) && calibreAuthorMatch(book, object));
   }
 }
 
 /**
- * Pure evidence matcher. Only one candidate at the strongest present tier in a
- * complete inventory can be confirmed. Duplicate evidence and partial scans
- * are deliberately downgraded to possible.
+ * Pure evidence matcher. Calibre-compatible exact title/author metadata is
+ * authoritative for each parsed object in a complete hierarchy. Multiple
+ * device objects at the same strongest tier still prove that the catalog book
+ * is present; every copy remains associated with that book and the lowest
+ * handle is the stable representative. Global metadata completeness is used
+ * by reconciliation to prove absence, not to downgrade an exact parsed row.
  */
 export function matchCatalogBookToKindle(
   book: KindleCatalogMatchInput,
   objectsInput: readonly KindleObjectMatchInput[],
   inventoryStatus: KindleInventoryStatus,
-  metadataStatus: KindleMatchMetadataStatus = "complete",
+  _metadataStatus: KindleMatchMetadataStatus = "complete",
 ): KindleBookMatchResult {
   const objects = uniqueObjects(objectsInput);
   const strongTiers = [
@@ -259,17 +292,13 @@ export function matchCatalogBookToKindle(
     "managed-token",
     "identifier-title-author",
     "title-author-size",
+    "title-author",
   ] as const;
 
   for (const evidence of strongTiers) {
     const candidates = candidatesForStrongTier(book, objects, evidence);
     if (candidates.length === 0) continue;
-    const metadataDerived = evidence === "identifier-title-author" || evidence === "title-author-size";
-    if (
-      candidates.length === 1
-      && inventoryStatus === "complete"
-      && (!metadataDerived || metadataStatus === "complete")
-    ) {
+    if (inventoryStatus === "complete") {
       return Object.freeze({
         status: "confirmed",
         evidence,
@@ -296,7 +325,7 @@ export function matchCatalogBookToKindle(
       status: "possible",
       evidence: "title-author",
       candidates: Object.freeze(titleAuthor),
-      ambiguous: titleAuthor.length !== 1 || inventoryStatus === "partial",
+      ambiguous: true,
     });
   }
 

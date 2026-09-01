@@ -40,6 +40,7 @@ const STORAGE_ID = 0x0001_0001;
 const DOCUMENTS_HANDLE = 0x0000_0042;
 const CREATED_HANDLE = 0x1234_abcd;
 const CACHE_HANDLE = 0x00ca_c4e0;
+const EXISTING_BOOK_HANDLE = 0x00b0_0c11;
 const CACHE_FILENAME = createKindleBridgeDeviceMetadataCacheFilename("a");
 
 function ok(transactionId: number, parameters: readonly number[] = []): Uint8Array {
@@ -88,6 +89,22 @@ function cacheObjectInfo(
       compressedSize: bytes.byteLength,
       filename: CACHE_FILENAME,
       modificationDate: "20260830T120000Z",
+    }),
+    ...overrides,
+  };
+}
+
+function existingBookObjectInfo(
+  overrides: Partial<ReturnType<typeof makeUploadObjectInfo>> = {},
+) {
+  return {
+    ...makeUploadObjectInfo({
+      storageId: STORAGE_ID,
+      parentHandle: DOCUMENTS_HANDLE,
+      objectFormat: MtpObjectFormat.Undefined,
+      compressedSize: 123,
+      filename: "Existing book.azw3",
+      modificationDate: "20260830T120000.",
     }),
     ...overrides,
   };
@@ -317,6 +334,81 @@ describe("MtpObjectStore prior-session Kindle Bridge cache deletion", () => {
       .filter(({ type }) => type === MtpContainerType.Command);
     expect(commands.some(({ code }) => code === MtpOperationCode.GetObject)).toBe(false);
     expect(commands.some(({ code }) => code === MtpOperationCode.DeleteObject)).toBe(false);
+  });
+});
+
+describe("MtpObjectStore conditional existing-book deletion", () => {
+  it("re-reads full ObjectInfo, deletes one concrete handle, and verifies its absence", async () => {
+    const objectInfo = existingBookObjectInfo();
+    const snapshot = { handle: EXISTING_BOOK_HANDLE, ...objectInfo };
+    const { store, transport } = await openStore([
+      data(MtpOperationCode.GetObjectInfo, 1, encodeObjectInfo(objectInfo)), ok(1),
+      data(MtpOperationCode.GetObjectHandles, 2, encodeObjectHandles([EXISTING_BOOK_HANDLE])), ok(2),
+      data(MtpOperationCode.GetObjectInfo, 3, encodeObjectInfo(objectInfo)), ok(3),
+      ok(4),
+      data(MtpOperationCode.GetObjectHandles, 5, encodeObjectHandles([])), ok(5),
+    ]);
+
+    await expect(store.deleteExistingKindleBookObject(snapshot)).resolves.toBeUndefined();
+
+    const commands = writtenContainers(transport)
+      .filter(({ type }) => type === MtpContainerType.Command);
+    expect(commands.map(({ code }) => code)).toEqual([
+      MtpOperationCode.OpenSession,
+      MtpOperationCode.GetObjectInfo,
+      MtpOperationCode.GetObjectHandles,
+      MtpOperationCode.GetObjectInfo,
+      MtpOperationCode.DeleteObject,
+      MtpOperationCode.GetObjectHandles,
+    ]);
+    expect(decodeContainerParameters(commands[4]!.payload)).toEqual([EXISTING_BOOK_HANDLE, 0]);
+    expect(commands
+      .filter(({ code }) => code === MtpOperationCode.DeleteObject)).toHaveLength(1);
+  });
+
+  it("refuses deletion when any inventoried ObjectInfo field changed", async () => {
+    const snapshotInfo = existingBookObjectInfo();
+    const changedInfo = existingBookObjectInfo({
+      modificationDate: "20260830T120001.",
+    });
+    const { store, transport } = await openStore([
+      data(MtpOperationCode.GetObjectInfo, 1, encodeObjectInfo(changedInfo)), ok(1),
+    ]);
+
+    await expect(store.deleteExistingKindleBookObject({
+      handle: EXISTING_BOOK_HANDLE,
+      ...snapshotInfo,
+    })).rejects.toMatchObject({ code: "MTP_OBJECT_DELETE_MISMATCH" });
+    expect(writtenContainers(transport).some(({ code }) => code === MtpOperationCode.DeleteObject))
+      .toBe(false);
+  });
+
+  it.each([
+    {
+      label: "folder",
+      info: existingBookObjectInfo({
+        objectFormat: MtpObjectFormat.Association,
+        associationType: MtpAssociationType.GenericFolder,
+      }),
+    },
+    {
+      label: "Kindle Bridge cache",
+      info: cacheObjectInfo(new Uint8Array(10)),
+    },
+    {
+      label: "non-book file",
+      info: existingBookObjectInfo({ filename: "notes.txt" }),
+    },
+  ])("rejects a $label before issuing any device command", async ({ info }) => {
+    const { store, transport } = await openStore([]);
+
+    await expect(store.deleteExistingKindleBookObject({
+      handle: EXISTING_BOOK_HANDLE,
+      ...info,
+    })).rejects.toMatchObject({ code: "MTP_OBJECT_DELETE_MISMATCH" });
+    expect(writtenContainers(transport).map(({ code }) => code)).toEqual([
+      MtpOperationCode.OpenSession,
+    ]);
   });
 });
 

@@ -6,6 +6,7 @@ import {
   createKindleMetadataCache,
   derivePseudonymousKindleIdentity,
   type KindleBookTransferResult,
+  type KindleBookRemovalResult,
   type KindleDeviceLease,
   type KindleDeviceLeaseProvider,
   type KindleDeviceOptions,
@@ -49,6 +50,11 @@ export interface SendBookOptions extends MtpOperationOptions {
   readonly managedToken?: string;
 }
 
+export interface RemoveKindleBooksOptions extends MtpOperationOptions {
+  /** Whole-operation wall-clock bound across exact revalidation and deletion. */
+  readonly aggregateTimeoutMs?: number;
+}
+
 export interface KindlePostConnectOptions {
   readonly inventory?: KindleInventoryRefreshOptions;
   readonly selfTest?: SendBookOptions;
@@ -73,6 +79,20 @@ export interface KindleSendAndRefreshResult {
   readonly inventoryErrorCode?: string;
   /** The transfer verified, but the MTP session then lost synchronization. */
   readonly connectionFaulted?: true;
+}
+
+export interface KindleRemoveBooksAndRefreshResult {
+  readonly removals: readonly KindleBookRemovalResult[];
+  readonly inventory?: KindleInventorySnapshot;
+  readonly inventoryRefresh: "complete" | "partial" | "failed";
+  readonly inventoryErrorCode?: string;
+  /** Removal succeeded, but the MTP session then lost synchronization. */
+  readonly connectionFaulted?: true;
+}
+
+export interface KindleRemoveBookAndRefreshResult
+  extends Omit<KindleRemoveBooksAndRefreshResult, "removals"> {
+  readonly removal: KindleBookRemovalResult;
 }
 
 export interface OpenKindleOptions extends MtpOperationOptions {
@@ -348,6 +368,81 @@ export class ConnectedKindle {
         const inventoryErrorCode = safeErrorCode(error);
         return {
           transfer,
+          inventoryRefresh: "failed",
+          ...(inventoryErrorCode === undefined ? {} : { inventoryErrorCode }),
+          ...(isFatalInventoryError(error) ? { connectionFaulted: true as const } : {}),
+        };
+      }
+    });
+  }
+
+  removeBookAndRefreshInventory(
+    handle: number,
+    options: RemoveKindleBooksOptions = {},
+    inventoryOptions: KindleInventoryRefreshOptions = {},
+  ): Promise<KindleRemoveBookAndRefreshResult> {
+    return this.removeBooksAndRefreshInventory([handle], options, inventoryOptions)
+      .then(({ removals, ...result }) => ({
+        ...result,
+        removal: removals[0]!,
+      }));
+  }
+
+  /**
+   * Bulk removal is one exclusive operation: each selected handle is deleted
+   * sequentially under exact snapshot revalidation, followed by one inventory
+   * refresh so the UI never needs N expensive reconnect scans.
+   */
+  removeBooksAndRefreshInventory(
+    handles: readonly number[],
+    options: RemoveKindleBooksOptions = {},
+    inventoryOptions: KindleInventoryRefreshOptions = {},
+  ): Promise<KindleRemoveBooksAndRefreshResult> {
+    return this.#runExclusive(async () => {
+      if (!this.#selfTestResult?.cleanedUp) {
+        throw new KindleDeviceError(
+          "MTP_SELF_TEST_REQUIRED",
+          "The exact-byte safe-write check must pass in this connection before removing books.",
+        );
+      }
+      const authorityInventory = this.#inventory;
+      if (authorityInventory?.status !== "complete") {
+        throw new KindleDeviceError(
+          "MTP_BOOK_REMOVAL_REJECTED",
+          "Reconnect and complete a live Kindle inventory before removing books.",
+        );
+      }
+
+      let removals: readonly KindleBookRemovalResult[];
+      try {
+        removals = await operationWithAggregateDeadline(
+          "Kindle book removal",
+          options,
+          (operationOptions) => this.#kindle.removeBooks(
+            authorityInventory,
+            handles,
+            operationOptions,
+          ),
+        );
+      } catch (error) {
+        // A failed batch may have completed earlier exact-handle deletions.
+        // Never expose the pre-operation inventory as current afterward.
+        this.#inventory = undefined;
+        throw error;
+      }
+      this.#inventory = undefined;
+      try {
+        const inventory = await inventoryWithAggregateDeadline(this.#kindle, inventoryOptions);
+        this.#inventory = inventory;
+        return {
+          removals,
+          inventory,
+          inventoryRefresh: inventory.status,
+        };
+      } catch (error) {
+        const inventoryErrorCode = safeErrorCode(error);
+        return {
+          removals,
           inventoryRefresh: "failed",
           ...(inventoryErrorCode === undefined ? {} : { inventoryErrorCode }),
           ...(isFatalInventoryError(error) ? { connectionFaulted: true as const } : {}),

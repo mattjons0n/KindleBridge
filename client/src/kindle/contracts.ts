@@ -107,6 +107,15 @@ export interface KindleObjectStore {
   ): Promise<Uint8Array>;
   /** The concrete store must reject handles it did not create this session. */
   deleteObject(handle: number, options?: KindleOperationOptions): Promise<void>;
+  /**
+   * Deletes one pre-existing Kindle book only when its complete live ObjectInfo
+   * still exactly matches the current-inventory snapshot supplied by policy.
+   * Associations and application cache objects must always be rejected.
+   */
+  deleteExistingKindleBookObject(
+    snapshot: KindleStoredObjectInfo,
+    options?: KindleOperationOptions,
+  ): Promise<void>;
   /** Reads and validates a bounded, root-level Kindle Bridge cache candidate. */
   inspectKindleBridgeMetadataCacheObject(
     handle: number,

@@ -151,7 +151,7 @@ describe("catalog/Kindle reconciliation", () => {
     },
   );
 
-  it("keeps duplicate managed evidence across extended Kindle formats ambiguous", async () => {
+  it("associates every duplicate managed device copy with the same confirmed book", async () => {
     const snapshot = await inventory("book-1");
     const managed = snapshot.objects[0]!;
     const first = {
@@ -182,8 +182,9 @@ describe("catalog/Kindle reconciliation", () => {
 
     const result = await reconcileCatalogIndexes([index("book-1")], ambiguous, { deviceLabel: "Kindle" });
 
-    expect(result.statuses.get("book-1")).toBe("possible");
-    expect(result.inventory.items.every(({ match }) => match === "possible")).toBe(true);
+    expect(result.statuses.get("book-1")).toBe("confirmed");
+    expect(result.inventory.items).toHaveLength(2);
+    expect(result.inventory.items.every(({ bookId, match }) => bookId === "book-1" && match === "confirmed")).toBe(true);
   });
 
   it("rotates strong match authority when a stable catalog path is replaced with different bytes", async () => {
@@ -318,7 +319,7 @@ describe("catalog/Kindle reconciliation", () => {
     }
   });
 
-  it("confirms a uniquely enriched unmanaged book by exact identifier, title, and author", async () => {
+  it("confirms a uniquely enriched unmanaged book by normalized title and author", async () => {
     const snapshot = await inventory("another-book");
     const enriched: KindleInventorySnapshot = {
       ...snapshot,
@@ -326,7 +327,7 @@ describe("catalog/Kindle reconciliation", () => {
         ...snapshot.objects[1]!,
         title: "Meditations",
         authors: ["Marcus Aurelius"],
-        identifiers: ["isbn:978-0-0000-0000-1"],
+        identifiers: [],
         bookMetadataState: "enriched",
       }],
       scannedObjectCount: 1,
@@ -355,7 +356,7 @@ describe("catalog/Kindle reconciliation", () => {
     });
   });
 
-  it("keeps an otherwise unique unmanaged metadata match uncertain on a global claimant collision", async () => {
+  it("scopes Calibre-compatible metadata matching to the selected profile", async () => {
     const snapshot = await inventory("another-book");
     const enriched: KindleInventorySnapshot = {
       ...snapshot,
@@ -382,11 +383,11 @@ describe("catalog/Kindle reconciliation", () => {
       deviceLabel: "Kindle",
     });
 
-    expect(result.statuses.get("book-unmanaged")).toBe("possible");
-    expect(result.inventory.items[0]?.match).toBe("possible");
+    expect(result.statuses.get("book-unmanaged")).toBe("confirmed");
+    expect(result.inventory.items[0]?.match).toBe("confirmed");
   });
 
-  it("fails metadata evidence closed on an incomplete summary but preserves managed evidence", async () => {
+  it("does not let a legacy cross-profile summary weaken selected-profile evidence", async () => {
     const unmanagedSnapshot = await inventory("another-book");
     const enriched: KindleInventorySnapshot = {
       ...unmanagedSnapshot,
@@ -412,7 +413,7 @@ describe("catalog/Kindle reconciliation", () => {
     const metadataResult = await reconcileCatalogIndexes([
       { ...incomplete, metadataClaims: claimSummary([], false) },
     ], enriched, { deviceLabel: "Kindle" });
-    expect(metadataResult.statuses.get("book-unmanaged")).toBe("possible");
+    expect(metadataResult.statuses.get("book-unmanaged")).toBe("confirmed");
 
     const managed = index("book-managed");
     const managedResult = await reconcileCatalogIndexes([
@@ -463,7 +464,7 @@ describe("catalog/Kindle reconciliation", () => {
     expect(result.inventory.items[0]).toMatchObject({ bookId: "book-azw3", match: "confirmed" });
   });
 
-  it("never treats EPUB source length as converted artifact length", async () => {
+  it("falls through from an unusable EPUB source length to Calibre-compatible title-author evidence", async () => {
     const snapshot = await inventory("another-book");
     const enriched: KindleInventorySnapshot = {
       ...snapshot,
@@ -490,11 +491,11 @@ describe("catalog/Kindle reconciliation", () => {
 
     const result = await reconcileCatalogIndexes([index("book-epub")], enriched, { deviceLabel: "Kindle" });
 
-    expect(result.statuses.get("book-epub")).toBe("possible");
-    expect(result.inventory.items[0]).toMatchObject({ bookId: "book-epub", match: "possible" });
+    expect(result.statuses.get("book-epub")).toBe("confirmed");
+    expect(result.inventory.items[0]).toMatchObject({ bookId: "book-epub", match: "confirmed" });
   });
 
-  it("keeps a unique metadata match possible when another eligible object's metadata is incomplete", async () => {
+  it("confirms an exact parsed row even when an unrelated object's metadata is incomplete", async () => {
     const snapshot = await inventory("another-book");
     const exact = {
       ...snapshot.objects[1]!,
@@ -537,14 +538,17 @@ describe("catalog/Kindle reconciliation", () => {
       deviceLabel: "Kindle",
     });
 
-    expect(result.statuses.get("book-unmanaged")).toBe("possible");
+    expect(result.statuses.get("book-unmanaged")).toBe("confirmed");
     expect(result.inventory.items.find(({ filename }) => filename === "unmanaged.azw3")).toMatchObject({
       bookId: "book-unmanaged",
-      match: "possible",
+      match: "confirmed",
+    });
+    expect(result.inventory.items.find(({ filename }) => filename === "unread.azw3")).toMatchObject({
+      match: "unmatched",
     });
   });
 
-  it("downgrades two catalog books that claim the same unmanaged Kindle object", async () => {
+  it("deterministically assigns an indistinguishable Kindle object to one selected-profile book", async () => {
     const snapshot = await inventory("another-book");
     const enriched: KindleInventorySnapshot = {
       ...snapshot,
@@ -567,17 +571,62 @@ describe("catalog/Kindle reconciliation", () => {
       },
     };
     const first = index("book-a");
+    const indistinguishable = { ...first.entries[0]!, identifiers: [] };
     const ambiguousIndex: CatalogMatchIndex = {
       ...first,
-      entries: [first.entries[0]!, { ...first.entries[0]!, bookId: "book-b" }],
+      entries: [{ ...indistinguishable, bookId: "book-b" }, indistinguishable],
     };
 
     const result = await reconcileCatalogIndexes([ambiguousIndex], enriched, { deviceLabel: "Kindle" });
 
-    expect(result.statuses.get("book-a")).toBe("possible");
-    expect(result.statuses.get("book-b")).toBe("possible");
-    expect(result.statusCountsByProfile.get("profile-a")?.possible).toBe(2);
-    expect(result.inventory.items[0]?.match).toBe("possible");
+    expect(result.statuses.get("book-a")).toBe("confirmed");
+    expect(result.statuses.get("book-b")).toBe("not-on-kindle");
+    expect(result.statusCountsByProfile.get("profile-a")).toEqual({
+      confirmed: 1,
+      possible: 0,
+      notOnKindle: 1,
+      unknown: 0,
+    });
+    expect(result.inventory.items[0]).toMatchObject({ bookId: "book-a", match: "confirmed" });
+  });
+
+  it("does not leave a weak overlapping-author claim possible after an exact Calibre match wins", async () => {
+    const snapshot = await inventory("another-book");
+    const enriched: KindleInventorySnapshot = {
+      ...snapshot,
+      objects: [{
+        ...snapshot.objects[1]!,
+        title: "Meditations",
+        authors: ["Marcus Aurelius"],
+        identifiers: [],
+        bookMetadataState: "enriched",
+      }],
+      scannedObjectCount: 1,
+      bookMetadata: {
+        ...snapshot.bookMetadata!,
+        eligibleObjectCount: 1,
+        attemptedObjectCount: 1,
+        parsedObjectCount: 1,
+        enrichedObjectCount: 1,
+        readByteCount: 20,
+        budgetedByteCount: 20,
+      },
+    };
+    const exact = index("book-exact");
+    const base = { ...exact.entries[0]!, identifiers: [] };
+    const overlapping: CatalogMatchIndex = {
+      ...exact,
+      entries: [
+        base,
+        { ...base, bookId: "book-overlap", authors: ["Marcus Aurelius", "Another Author"] },
+      ],
+    };
+
+    const result = await reconcileCatalogIndexes([overlapping], enriched, { deviceLabel: "Kindle" });
+
+    expect(result.statuses.get("book-exact")).toBe("confirmed");
+    expect(result.statuses.get("book-overlap")).toBe("not-on-kindle");
+    expect(result.inventory.items[0]).toMatchObject({ bookId: "book-exact", match: "confirmed" });
   });
 
   it("keeps absence unknown when bounded Kindle metadata enrichment is incomplete", async () => {

@@ -221,6 +221,7 @@ export interface CatalogMatchIndexEntry {
   readonly identifiers: readonly string[];
   readonly title: string;
   readonly authors: readonly string[];
+  readonly authorSort?: string;
   readonly deliveries: readonly CatalogMatchDelivery[];
 }
 
@@ -670,6 +671,7 @@ function parseMatchIndex(value: unknown): CatalogMatchIndex {
       identifiers: stringArray(candidate.identifiers),
       title: textValue(candidate.title, "Untitled"),
       authors: stringArray(candidate.authors),
+      authorSort: optionalText(candidate.authorSort),
       deliveries,
     };
   }) : [];

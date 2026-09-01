@@ -235,6 +235,7 @@ export interface MatchIndexEntry {
   bookId: string;
   title: string;
   authors: string[];
+  authorSort: string | null;
   identifiers: string[];
   sourceFormat: BookFormat;
   sourceSize: number;

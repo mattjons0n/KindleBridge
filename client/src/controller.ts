@@ -1,6 +1,10 @@
 import { convertEpub, type ConversionResult } from "./api/convert";
 import { AppError, toAppError } from "./app-error";
-import type { CatalogKindleInventory, CatalogSendRequest } from "./catalog-browser";
+import type {
+  CatalogKindleInventory,
+  CatalogRemoveRequest,
+  CatalogSendRequest,
+} from "./catalog-browser";
 import {
   createCatalogClient,
   type CatalogApi,
@@ -22,7 +26,9 @@ import {
   openKindle,
   type DeviceRuntimeHooks,
   type KindlePostConnectResult,
+  type KindleRemoveBooksAndRefreshResult,
   type KindleSendAndRefreshResult,
+  type RemoveKindleBooksOptions,
   type SendBookOptions,
 } from "./device-runtime";
 import {
@@ -94,6 +100,11 @@ export interface ConnectedKindlePort {
     options?: SendBookOptions,
     inventoryOptions?: Parameters<ConnectedKindle["refreshInventory"]>[0],
   ): Promise<KindleSendAndRefreshResult>;
+  removeBooksAndRefreshInventory?(
+    handles: readonly number[],
+    options?: RemoveKindleBooksOptions,
+    inventoryOptions?: Parameters<ConnectedKindle["refreshInventory"]>[0],
+  ): Promise<KindleRemoveBooksAndRefreshResult>;
   disconnect(): Promise<void>;
   closeAfterPhysicalDisconnect(): Promise<void>;
 }
@@ -140,6 +151,8 @@ export interface AppControllerDependencies {
   readonly selfTestOperationTimeoutMs?: number;
   /** Optional test/deployment override for the complete MTP book transaction. */
   readonly sendOperationTimeoutMs?: number;
+  /** Aggregate wall-clock bound for one confirmed bulk removal transaction. */
+  readonly removeOperationTimeoutMs?: number;
   /** Aggregate wall-clock bound for automatic connection inventory. */
   readonly connectInventoryTimeoutMs?: number;
   /** Aggregate wall-clock bound for the refresh after verified upload. */
@@ -168,8 +181,10 @@ const DEFAULT_OPEN_DEVICE_TIMEOUT_MS = 120_000;
 const DEFAULT_SELF_TEST_OPERATION_TIMEOUT_MS = 120_000;
 const DEFAULT_CONNECT_INVENTORY_TIMEOUT_MS = 10 * 60_000;
 const DEFAULT_POST_UPLOAD_INVENTORY_TIMEOUT_MS = 2 * 60_000;
+const DEFAULT_REMOVE_OPERATION_TIMEOUT_MS = 5 * 60_000;
 const MAX_SYNTHETIC_INVENTORY_OBJECTS = 10_000;
 const MAX_SYNTHETIC_INVENTORY_ISSUES = 64;
+const MAX_CATALOG_REMOVE_TARGETS = 1_000;
 
 export interface CatalogReconciliationLimits {
   readonly entries: number;
@@ -209,6 +224,7 @@ function matchIndexFootprint(index: CatalogMatchIndex): CatalogReconciliationFoo
     entries += 1;
     retain(entry.bookId);
     retain(entry.title);
+    retain(entry.authorSort);
     retain(entry.sourceFilename);
     retain(entry.sourceFormat);
     retain(entry.contentHash);
@@ -516,6 +532,7 @@ export class AppController {
       onCatalogConnectRequested: () => this.connect("catalog"),
       onCatalogDisconnectRequested: () => this.disconnect(),
       onCatalogSendRequested: (request) => this.sendCatalogBook(request),
+      onCatalogRemoveRequested: (request) => this.removeCatalogBooks(request),
       onCatalogChanged: () => this.#queueConnectedCatalogReconciliation(),
       onCatalogProfileChanged: () => this.#queueConnectedCatalogReconciliation(),
     };
@@ -1398,6 +1415,177 @@ export class AppController {
       throw error;
     } finally {
       this.#conversionPipelineBusy = false;
+      this.#finishHardwareOperation();
+    }
+  }
+
+  async removeCatalogBooks(request: CatalogRemoveRequest): Promise<void> {
+    if (this.#hardwareBusy) {
+      throw new AppError("INVALID_STATE", "Another Kindle operation is already running");
+    }
+    if (this.#conversionPipelineBusy) {
+      throw new AppError("CONVERSION_BUSY", "Another browser-local book conversion is already running");
+    }
+    if (this.#synchronizePendingCleanupFromStorage()) {
+      throw new AppError(
+        "INVALID_STATE",
+        "Inspect and acknowledge the interrupted Kindle object before removing books",
+      );
+    }
+    if (this.#state.selfTest.kind !== "passed") {
+      throw new AppError(
+        "MTP_SELF_TEST_REQUIRED",
+        "Safe-write check failed. No book was removed. Reconnect the Kindle and let the automatic check pass.",
+      );
+    }
+    const connection = this.#readyConnection("Connect the Kindle before removing books");
+    if (!connection || !connection.readyForSend) {
+      throw new AppError(
+        "MTP_SELF_TEST_REQUIRED",
+        "Safe-write check failed. No book was removed. Reconnect the Kindle and let the automatic check pass.",
+      );
+    }
+    if (!connection.removeBooksAndRefreshInventory) {
+      throw new AppError("INVALID_STATE", "This Kindle connection does not support exact book removal");
+    }
+    if (!this.#catalogInventoryReadyForCurrentConnection(connection, request.profileId)) {
+      throw new AppError(
+        "INVALID_STATE",
+        "The current Kindle inventory and catalog comparison are not ready. Reconnect before removing books.",
+      );
+    }
+    if (
+      request.profileId !== this.#view.activeCatalogProfileId
+      || request.targets.length < 1
+      || request.targets.length > MAX_CATALOG_REMOVE_TARGETS
+    ) {
+      throw new AppError(
+        "INVALID_STATE",
+        `Book removal requires 1 to ${MAX_CATALOG_REMOVE_TARGETS} exact targets from the active library.`,
+      );
+    }
+
+    const rawInventory = this.#currentRawCatalogInventory(connection);
+    const presentedInventory = this.#catalogInventory;
+    if (
+      rawInventory?.status !== "complete"
+      || presentedInventory?.completeness !== "complete"
+      || presentedInventory.matching?.status !== "complete"
+    ) {
+      throw new AppError("INVALID_STATE", "Book removal requires a complete current Kindle comparison");
+    }
+    const presentedById = new Map(presentedInventory.items.map((item) => [item.id, item] as const));
+    const rawById = new Map<string, KindleInventorySnapshot["objects"][number]>(rawInventory.objects.map((object) => [
+      `mtp-${object.handle.toString(16).padStart(8, "0")}`,
+      object,
+    ] as const));
+    const seenItemIds = new Set<string>();
+    const handles: number[] = [];
+    for (const target of request.targets) {
+      const item = presentedById.get(target.itemId);
+      const raw = rawById.get(target.itemId);
+      if (
+        seenItemIds.has(target.itemId)
+        || !item
+        || !raw
+        || raw.kind !== "file"
+        || item.match !== "confirmed"
+        || item.bookId !== target.bookId
+        || this.#view.catalogKindleStatus(target.bookId) !== "confirmed"
+        || item.filename !== target.filename
+        || item.size !== target.size
+        || raw.filename !== item.filename
+        || raw.size !== item.size
+      ) {
+        throw new AppError(
+          "INVALID_STATE",
+          "A selected Kindle file changed or is no longer an exact confirmed match. Reconnect before removing it.",
+        );
+      }
+      seenItemIds.add(target.itemId);
+      handles.push(raw.handle);
+    }
+
+    const epoch = this.#deviceEpoch;
+    const signal = this.#deviceAbort?.signal;
+    this.#hardwareBusy = true;
+    try {
+      const result = await connection.removeBooksAndRefreshInventory(
+        handles,
+        {
+          signal,
+          aggregateTimeoutMs: this.#dependencies.removeOperationTimeoutMs
+            ?? DEFAULT_REMOVE_OPERATION_TIMEOUT_MS,
+        },
+        {
+          signal,
+          aggregateTimeoutMs: this.#dependencies.postUploadInventoryTimeoutMs
+            ?? DEFAULT_POST_UPLOAD_INVENTORY_TIMEOUT_MS,
+          deviceMetadataCache: "read-write",
+          onObjectState: this.#objectStateHandler("metadata-cache", undefined, connection.details),
+        },
+      );
+      const removedHandles = new Set(result.removals.map((removal) => removal.handle));
+      if (result.removals.length !== handles.length || handles.some((handle) => !removedHandles.has(handle))) {
+        throw new AppError(
+          "MTP_OBJECT_VERIFICATION_FAILED",
+          "The Kindle did not verify every selected exact-handle removal. Reconnect before taking another action.",
+        );
+      }
+
+      const connectionCurrent = this.#isActiveConnection(epoch, connection);
+      if (result.inventory && connectionCurrent) {
+        this.#logKindleMetadataCacheDiagnostics(result.inventory);
+        try {
+          await this.#withPostUploadCatalogDeadline((catalogSignal) => (
+            this.#reconcileCatalogInventory(result.inventory!, connection, catalogSignal)
+          ));
+        } catch (error) {
+          await this.#presentInventoryWithoutCatalogMatches(result.inventory, connection);
+          this.log.warn("Books were removed, but catalog matching could not be refreshed", {
+            code: errorContext(toAppError(error)).code,
+          });
+        }
+      } else {
+        this.#clearCurrentCatalogInventoryAuthority();
+        this.#markCatalogInventoryLastSeen();
+        if (connectionCurrent) {
+          this.#commit({ ...this.#state, catalogInventoryState: "failed" });
+        }
+      }
+
+      this.log.info("Exact Kindle book removal verified", {
+        requestedBooks: new Set(request.targets.map((target) => target.bookId)).size,
+        removedObjects: result.removals.length,
+        removedBytes: result.removals.reduce((sum, removal) => sum + removal.size, 0),
+        inventoryRefresh: result.inventoryRefresh,
+      });
+      if (result.connectionFaulted && this.#connection === connection) {
+        const error = new AppError(
+          "MTP_TRANSPORT_ERROR",
+          "The selected books were removed, but the Kindle session lost synchronization during inventory refresh. Reconnect before another action.",
+          { details: { inventoryErrorCode: result.inventoryErrorCode } },
+        );
+        await this.#retireFaultedConnection(connection, error);
+      }
+    } catch (rawError) {
+      const error = toAppError(rawError, "The selected Kindle books could not all be removed");
+      if (this.#isActiveConnection(epoch, connection)) {
+        // A batch failure can occur after one of its earlier exact deletes.
+        // Revoke every pre-operation association rather than presenting stale
+        // green checks or allowing the same pending targets to be retried.
+        this.#clearCurrentCatalogInventoryAuthority();
+        this.#markCatalogInventoryLastSeen();
+        this.#commit({ ...this.#state, catalogInventoryState: "failed" });
+      }
+      this.log.error(error.message, errorContext(error));
+      const connectionFaulted = this.#connection === connection && (
+        (rawError !== null && typeof rawError === "object" && Reflect.get(rawError, "fatal") === true)
+        || !connection.readyForSend
+      );
+      if (connectionFaulted) await this.#retireFaultedConnection(connection, error);
+      throw error;
+    } finally {
       this.#finishHardwareOperation();
     }
   }
@@ -2353,6 +2541,7 @@ export class AppController {
           bookId: book.id,
           title: book.title,
           authors: [...book.authors],
+          authorSort: book.authorSort,
           identifiers: [...book.identifiers],
           sourceFormat: book.format,
           sourceSize: book.size,
@@ -2422,6 +2611,30 @@ export class AppController {
   #markCatalogInventoryLastSeen(): void {
     this.#catalogInventory = asLastSeenInventory(this.#catalogInventory);
     this.#view.setCatalogKindleInventory(this.#catalogInventory);
+  }
+
+  async #presentInventoryWithoutCatalogMatches(
+    inventory: KindleInventorySnapshot,
+    connection: ConnectedKindlePort,
+  ): Promise<void> {
+    if (!this.#isActiveConnection(this.#deviceEpoch, connection)) return;
+    const unmatched = await reconcileCatalogIndexes([], inventory, {
+      deviceLabel: connection.details.model ?? connection.details.productName ?? "Connected Kindle",
+      deviceKey: connection.identityKey,
+      scannedAt: new Date(this.#dependencies.now()),
+    });
+    const presented: CatalogKindleInventory = {
+      ...unmatched.inventory,
+      matching: { status: "unavailable", matchedProfiles: 0, failedProfiles: 1 },
+    };
+    this.#rawCatalogInventory = inventory;
+    this.#catalogInventory = presented;
+    this.#catalogInventoryEpoch = undefined;
+    this.#catalogReadyProfileIds.clear();
+    this.#catalogReconciledContentHashes.clear();
+    this.#view.setCatalogKindleStatuses(new Map(), new Map());
+    this.#view.setCatalogKindleInventory(presented);
+    this.#commit({ ...this.#state, catalogInventoryState: "failed" });
   }
 
   #synchronizePendingCleanupFromStorage(): PendingObjectCleanup | undefined {

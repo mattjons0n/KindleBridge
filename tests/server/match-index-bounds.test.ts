@@ -40,7 +40,7 @@ async function fixture(metadataOverrides: Partial<ExtractedBookInput> = {}): Pro
     metadata: {
       title: 'A "quoted" title\nwith a line',
       authors: ["Ada \\ Author", "漢字 📚"],
-      authorSort: null,
+      authorSort: "Author, Ada",
       language: "en",
       publisher: null,
       publishedAt: null,
@@ -64,7 +64,7 @@ describe("bounded match-index serialization", () => {
       profileId: string;
       generatedAt: string;
       metadataClaims: { complete: boolean; collisionBitmap: string };
-      entries: Array<{ title: string; authors: string[]; identifiers: string[]; sourceFilename: string }>;
+      entries: Array<{ title: string; authors: string[]; authorSort: string | null; identifiers: string[]; sourceFilename: string }>;
     };
 
     expect(parsed.profileId).toBe(profileId);
@@ -75,10 +75,12 @@ describe("bounded match-index serialization", () => {
       {
         title: 'A "quoted" title\nwith a line',
         authors: ["Ada \\ Author", "漢字 📚"],
+        authorSort: "Author, Ada",
         identifiers: ["urn:test:\u0001"],
         sourceFilename: "quoted.epub",
       },
     ]);
+    expect(database.getMatchIndex(profileId).entries[0]?.authorSort).toBe("Author, Ada");
     expect(database.serializeMatchIndex(profileId, { maxResponseBytes: body.length })).toHaveLength(body.length);
     expect(() => database.serializeMatchIndex(profileId, { maxResponseBytes: body.length - 1 })).toThrow(
       expect.objectContaining({ code: "match_index_too_large" }),

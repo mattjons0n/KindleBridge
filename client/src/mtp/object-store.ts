@@ -2,6 +2,7 @@ import {
   MTP_ALL_ASSOCIATIONS,
   MTP_ALL_OBJECT_FORMATS,
   MTP_ROOT_PARENT,
+  MtpAssociationType,
   MtpObjectFormat,
   MtpOperationCode,
 } from "./constants";
@@ -31,7 +32,10 @@ import {
   isKindleBridgeDeviceMetadataCacheFilename,
   type KindleBridgeDeviceMetadataCache,
 } from "../kindle/device-metadata-cache-codec";
-import type { KindleBridgeMetadataCacheObjectSnapshot } from "../kindle/contracts";
+import type {
+  KindleBridgeMetadataCacheObjectSnapshot,
+  KindleStoredObjectInfo,
+} from "../kindle/contracts";
 
 const UINT32_MAX = 0xffff_ffff;
 const MTP_MAX_DATA_PAYLOAD_LENGTH = UINT32_MAX - 12;
@@ -43,6 +47,7 @@ const MAX_OBJECT_INFO_DATA_BYTES = 2_048;
 const MAX_CLEANUP_VERIFICATION_HANDLES = 10_000;
 const MAX_CREATE_PARENT_HANDLES = 10_000;
 const MAX_CACHE_ROOT_HANDLES = 256;
+const KINDLE_BOOK_EXTENSIONS = new Set(["azw", "azw3", "azw8", "kfx", "mobi", "prc"]);
 
 export interface MtpListObjectHandlesRequest {
   readonly storageId: number;
@@ -225,6 +230,13 @@ function assertSafeFilename(filename: string): void {
       "MTP object filename exceeds 254 UTF-16 code units",
     );
   }
+}
+
+function isKindleBookFilename(filename: string): boolean {
+  const dot = filename.lastIndexOf(".");
+  return dot > 0
+    && dot < filename.length - 1
+    && KINDLE_BOOK_EXTENSIONS.has(filename.slice(dot + 1).toLocaleLowerCase("en-US"));
 }
 
 export class MtpObjectStore {
@@ -525,6 +537,88 @@ export class MtpObjectStore {
     await this.deleteOwnedObject(handle, options);
   }
 
+  /**
+   * Conditional deletion for one user-selected, pre-existing Kindle book.
+   * The handle is always concrete; folders, cache files, and any ObjectInfo
+   * that changed after the live inventory are rejected before DeleteObject.
+   */
+  async deleteExistingKindleBookObject(
+    snapshot: KindleStoredObjectInfo,
+    options: MtpOperationOptions = {},
+  ): Promise<void> {
+    assertSpecificObjectHandle(snapshot.handle, "object handle");
+    assertUint32(snapshot.storageId, "storage ID");
+    assertUint32(snapshot.objectFormat, "object format");
+    assertSafeFilename(snapshot.filename);
+    if (
+      snapshot.parentHandle === 0
+      || snapshot.parentHandle === UINT32_MAX
+      || snapshot.objectFormat === MtpObjectFormat.Association
+      || snapshot.associationType !== MtpAssociationType.Undefined
+      || snapshot.protectionStatus !== 0
+      || !Number.isSafeInteger(snapshot.compressedSize)
+      || snapshot.compressedSize < 0
+      || !isKindleBookFilename(snapshot.filename)
+      || isKindleBridgeDeviceMetadataCacheFilename(snapshot.filename)
+    ) {
+      throw new MtpObjectStoreError(
+        "MTP_OBJECT_DELETE_MISMATCH",
+        `object 0x${snapshot.handle.toString(16).padStart(8, "0")} is not an unprotected Kindle book file eligible for conditional deletion`,
+      );
+    }
+    assertSpecificObjectHandle(snapshot.parentHandle, "parent handle");
+
+    const current = await this.getObjectInfo(snapshot.handle, options);
+    if (!this.sameStoredObjectInfo(current, snapshot)) {
+      throw new MtpObjectStoreError(
+        "MTP_OBJECT_DELETE_MISMATCH",
+        `book object 0x${snapshot.handle.toString(16).padStart(8, "0")} changed after inventory`,
+      );
+    }
+    const currentParentHandles = await this.listObjectHandles({
+      storageId: snapshot.storageId,
+      associationHandle: snapshot.parentHandle,
+      maxHandles: MAX_CLEANUP_VERIFICATION_HANDLES,
+    }, options);
+    if (!currentParentHandles.includes(snapshot.handle)) {
+      throw new MtpObjectStoreError(
+        "MTP_OBJECT_DELETE_MISMATCH",
+        `book object 0x${snapshot.handle.toString(16).padStart(8, "0")} is no longer a child of its inventoried parent`,
+      );
+    }
+
+    // Narrow the final read/delete race after the parent relist. MTP does not
+    // offer an atomic compare-and-delete primitive, so this is the last device
+    // command before the exact-handle DeleteObject transaction.
+    const finalCurrent = await this.getObjectInfo(snapshot.handle, options);
+    if (!this.sameStoredObjectInfo(finalCurrent, snapshot)) {
+      throw new MtpObjectStoreError(
+        "MTP_OBJECT_DELETE_MISMATCH",
+        `book object 0x${snapshot.handle.toString(16).padStart(8, "0")} changed immediately before deletion`,
+      );
+    }
+    options.signal?.throwIfAborted();
+    await this.session.execute(
+      {
+        operationCode: MtpOperationCode.DeleteObject,
+        parameters: [snapshot.handle, MTP_ALL_OBJECT_FORMATS],
+        expectedResponseParameterCount: 0,
+      },
+      options,
+    );
+    const remainingHandles = await this.listObjectHandles({
+      storageId: snapshot.storageId,
+      associationHandle: snapshot.parentHandle,
+      maxHandles: MAX_CLEANUP_VERIFICATION_HANDLES,
+    }, options);
+    if (remainingHandles.includes(snapshot.handle)) {
+      throw new MtpObjectStoreError(
+        "MTP_OBJECT_DELETE_UNVERIFIED",
+        `book object 0x${snapshot.handle.toString(16).padStart(8, "0")} still exists after exact-handle DeleteObject`,
+      );
+    }
+  }
+
   async inspectKindleBridgeMetadataCacheObject(
     handle: number,
     options: MtpOperationOptions = {},
@@ -642,8 +736,8 @@ export class MtpObjectStore {
   }
 
   private sameStoredObjectInfo(
-    left: KindleBridgeMetadataCacheObjectSnapshot["info"],
-    right: KindleBridgeMetadataCacheObjectSnapshot["info"],
+    left: KindleStoredObjectInfo,
+    right: KindleStoredObjectInfo,
   ): boolean {
     return left.handle === right.handle
       && left.storageId === right.storageId

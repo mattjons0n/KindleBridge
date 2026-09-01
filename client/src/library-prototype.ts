@@ -11,6 +11,7 @@ import type {
 
 export type LibraryProfileId = string;
 export type LibraryView = "all" | "on-kindle" | "recent" | "settings";
+export type LibraryLayout = "grid" | "list";
 export type LibrarySort = CatalogBookSort;
 export type KindleFilter = "all" | "on-kindle" | "not-on-kindle" | "possible";
 export type MetadataFilter = "all" | "complete" | "partial";

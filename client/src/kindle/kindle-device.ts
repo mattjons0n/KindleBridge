@@ -15,6 +15,9 @@ import {
 } from "./filenames";
 import {
   buildKindleInventory,
+  exactKindleObjectInfoFromInventory,
+  isKindleReadableBookFilename,
+  retainExactKindleObjectInfoAuthority,
   type KindleDeviceMetadataCacheWriteOutcome,
   type KindleInventoryFolderSeed,
   type KindleInventoryDeviceMetadataCacheDiagnostics,
@@ -47,6 +50,7 @@ export const MTP_ROOT_ASSOCIATION_HANDLE = 0xffff_ffff;
 export const MTP_ACCESS_READ_WRITE = 0x0000;
 const MAX_ROOT_OBJECT_HANDLES = 256;
 const MAX_DOCUMENT_CHILD_HANDLES = 10_000;
+const MAX_BOOK_REMOVALS_PER_OPERATION = 1_000;
 
 export interface KindleDeviceOptions {
   now?: () => Date;
@@ -68,6 +72,16 @@ export interface KindleBookTransferResult {
   parentHandle: number;
   verified: true;
   managedToken?: string;
+}
+
+export interface KindleBookRemovalResult {
+  readonly handle: number;
+  readonly storageId: number;
+  readonly parentHandle: number;
+  readonly filename: string;
+  readonly size: number;
+  readonly objectFormat: number;
+  readonly removed: true;
 }
 
 export interface KindleTransferProgress {
@@ -539,7 +553,7 @@ export class KindleDevice {
       cacheWrite = cacheWriteResult(outcome, 0);
     }
     const diagnostics = deviceCacheDiagnostics(cacheMode, loadedDeviceCache, cacheWrite);
-    return Object.freeze({
+    const result: KindleInventorySnapshot = Object.freeze({
       ...inventory,
       ...(inventory.metadataCacheDiagnostics === undefined
         ? {}
@@ -550,6 +564,7 @@ export class KindleDevice {
             }),
           }),
     });
+    return retainExactKindleObjectInfoAuthority(inventory, result);
   }
 
   async sendAzW3(
@@ -653,6 +668,89 @@ export class KindleDevice {
       verified: true,
       ...(managedToken === undefined ? {} : { managedToken }),
     };
+  }
+
+  /**
+   * Removes a bounded set of explicitly selected live book handles. Every
+   * handle is resolved through the genuine current-inventory capability before
+   * any mutation; the store then performs its own exact ObjectInfo recheck and
+   * exact-handle absence verification for each book sequentially.
+   */
+  async removeBooks(
+    inventory: KindleInventorySnapshot,
+    handles: readonly number[],
+    options: KindleOperationOptions = {},
+  ): Promise<readonly KindleBookRemovalResult[]> {
+    if (!this.selfTestPassed) {
+      throw new KindleDeviceError(
+        "MTP_SELF_TEST_REQUIRED",
+        "The exact-byte safe-write check must pass in this connection before removing books.",
+      );
+    }
+    if (
+      handles.length < 1
+      || handles.length > MAX_BOOK_REMOVALS_PER_OPERATION
+      || handles.some((handle) => !Number.isInteger(handle) || handle <= 0 || handle >= 0xffff_ffff)
+      || new Set(handles).size !== handles.length
+    ) {
+      throw new KindleDeviceError(
+        "MTP_BOOK_REMOVAL_REJECTED",
+        `Book removal requires 1 to ${MAX_BOOK_REMOVALS_PER_OPERATION} unique concrete object handles.`,
+      );
+    }
+    const target = await this.ensureTarget(0, options);
+    if (
+      inventory.status !== "complete"
+      || inventory.storageId !== target.storageId
+      || inventory.documentsHandle !== target.documentsHandle
+    ) {
+      throw new KindleDeviceError(
+        "MTP_BOOK_REMOVAL_REJECTED",
+        "Book removal requires the complete live inventory from this Kindle connection.",
+      );
+    }
+
+    const snapshots = handles.map((handle) => {
+      const object = inventory.objects.find((candidate) => candidate.handle === handle);
+      const exact = exactKindleObjectInfoFromInventory(inventory, handle);
+      if (
+        object?.kind !== "file"
+        || exact === undefined
+        || !isKindleReadableBookFilename(exact.filename)
+      ) {
+        throw new KindleDeviceError(
+          "MTP_BOOK_REMOVAL_REJECTED",
+          `MTP handle ${handle} is not a removable book in the current live inventory.`,
+          { handle },
+        );
+      }
+      return exact;
+    });
+
+    const removed: KindleBookRemovalResult[] = [];
+    try {
+      for (const snapshot of snapshots) {
+        options.signal?.throwIfAborted();
+        await this.store.deleteExistingKindleBookObject(snapshot, options);
+        removed.push(Object.freeze({
+          handle: snapshot.handle,
+          storageId: snapshot.storageId,
+          parentHandle: snapshot.parentHandle,
+          filename: snapshot.filename,
+          size: snapshot.compressedSize,
+          objectFormat: snapshot.objectFormat,
+          removed: true,
+        }));
+      }
+      return Object.freeze(removed);
+    } finally {
+      if (removed.length > 0) {
+        // Any child/root seed predates a destructive mutation and must not be
+        // reused by the mandatory post-removal inventory refresh.
+        this.inventoryFolderSeed = undefined;
+        this.rootObjectSeed = undefined;
+      }
+    }
   }
 
   private async updateDeviceMetadataCache(

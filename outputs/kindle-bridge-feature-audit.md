@@ -9,7 +9,7 @@ container evidence passed. `[ ]` deliberately identifies release-host,
 household-data, browser-memory, secure-origin, or physical-device evidence that
 cannot be inferred from mocks or localhost.
 
-The authoritative root gate passed 53/53 test files and 628/628 tests, followed
+The authoritative 2026-08-31 root gate passed 55/55 test files and 666/666 tests, followed
 by successful client typechecking, server build, and production Vite build. The
 generic operator template in `deploy/docker/RELEASE_CHECKLIST.md` remains
 unchecked until a concrete release image, host, origin, and Kindle are accepted.
@@ -74,6 +74,8 @@ unchecked until a concrete release image, host, origin, and Kindle are accepted.
 - [x] Normal mode contains no sample catalog, simulated counts, or simulated Kindle state.
 - [x] Real profiles, roots, books, covers, source health, counts, and scan progress load from the API.
 - [x] The primary library is a cover grid whose cards clearly show each book cover, title/name, authors, and relevant catalog state.
+- [x] A toggleable list view retains the same book identity/status and adds multi-select, select-page/clear, bulk Send, and bulk Remove from Kindle actions.
+- [x] Every grid/list item has an in-place three-dot menu; exact confirmed Kindle associations offer Remove from Kindle without adding a separate device-management panel.
 - [x] The grid and navigation adapt to narrow screens without discarding the book identity, search, filter, or transfer controls.
 - [x] Settings is separated from the main library actions and rendered last/lower in the sidebar navigation.
 - [x] A uniquely confirmed on-Kindle match renders a green check badge in the card's top-right corner; possible/ambiguous evidence does not receive that badge.
@@ -114,7 +116,9 @@ unchecked until a concrete release image, host, origin, and Kindle are accepted.
 - [x] Pure matcher returns confirmed, possible, or absent.
 - [x] Managed token/delivery evidence has priority over exact identifiers and normalized metadata.
 - [x] Fuzzy or ambiguous evidence can produce only Possible match.
-- [x] The active profile remains bounded while a same-snapshot fixed-width household claimant summary permits globally unique unmanaged metadata matches and downgrades incomplete or cross-profile collision evidence.
+- [x] Active-profile unmanaged matching mirrors Calibre's punctuation-insensitive title key plus joined-author, `author_sort`, and individual-author comparison; unrelated profiles do not downgrade an exact match.
+- [x] An exact parsed object can confirm despite an unrelated metadata failure; global metadata completeness remains required to prove absence.
+- [x] Indistinguishable active-profile rows are allocated deterministically to one catalog row instead of marking all duplicates green.
 - [x] Only confirmed matches receive the green check.
 - [x] Kindle-only and unmanaged objects remain visible and untouched.
 - [x] Duplicate titles, ambiguous metadata, missing files, multiple deliveries, reconnect, and cross-profile cases are tested.
@@ -130,10 +134,13 @@ unchecked until a concrete release image, host, origin, and Kindle are accepted.
 - [x] Collision-resistant managed filename never overwrites an existing object.
 - [x] Double-click suppression and one active write lease prevent duplicate concurrent sends.
 - [x] MTP result metadata is verified before success is shown.
-- [x] Success refreshes and reconciles live inventory immediately; a green check appears only when reconciliation yields a unique confirmed match.
+- [x] Success refreshes and reconciles live inventory immediately; a green check appears only when reconciliation yields a confirmed active-profile association.
 - [x] Send requires exact current-connection `not-on-kindle` evidence bound to the reconciled book/content hash; confirmed, possible, unknown, stale, and source-version races fail before conversion or MTP.
 - [x] Delivery writes are idempotent; a later scan recovers if recording failed after transfer.
 - [x] Existing bounded recovery journal and exact-current-handle cleanup remain intact.
+- [x] Single and bulk removal require explicit confirmation listing exact Kindle filenames and sizes, current complete matching authority, and the successful current-session self-test.
+- [x] Each selected pre-existing book is revalidated by complete ObjectInfo and parent membership, deleted only by its concrete handle, and verified absent; folders, cache/non-book/protected/changed objects and broad handles are rejected.
+- [x] Bulk removal is sequential with one final inventory refresh; any partial failure revokes stale green/removal authority, and host-mounted originals remain untouched.
 - [x] Derivatives remain ephemeral in Release 1; originals remain byte-identical by construction and automated read-only tests.
 - [x] The vendored converter preflights hostile ZIPs and caps spine/package documents, DOM/attributes/text, IR/styles/semantics, MathML, aggregate chapter cache, normalized XHTML/CSS, and AZW3 output before the corresponding retained allocation crosses its limit.
 - [x] Actual checked-in-WASM regressions cover Epictetus plus archive entry/inflation attacks, a 100,001-node DOM, 4,097 itemrefs, excessive MathML depth, synthesized XHTML beyond 32 MiB, and resource-driven AZW3 output beyond 200 MiB with no partial output.
@@ -154,7 +161,7 @@ unchecked until a concrete release image, host, origin, and Kindle are accepted.
 
 ## Verification and release evidence
 
-- [x] Root unit, database, filesystem, API, parser-security, browser, MTP-fault, deployment, and integration gate passes: 53/53 files and 628/628 tests, plus client typecheck, server build, and production Vite build.
+- [x] Root unit, database, filesystem, API, parser-security, browser, MTP-fault, deployment, and integration gate passes: 55/55 files and 666/666 tests, plus client typecheck, server build, and production Vite build.
 - [x] A directly generated 10,000-row database corpus covers FTS, filtering, pagination, and complete match-index query budgets; no full filesystem scan is inferred from it.
 - [x] Current schema-v13 native `linux/arm64` hardened-container smoke covers health/readiness, API catalog/search/facets/source/cover/delivery, restart persistence, read-only root/source, Host/Origin rejection, and security headers.
 - [x] Current-image restore and catalog/cache rebuild smoke preserves profile/root/stable-book/delivery evidence, recreates derived data, and returns the exact original 459,174-byte source with its indexed SHA-256.

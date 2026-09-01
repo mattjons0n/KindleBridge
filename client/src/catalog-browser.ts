@@ -17,6 +17,7 @@ import {
   EMPTY_CATALOG_FILTERS,
   initialLibraryFilters,
   type LibraryFilters,
+  type LibraryLayout,
   type LibraryProfileId,
   type LibraryView,
 } from "./library-prototype";
@@ -66,6 +67,11 @@ export interface CatalogBrowserSnapshot {
   readonly kindleStatusCountsByProfile: ReadonlyMap<string, CatalogKindleStatusCounts>;
   readonly kindleInventory?: CatalogKindleInventory;
   readonly kindleInventoryOffset: number;
+  readonly layout: LibraryLayout;
+  readonly selectedBookIds: ReadonlySet<string>;
+  readonly bulkActionBusy: boolean;
+  readonly bulkActionError?: string;
+  readonly pendingRemoval?: CatalogRemoveRequest;
 }
 
 export type CatalogTransferPhase = "preparing" | "converting" | "validating" | "sending" | "verifying" | "complete" | "failed";
@@ -123,10 +129,24 @@ export interface CatalogSendRequest {
   readonly book: CatalogBook;
 }
 
+export interface CatalogRemoveTarget {
+  readonly itemId: string;
+  readonly bookId: string;
+  readonly title: string;
+  readonly filename: string;
+  readonly size: number;
+}
+
+export interface CatalogRemoveRequest {
+  readonly profileId: string;
+  readonly targets: readonly CatalogRemoveTarget[];
+}
+
 export interface CatalogHardwareHooks {
   readonly onConnectRequested?: () => void | Promise<void>;
   readonly onDisconnectRequested?: () => void | Promise<void>;
   readonly onSendRequested?: (request: CatalogSendRequest) => void | Promise<void>;
+  readonly onRemoveRequested?: (request: CatalogRemoveRequest) => void | Promise<void>;
   readonly onCatalogChanged?: (event: CatalogEvent) => void | Promise<void>;
   /** Reconcile the newly visible profile first when a Kindle is already connected. */
   readonly onActiveProfileChanged?: (profileId: string) => void | Promise<void>;
@@ -404,6 +424,9 @@ export class CatalogBrowser {
       kindleStatus: new Map(),
       kindleStatusCountsByProfile: new Map(),
       kindleInventoryOffset: 0,
+      layout: "grid",
+      selectedBookIds: new Set(),
+      bulkActionBusy: false,
     };
   }
 
@@ -526,7 +549,7 @@ export class CatalogBrowser {
   }
 
   async retry(): Promise<void> {
-    if (this.#snapshot.sendBusy) return;
+    if (this.#kindleActionBusy()) return;
     this.#snapshot = {
       ...this.#snapshot,
       loadState: "idle",
@@ -537,12 +560,15 @@ export class CatalogBrowser {
       stale: false,
       pendingBookId: undefined,
       pendingBook: undefined,
+      selectedBookIds: new Set(),
+      pendingRemoval: undefined,
+      bulkActionError: undefined,
     };
     await this.start();
   }
 
   async selectProfile(profileId: LibraryProfileId): Promise<void> {
-    if (this.#snapshot.sendBusy) return;
+    if (this.#kindleActionBusy()) return;
     const profile = this.#snapshot.profiles.find((candidate) => candidate.id === profileId && candidate.enabled);
     if (!profile || profile.id === this.#snapshot.filters.profileId) return;
     if (this.#snapshot.settingsSaving || this.#snapshot.settingsRefreshing) return;
@@ -566,6 +592,9 @@ export class CatalogBrowser {
       error: undefined,
       pendingBookId: undefined,
       pendingBook: undefined,
+      selectedBookIds: new Set(),
+      pendingRemoval: undefined,
+      bulkActionError: undefined,
       announcement: undefined,
     };
     this.#render("all");
@@ -588,7 +617,7 @@ export class CatalogBrowser {
   }
 
   async setView(view: LibraryView): Promise<void> {
-    if (this.#snapshot.sendBusy && view !== this.#snapshot.filters.view) return;
+    if (this.#kindleActionBusy() && view !== this.#snapshot.filters.view) return;
     if ((this.#snapshot.settingsSaving || this.#snapshot.settingsRefreshing) && this.#snapshot.filters.view === "settings" && view !== "settings") return;
     const discardingSettings = this.#snapshot.filters.view === "settings"
       && view !== "settings"
@@ -611,6 +640,9 @@ export class CatalogBrowser {
       filters: { ...this.#snapshot.filters, view, offset: 0, kindle: view === "on-kindle" || leavingKindleView ? "all" : this.#snapshot.filters.kindle },
       pendingBookId: undefined,
       pendingBook: undefined,
+      selectedBookIds: new Set(),
+      pendingRemoval: undefined,
+      bulkActionError: undefined,
       settingsError: undefined,
       ...(discardingSettings ? { settingsDraft: undefined, settingsDirty: false } : {}),
     };
@@ -635,13 +667,14 @@ export class CatalogBrowser {
   }
 
   updateFilter(key: keyof LibraryFilters, value: string | number): void {
-    if (this.#snapshot.sendBusy) return;
+    if (this.#kindleActionBusy()) return;
     if (key === "profileId" || key === "view" || key === "limit") return;
     this.#bookEpoch += 1;
     this.#bookOperation?.abort();
     this.#snapshot = {
       ...this.#snapshot,
       filters: { ...this.#snapshot.filters, [key]: value, offset: key === "offset" ? Number(value) : 0 },
+      selectedBookIds: new Set(),
       ...(key === "query" ? { kindleInventoryOffset: 0 } : {}),
       error: undefined,
     };
@@ -655,28 +688,33 @@ export class CatalogBrowser {
   }
 
   clearFilters(): void {
-    if (this.#snapshot.sendBusy) return;
+    if (this.#kindleActionBusy()) return;
     this.#bookEpoch += 1;
     this.#bookOperation?.abort();
-    this.#snapshot = { ...this.#snapshot, filters: clearCatalogFilters(this.#snapshot.filters) };
+    this.#snapshot = {
+      ...this.#snapshot,
+      filters: clearCatalogFilters(this.#snapshot.filters),
+      selectedBookIds: new Set(),
+    };
     this.#render("all");
     void this.reloadBooks();
   }
 
   goToPage(offset: number): void {
-    if (this.#snapshot.sendBusy) return;
+    if (this.#kindleActionBusy()) return;
     this.#bookEpoch += 1;
     this.#bookOperation?.abort();
     this.#snapshot = {
       ...this.#snapshot,
       filters: { ...this.#snapshot.filters, offset: Math.max(0, offset) },
+      selectedBookIds: new Set(),
     };
     this.#render("results");
     void this.reloadBooks();
   }
 
   goToKindleInventoryPage(offset: number): void {
-    if (this.#snapshot.sendBusy) return;
+    if (this.#kindleActionBusy()) return;
     this.#snapshot = { ...this.#snapshot, kindleInventoryOffset: Math.max(0, offset) };
     this.#render("device");
   }
@@ -733,6 +771,7 @@ export class CatalogBrowser {
         };
       }
       if (epoch !== this.#bookEpoch || profileId !== this.#snapshot.filters.profileId) return;
+      const visibleBookIds = new Set(page.items.map((book) => book.id));
       this.#set({
         filters: {
           ...this.#snapshot.filters,
@@ -740,6 +779,9 @@ export class CatalogBrowser {
           limit: page.limit,
         },
         page,
+        selectedBookIds: new Set(
+          [...this.#snapshot.selectedBookIds].filter((bookId) => visibleBookIds.has(bookId)),
+        ),
         booksState: "ready",
         stale: false,
         error: undefined,
@@ -1148,8 +1190,151 @@ export class CatalogBrowser {
     }
   }
 
+  setLayout(layout: LibraryLayout): void {
+    if (layout !== "grid" && layout !== "list") return;
+    if (this.#kindleActionBusy() || layout === this.#snapshot.layout) return;
+    this.#set({
+      layout,
+      selectedBookIds: layout === "list" ? this.#snapshot.selectedBookIds : new Set(),
+      bulkActionError: undefined,
+    }, "results");
+  }
+
+  toggleBookSelection(bookId: string, selected?: boolean): void {
+    if (this.#snapshot.layout !== "list" || this.#kindleActionBusy()) return;
+    if (!this.#snapshot.page?.items.some((book) => book.id === bookId)) return;
+    const next = new Set(this.#snapshot.selectedBookIds);
+    const shouldSelect = selected ?? !next.has(bookId);
+    if (shouldSelect) next.add(bookId);
+    else next.delete(bookId);
+    this.#set({ selectedBookIds: next, bulkActionError: undefined }, "results");
+  }
+
+  toggleVisibleBookSelection(): void {
+    if (this.#snapshot.layout !== "list" || this.#kindleActionBusy()) return;
+    const visibleIds = this.#snapshot.page?.items.map((book) => book.id) ?? [];
+    if (visibleIds.length === 0) return;
+    const next = new Set(this.#snapshot.selectedBookIds);
+    const allSelected = visibleIds.every((bookId) => next.has(bookId));
+    for (const bookId of visibleIds) {
+      if (allSelected) next.delete(bookId);
+      else next.add(bookId);
+    }
+    this.#set({ selectedBookIds: next, bulkActionError: undefined }, "results");
+  }
+
+  clearBookSelection(): void {
+    if (this.#kindleActionBusy() || this.#snapshot.selectedBookIds.size === 0) return;
+    this.#set({ selectedBookIds: new Set(), bulkActionError: undefined }, "results");
+  }
+
+  async sendSelectedBooks(): Promise<void> {
+    if (this.#snapshot.layout !== "list" || this.#kindleActionBusy()) return;
+    const books = (this.#snapshot.page?.items ?? []).filter((book) => (
+      this.#snapshot.selectedBookIds.has(book.id)
+      && this.#snapshot.kindleStatus.get(book.id) === "not-on-kindle"
+      && this.#bookSourceAvailable(book)
+    ));
+    if (books.length === 0) {
+      this.#set({ announcement: "None of the selected books are currently eligible to send." }, "all");
+      return;
+    }
+    if (!this.#hooks.onSendRequested) {
+      this.#set({ announcement: "This build has no Kindle transfer hook configured." }, "all");
+      return;
+    }
+
+    const sentBookIds = new Set<string>();
+    this.#set({
+      bulkActionBusy: true,
+      bulkActionError: undefined,
+      announcement: undefined,
+    }, "all");
+    try {
+      for (const book of books) {
+        this.#set({
+          pendingBookId: book.id,
+          pendingBook: book,
+          sendBusy: true,
+          sendPhase: "preparing",
+          sendProgress: 0,
+          sendMessage: `Preparing ${sentBookIds.size + 1} of ${books.length}`,
+        }, "all");
+        await this.#hooks.onSendRequested({ profileId: book.profileId, book });
+        sentBookIds.add(book.id);
+      }
+      const selectedBookIds = new Set(this.#snapshot.selectedBookIds);
+      for (const bookId of sentBookIds) selectedBookIds.delete(bookId);
+      this.#set({
+        bulkActionBusy: false,
+        sendBusy: false,
+        pendingBookId: undefined,
+        pendingBook: undefined,
+        sendPhase: undefined,
+        sendProgress: undefined,
+        sendMessage: undefined,
+        selectedBookIds,
+        announcement: `${sentBookIds.size} ${sentBookIds.size === 1 ? "book was" : "books were"} sent to the Kindle and verified. Library originals remain unchanged.`,
+      }, "all");
+    } catch (error) {
+      const message = errorMessage(error, "The selected books could not all be sent.");
+      this.#set({
+        bulkActionBusy: false,
+        sendBusy: false,
+        sendPhase: "failed",
+        sendMessage: message,
+        error: message,
+      }, "all");
+    }
+  }
+
+  requestBookRemoval(bookId: string): void {
+    this.#requestRemoval([bookId]);
+  }
+
+  requestSelectedBookRemoval(): void {
+    if (this.#snapshot.layout !== "list") return;
+    this.#requestRemoval([...this.#snapshot.selectedBookIds]);
+  }
+
+  cancelBookRemoval(): void {
+    if (this.#snapshot.bulkActionBusy) return;
+    this.#set({ pendingRemoval: undefined, bulkActionError: undefined }, "all");
+  }
+
+  async confirmBookRemoval(): Promise<void> {
+    const request = this.#snapshot.pendingRemoval;
+    if (!request || request.targets.length === 0 || this.#kindleActionBusy()) return;
+    if (!this.#hooks.onRemoveRequested) {
+      this.#set({
+        pendingRemoval: undefined,
+        announcement: "This build has no Kindle removal hook configured.",
+      }, "all");
+      return;
+    }
+    this.#set({ bulkActionBusy: true, bulkActionError: undefined, announcement: undefined }, "all");
+    try {
+      await this.#hooks.onRemoveRequested(request);
+      const removedBookIds = new Set(request.targets.map((target) => target.bookId));
+      const selectedBookIds = new Set(this.#snapshot.selectedBookIds);
+      for (const bookId of removedBookIds) selectedBookIds.delete(bookId);
+      this.#set({
+        bulkActionBusy: false,
+        pendingRemoval: undefined,
+        selectedBookIds,
+        bulkActionError: undefined,
+        announcement: `${request.targets.length} exact Kindle ${request.targets.length === 1 ? "file was" : "files were"} removed. Library originals were not changed.`,
+      }, "all");
+    } catch (error) {
+      this.#set({
+        bulkActionBusy: false,
+        bulkActionError: errorMessage(error, "The selected Kindle files could not all be removed."),
+      }, "all");
+    }
+  }
+
   openSend(bookId: string): void {
-    if (this.#snapshot.sendBusy) return;
+    if (this.#kindleActionBusy()) return;
     const book = this.#snapshot.page?.items.find((candidate) => candidate.id === bookId);
     if (!book) return;
     this.#set({ pendingBookId: book.id, pendingBook: book, announcement: undefined, sendPhase: undefined, sendProgress: undefined, sendMessage: undefined }, "all");
@@ -1159,7 +1344,7 @@ export class CatalogBrowser {
   }
 
   closeSend(): void {
-    if (this.#snapshot.sendBusy) return;
+    if (this.#kindleActionBusy()) return;
     this.#activeSendOperation = undefined;
     this.#set({ pendingBookId: undefined, pendingBook: undefined, sendPhase: undefined, sendProgress: undefined, sendMessage: undefined }, "all");
   }
@@ -1167,7 +1352,7 @@ export class CatalogBrowser {
   async confirmSend(): Promise<void> {
     const book = this.#snapshot.pendingBook;
     const profileId = book?.profileId;
-    if (!profileId || !book || this.#snapshot.sendBusy) return;
+    if (!profileId || !book || this.#kindleActionBusy()) return;
     if (!this.#hooks.onSendRequested) {
       this.#set({
         pendingBookId: undefined,
@@ -1183,8 +1368,8 @@ export class CatalogBrowser {
       await this.#hooks.onSendRequested({ profileId, book });
       if (this.#activeSendOperation !== operation) return;
       this.#activeSendOperation = undefined;
-      // Keep the reconciled status intact: a verified write can still be an
-      // ambiguous match when duplicate managed-token objects are present.
+      // Keep the reconciled status intact: the refreshed inventory is the
+      // authority, including Calibre-style association of duplicate copies.
       const terminalMessage = this.#snapshot.sendPhase === "complete"
         ? this.#snapshot.sendMessage
         : undefined;
@@ -1235,7 +1420,7 @@ export class CatalogBrowser {
   }
 
   async requestDisconnect(): Promise<void> {
-    if (this.#snapshot.sendBusy) return;
+    if (this.#kindleActionBusy()) return;
     await this.#hooks.onDisconnectRequested?.();
   }
 
@@ -1288,6 +1473,8 @@ export class CatalogBrowser {
         kindleInventory: undefined,
         kindleStatus: new Map(),
         kindleStatusCountsByProfile: new Map(),
+        pendingRemoval: undefined,
+        bulkActionError: undefined,
       }, "all");
       void this.reloadBooks(true);
       return;
@@ -1331,6 +1518,73 @@ export class CatalogBrowser {
     if (!this.#settingsDraftDirty) return true;
     if (typeof window === "undefined" || typeof window.confirm !== "function") return true;
     return window.confirm("Discard your unsaved library settings changes?");
+  }
+
+  #kindleActionBusy(): boolean {
+    return this.#snapshot.sendBusy || this.#snapshot.bulkActionBusy;
+  }
+
+  #bookSourceAvailable(book: CatalogBook): boolean {
+    const root = this.#snapshot.rootsByProfile.get(book.profileId)
+      ?.find((candidate) => candidate.id === book.rootId);
+    return book.available !== false
+      && root?.enabled === true
+      && ["available", "watching", "paused", "scanning"].includes(root.status);
+  }
+
+  #requestRemoval(bookIds: readonly string[]): void {
+    if (this.#kindleActionBusy()) return;
+    const profileId = this.#snapshot.filters.profileId;
+    const inventory = this.#snapshot.kindleInventory;
+    if (
+      !profileId
+      || inventory?.completeness !== "complete"
+      || inventory.matching?.status !== "complete"
+    ) {
+      this.#set({
+        bulkActionError: undefined,
+        announcement: "Reconnect the Kindle and complete its live comparison before removing books.",
+      }, "all");
+      return;
+    }
+    const requestedBookIds = new Set(bookIds);
+    const booksById = new Map(
+      (this.#snapshot.page?.items ?? [])
+        .filter((book) => requestedBookIds.has(book.id))
+        .map((book) => [book.id, book] as const),
+    );
+    const seenItems = new Set<string>();
+    const targets: CatalogRemoveTarget[] = [];
+    for (const item of inventory.items) {
+      if (
+        !item.bookId
+        || !requestedBookIds.has(item.bookId)
+        || item.match !== "confirmed"
+        || seenItems.has(item.id)
+      ) continue;
+      const book = booksById.get(item.bookId);
+      if (!book || book.profileId !== profileId) continue;
+      seenItems.add(item.id);
+      targets.push(Object.freeze({
+        itemId: item.id,
+        bookId: book.id,
+        title: book.title,
+        filename: item.filename,
+        size: item.size,
+      }));
+    }
+    if (targets.length === 0) {
+      this.#set({
+        bulkActionError: undefined,
+        announcement: "No selected book has an exact current Kindle association that can be removed safely.",
+      }, "all");
+      return;
+    }
+    this.#set({
+      pendingRemoval: Object.freeze({ profileId, targets: Object.freeze(targets) }),
+      bulkActionError: undefined,
+      announcement: undefined,
+    }, "all");
   }
 
   #set(update: Partial<CatalogBrowserSnapshot>, scope: CatalogRenderScope): void {
@@ -1480,7 +1734,7 @@ export class CatalogBrowser {
         booksState: selected ? "loading" as const : "idle" as const,
         stale: false,
         error: undefined,
-        ...(this.#snapshot.sendBusy ? {} : { pendingBookId: undefined, pendingBook: undefined }),
+        ...(this.#kindleActionBusy() ? {} : { pendingBookId: undefined, pendingBook: undefined }),
       } : {}),
       ...(!selected ? { booksState: "idle" as const, page: undefined } : {}),
     };
