@@ -44,7 +44,7 @@ This document is the release-candidate omission audit for the backlog program in
 
 ## Final candidate record
 
-- Feature candidate Git revision: recorded after the candidate commit below
+- Feature candidate Git revision: `1ae91a1188631793c099230d581fcfb8770247ed`
 - Final `npm run check`: **passed** in the pinned Node.js 24.20.0 Docker build on 2026-09-04 — 93 test files and 948 tests passed; client/server type checks and the production Vite build passed
 - Canonical Docker build/smoke: **passed** as native `linux/arm64` image `sha256:1749294bd084341518f1c6727a752445a84a9d51ba9c6f75c605cb79a1a427d0`; a fresh empty `/data` and `/cache` tmpfs booted as UID/GID 1000 with a read-only root filesystem, all capabilities dropped, `no-new-privileges`, and PID limit 128; `/api/healthz` returned `{"live":true}` and `/api/readyz` returned database/cache ready
 - Live Open Library/Google Books acceptance: requires deployment egress and, for Google Books, a user-supplied key
