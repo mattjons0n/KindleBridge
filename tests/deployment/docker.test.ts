@@ -37,7 +37,8 @@ describe("platform-agnostic Docker deployment", () => {
 
     expect(dockerfile).toContain("USER 1000:1000");
     expect(dockerfile).toContain('VOLUME ["/data", "/cache"]');
-    expect(dockerfile).toContain("TMPDIR=/cache/tmp");
+    expect(dockerfile.split(/\r?\n/u)).toContain("    TMPDIR=/cache \\");
+    expect(dockerfile).not.toContain("TMPDIR=/cache/tmp");
     expect(dockerfile).toContain("STOPSIGNAL SIGTERM");
     expect(dockerfile).toContain("HEALTHCHECK");
     expect(compose).toContain('user: "1000:1000"');

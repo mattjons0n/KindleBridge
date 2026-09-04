@@ -35,7 +35,12 @@ export enum MtpOperationCode {
   DeleteObject = 0x100b,
   SendObjectInfo = 0x100c,
   SendObject = 0x100d,
+  /** Standard MTP bounded range read. Production inventory does not use this yet. */
+  GetPartialObject = 0x101b,
 }
+
+// Deliberately do not add GetObjectPropList (0x9805): libmtp/Calibre marks it
+// broken for the physically tested Amazon 0x1949 / 0x9981 Kindle.
 
 export enum MtpResponseCode {
   Undefined = 0x2000,

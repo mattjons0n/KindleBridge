@@ -6,13 +6,15 @@ interface Migration {
   sql: string;
 }
 
-export const CATALOG_SCHEMA_VERSION = 14;
+export const CATALOG_SCHEMA_VERSION = 17;
 /** Bounded replay window for Settings/configuration mutations per profile. */
 export const MAX_CONFIGURATION_WRITES_PER_PROFILE = 1_000;
 /** Unreferenced stable identities retained per root after confirmed scans. */
 export const MAX_UNREFERENCED_IDENTITIES_PER_ROOT = 20_000;
 /** Exact raw UTF-8 budget for unreferenced stable identities in one root. */
 export const MAX_UNREFERENCED_IDENTITY_BYTES_PER_ROOT = 32 * 1024 * 1024;
+/** Bounded replay window for queue-add and shelf-create operations. */
+export const MAX_DURABLE_MUTATION_REPLAYS_PER_PROFILE = 1_000;
 
 /** Exported for deterministic migration-fixture construction in tests/tools. */
 export const CATALOG_MIGRATIONS: readonly Migration[] = [
@@ -457,6 +459,204 @@ export const CATALOG_MIGRATIONS: readonly Migration[] = [
         replace(replace(b.identifiers_json, '[', ' '), ']', ' '),
         coalesce(b.description, ''), sf.relative_path
       FROM books b JOIN source_files sf ON sf.id = b.source_file_id;
+    `,
+  },
+  {
+    version: 15,
+    name: "durable cover provider credentials",
+    sql: `
+      CREATE TABLE cover_provider_credentials (
+        provider TEXT PRIMARY KEY CHECK(provider IN ('google-books')),
+        api_key TEXT,
+        configuration_state TEXT NOT NULL DEFAULT 'never-configured' CHECK(
+          configuration_state IN ('never-configured', 'configured', 'removed')
+        ),
+        revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
+        last_tested_at TEXT,
+        last_test_status TEXT CHECK(last_test_status IS NULL OR last_test_status IN ('working', 'error')),
+        last_test_error_code TEXT CHECK(
+          last_test_error_code IS NULL OR last_test_error_code IN (
+            'invalid-or-restricted-key', 'quota-exhausted', 'timeout', 'provider-unavailable'
+          )
+        ),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        CHECK(
+          (configuration_state = 'configured' AND api_key IS NOT NULL)
+          OR (
+            configuration_state IN ('never-configured', 'removed')
+            AND api_key IS NULL AND last_tested_at IS NULL
+            AND last_test_status IS NULL AND last_test_error_code IS NULL
+          )
+        )
+      ) STRICT;
+    `,
+  },
+  {
+    version: 16,
+    name: "profile send queue, smart shelves, and personal annotations",
+    sql: `
+      CREATE TABLE send_queue_state (
+        profile_id TEXT PRIMARY KEY REFERENCES profiles(id) ON DELETE CASCADE,
+        revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
+        updated_at TEXT NOT NULL
+      ) STRICT;
+
+      -- No books foreign key: user intent must survive a rebuild, a missing
+      -- mount, and retirement of a rebuildable source row.
+      CREATE TABLE send_queue_entries (
+        profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+        book_id TEXT NOT NULL,
+        rank INTEGER NOT NULL CHECK(rank >= 0),
+        queued_content_hash TEXT NOT NULL,
+        queued_presentation_version TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(profile_id, book_id)
+      ) STRICT;
+      CREATE INDEX send_queue_rank_idx
+        ON send_queue_entries(profile_id, rank, created_at, book_id);
+
+      CREATE TABLE smart_shelves (
+        id TEXT PRIMARY KEY,
+        profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+        name TEXT NOT NULL CHECK(length(trim(name)) BETWEEN 1 AND 80),
+        query_version INTEGER NOT NULL CHECK(query_version = 1),
+        query_json TEXT NOT NULL CHECK(
+          json_valid(query_json)
+          AND json_extract(query_json, '$.version') = query_version
+          AND length(CAST(query_json AS BLOB)) <= 8192
+        ),
+        pinned_rank INTEGER CHECK(pinned_rank IS NULL OR pinned_rank >= 0),
+        revision INTEGER NOT NULL CHECK(revision > 0),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      ) STRICT;
+      CREATE UNIQUE INDEX smart_shelves_profile_name_idx
+        ON smart_shelves(profile_id, name COLLATE NOCASE);
+      CREATE INDEX smart_shelves_profile_pin_idx
+        ON smart_shelves(profile_id, pinned_rank, name, id);
+
+      -- Like queue entries, annotations intentionally reference stable opaque
+      -- book identity rather than rebuildable book rows.
+      CREATE TABLE profile_book_annotations (
+        profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+        book_id TEXT NOT NULL,
+        favorite INTEGER NOT NULL DEFAULT 0 CHECK(favorite IN (0, 1)),
+        want_to_read INTEGER NOT NULL DEFAULT 0 CHECK(want_to_read IN (0, 1)),
+        revision INTEGER NOT NULL CHECK(revision > 0),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(profile_id, book_id)
+      ) STRICT;
+      CREATE INDEX profile_book_annotations_favorite_idx
+        ON profile_book_annotations(profile_id, favorite, book_id);
+      CREATE INDEX profile_book_annotations_want_idx
+        ON profile_book_annotations(profile_id, want_to_read, book_id);
+
+      CREATE TABLE durable_mutation_replays (
+        profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+        operation TEXT NOT NULL CHECK(operation IN ('send-queue-add', 'smart-shelf-create')),
+        idempotency_key TEXT NOT NULL,
+        request_hash TEXT NOT NULL,
+        resource_id TEXT,
+        result_revision INTEGER NOT NULL CHECK(result_revision >= 0),
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(profile_id, operation, idempotency_key)
+      ) STRICT;
+      CREATE INDEX durable_mutation_replays_retention_idx
+        ON durable_mutation_replays(profile_id, created_at DESC, idempotency_key DESC);
+    `,
+  },
+  {
+    version: 17,
+    name: "catalog health issue dispositions",
+    sql: `
+      -- Issue rows are derived from the current catalog. Only bounded user
+      -- disposition and retry state is durable, and it deliberately survives
+      -- rebuildable book/source rows disappearing.
+      CREATE TABLE catalog_issue_dispositions (
+        profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+        issue_signature TEXT NOT NULL CHECK(
+          length(issue_signature) = 22 AND issue_signature GLOB 'issue-[0-9a-f]*'
+        ),
+        issue_type TEXT NOT NULL CHECK(issue_type IN (
+          'missing-cover', 'incomplete-metadata', 'metadata-parser-failure',
+          'low-confidence-provider-data', 'unavailable-source', 'suspected-duplicate'
+        )),
+        ignored INTEGER NOT NULL DEFAULT 0 CHECK(ignored IN (0, 1)),
+        preferred_book_id TEXT CHECK(
+          preferred_book_id IS NULL OR (length(preferred_book_id) BETWEEN 6 AND 100)
+        ),
+        revision INTEGER NOT NULL CHECK(revision > 0),
+        retry_count INTEGER NOT NULL DEFAULT 0 CHECK(retry_count >= 0),
+        last_retry_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(profile_id, issue_signature)
+      ) STRICT;
+      CREATE INDEX catalog_issue_dispositions_profile_updated_idx
+        ON catalog_issue_dispositions(profile_id, updated_at DESC, issue_signature);
+
+      CREATE TABLE cover_provider_mutation_replays (
+        provider TEXT NOT NULL CHECK(provider IN ('google-books')),
+        operation TEXT NOT NULL CHECK(operation IN ('save', 'remove')),
+        idempotency_key TEXT NOT NULL,
+        request_hash TEXT NOT NULL,
+        result_revision INTEGER NOT NULL CHECK(result_revision > 0),
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(provider, operation, idempotency_key)
+      ) STRICT;
+      CREATE INDEX cover_provider_mutation_replays_retention_idx
+        ON cover_provider_mutation_replays(provider, created_at DESC, idempotency_key DESC);
+
+      CREATE TABLE metadata_lookup_jobs (
+        id TEXT PRIMARY KEY,
+        profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+        provider TEXT NOT NULL CHECK(provider IN ('google-books', 'open-library')),
+        status TEXT NOT NULL CHECK(status IN ('queued', 'running', 'paused', 'completed', 'cancelled')),
+        revision INTEGER NOT NULL CHECK(revision > 0),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      ) STRICT;
+      CREATE INDEX metadata_lookup_jobs_profile_updated_idx
+        ON metadata_lookup_jobs(profile_id, updated_at DESC, id);
+
+      -- Book IDs are intentionally stable opaque identities without a foreign
+      -- key to the rebuildable catalog. A missing source becomes a bounded
+      -- per-entry failure, while already reviewed results survive restarts.
+      CREATE TABLE metadata_lookup_entries (
+        job_id TEXT NOT NULL REFERENCES metadata_lookup_jobs(id) ON DELETE CASCADE,
+        book_id TEXT NOT NULL,
+        rank INTEGER NOT NULL CHECK(rank >= 0),
+        status TEXT NOT NULL CHECK(status IN (
+          'pending', 'searching', 'ready', 'no-results', 'failed', 'cancelled'
+        )),
+        attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+        candidates_json TEXT NOT NULL DEFAULT '[]' CHECK(
+          json_valid(candidates_json) AND json_type(candidates_json) = 'array'
+          AND length(CAST(candidates_json AS BLOB)) <= 2097152
+        ),
+        error_code TEXT CHECK(error_code IS NULL OR error_code IN (
+          'book-unavailable', 'provider-unavailable', 'provider-not-configured',
+          'provider-response-too-large', 'invalid-provider-response'
+        )),
+        accepted_at TEXT,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(job_id, book_id),
+        UNIQUE(job_id, rank)
+      ) STRICT;
+      CREATE INDEX metadata_lookup_entries_status_idx
+        ON metadata_lookup_entries(job_id, status, rank, book_id);
+
+      CREATE TABLE metadata_lookup_job_replays (
+        profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+        idempotency_key TEXT NOT NULL,
+        request_hash TEXT NOT NULL,
+        job_id TEXT NOT NULL REFERENCES metadata_lookup_jobs(id) ON DELETE CASCADE,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(profile_id, idempotency_key)
+      ) STRICT;
     `,
   },
 ];

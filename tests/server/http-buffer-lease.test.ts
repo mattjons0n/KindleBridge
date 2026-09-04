@@ -5,9 +5,14 @@ import { describe, expect, it } from "vitest";
 
 import { CatalogHttpServer } from "../../server/http-server.js";
 
+const database = {
+  initializeCoverProviderCredentials: () => undefined,
+  getCoverProviderCredential: () => undefined,
+};
+
 describe("buffered response lifecycle lease", () => {
   it("queues beyond the active cap and releases waiters in response-lifecycle order", async () => {
-    const server = new CatalogHttpServer({} as never, {} as never, {} as never, {} as never, {} as never, {
+    const server = new CatalogHttpServer(database as never, {} as never, {} as never, {} as never, {} as never, {
       maxConcurrentBufferedResponses: 2,
     });
     const acquire = (
@@ -35,7 +40,7 @@ describe("buffered response lifecycle lease", () => {
   });
 
   it("times out a non-draining bounded queue without reserving another buffer", async () => {
-    const server = new CatalogHttpServer({} as never, {} as never, {} as never, {} as never, {} as never, {
+    const server = new CatalogHttpServer(database as never, {} as never, {} as never, {} as never, {} as never, {
       maxConcurrentBufferedResponses: 1,
       bufferedResponseWaitTimeoutMs: 5,
     });
@@ -52,7 +57,7 @@ describe("buffered response lifecycle lease", () => {
   });
 
   it("rejects an already-closed fast-path response without leaking capacity", async () => {
-    const server = new CatalogHttpServer({} as never, {} as never, {} as never, {} as never, {} as never, {
+    const server = new CatalogHttpServer(database as never, {} as never, {} as never, {} as never, {} as never, {
       maxConcurrentBufferedResponses: 1,
     });
     const acquire = (
@@ -69,7 +74,7 @@ describe("buffered response lifecycle lease", () => {
   });
 
   it("removes a response that closes while queued and lets a later request acquire", async () => {
-    const server = new CatalogHttpServer({} as never, {} as never, {} as never, {} as never, {} as never, {
+    const server = new CatalogHttpServer(database as never, {} as never, {} as never, {} as never, {} as never, {
       maxConcurrentBufferedResponses: 1,
     });
     const acquire = (

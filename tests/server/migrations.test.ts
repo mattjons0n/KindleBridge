@@ -40,6 +40,32 @@ function createVersionFixture(databasePath: string, version: number): DatabaseSy
 }
 
 describe("catalog migrations", () => {
+  it("upgrades v15 durable data with queue, shelf, and annotation tables", async () => {
+    const databasePath = path.join(await temporaryDirectory(), "v15-durable-state.sqlite");
+    const database = createVersionFixture(databasePath, 15);
+    const timestamp = "2026-09-03T00:00:00.000Z";
+    database.prepare("INSERT INTO profiles(id, name, enabled, created_at, updated_at) VALUES (?, ?, 1, ?, ?)")
+      .run("prf_migration15", "Retained profile", timestamp, timestamp);
+
+    expect(migrateCatalogDatabase(database)).toBe(CATALOG_SCHEMA_VERSION);
+    expect(database.prepare("SELECT name FROM profiles WHERE id = ?").get("prf_migration15"))
+      .toEqual({ name: "Retained profile" });
+    for (const table of [
+      "send_queue_state",
+      "send_queue_entries",
+      "smart_shelves",
+      "profile_book_annotations",
+      "catalog_issue_dispositions",
+      "metadata_lookup_jobs",
+      "metadata_lookup_entries",
+      "cover_provider_mutation_replays",
+    ]) {
+      expect(database.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").get(table))
+        .toEqual({ name: table });
+    }
+    database.close();
+  });
+
   it("upgrades genuine v1 through v5 schemas to the current version", async () => {
     const directory = await temporaryDirectory();
     for (let version = 1; version <= 5; version += 1) {
@@ -52,6 +78,20 @@ describe("catalog migrations", () => {
       expect(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()).toEqual({ count: CATALOG_SCHEMA_VERSION });
       expect(database.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'catalog_book_identities'").get())
         .toEqual({ name: "catalog_book_identities" });
+      expect(database.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'cover_provider_credentials'").get())
+        .toEqual({ name: "cover_provider_credentials" });
+      for (const table of [
+        "send_queue_entries",
+        "smart_shelves",
+        "profile_book_annotations",
+        "durable_mutation_replays",
+        "catalog_issue_dispositions",
+        "metadata_lookup_jobs",
+        "cover_provider_mutation_replays",
+      ]) {
+        expect(database.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").get(table))
+          .toEqual({ name: table });
+      }
       database.close();
     }
   });

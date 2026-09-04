@@ -12,9 +12,20 @@ import {
   MAX_CATALOG_ROOT_MEMBERSHIPS,
   MAX_CATALOG_ROOTS,
   MAX_CATALOG_ROOTS_PER_PROFILE,
+  MAX_BOOK_SELECTION_IDS,
   MAX_MATCH_INDEX_DELIVERIES,
   MAX_MATCH_INDEX_ENTRIES,
   MAX_MATCH_INDEX_RESPONSE_BYTES,
+  MAX_METADATA_CANDIDATES,
+  MAX_METADATA_LOOKUP_JOB_BOOKS,
+  MAX_METADATA_LOOKUP_JOBS_PER_PROFILE,
+  MAX_PINNED_SMART_SHELVES_PER_PROFILE,
+  MAX_PROFILE_BOOK_ANNOTATIONS_PER_PROFILE,
+  MAX_SEND_QUEUE_ENTRIES_PER_PROFILE,
+  MAX_SEND_QUEUE_MUTATION_BOOK_IDS,
+  MAX_SERIES_DETAIL_BOOKS,
+  MAX_SMART_SHELF_NAME_LENGTH,
+  MAX_SMART_SHELVES_PER_PROFILE,
   MAX_STALE_MANAGED_TOKENS_PER_BOOK,
   type BookFormat,
   type BookCoverOverride,
@@ -22,29 +33,73 @@ import {
   type BookMetadataPatchInput,
   type BookMetadataResetInput,
   type BookMetadataState,
+  type BookDetailsState,
   type BookPage,
   type BookSetQuery,
   type CatalogBook,
   type CatalogFilters,
+  type CatalogSeriesDetail,
+  type CatalogSeriesSummaryPage,
   type CatalogProfile,
   type CatalogRoot,
+  type ConfigurableCoverProvider,
+  type CoverProviderCredentialErrorCode,
+  type CoverProviderCredentialState,
   type CoverProvider,
   type DeliveryInput,
   type DeliveryRecord,
   type EditableBookMetadata,
   type EditableMetadataField,
   type MatchIndexEntry,
+  type CatalogMetadataCandidate,
+  type MetadataCandidateSearchTerms,
+  type MetadataLookupJob,
+  type MetadataLookupJobEntry,
+  type MetadataLookupErrorCode,
+  type MetadataLookupJobInput,
+  type MetadataLookupJobPage,
+  type MetadataLookupJobStatus,
   type MetadataClaimSummary,
+  type BookSelectionResult,
+  type ProfileBookAnnotation,
+  type ProfileBookAnnotationPatchInput,
   type ProfileInput,
   type ProfileConfiguration,
   type ProfileConfigurationInput,
   type ProfileMatchIndex,
   type RootInput,
   type RootStatus,
+  type SendQueue,
+  type SendQueueEntry,
+  type SmartShelf,
+  type SmartShelfCreateInput,
+  type SmartShelfPatchInput,
+  type SmartShelfPinnedOrderInput,
+  type SmartShelfQuery,
 } from "../shared/catalog-contracts.js";
+import {
+  deriveCatalogIssues,
+  MAX_DERIVED_CATALOG_ISSUES,
+  type CatalogHealthIssue,
+  type CatalogHealthPage,
+  type CatalogHealthQuery,
+  type CatalogIssueBookFacts,
+  type CatalogDuplicatePreferenceInput,
+  type CatalogIssueDisposition,
+  type CatalogIssueSourceFacts,
+  type DerivedCatalogIssue,
+} from "../shared/catalog-issues.js";
+import { canonicalSeriesKey, MAX_USABLE_SERIES_INDEX, usableSeriesIndex } from "../shared/series.js";
+import {
+  decodeSmartShelfQuery,
+  encodeSmartShelfQuery,
+  smartShelfQueryToBookQuery,
+  SmartShelfQueryError,
+} from "../shared/shelf-query.js";
 import {
   CATALOG_SCHEMA_VERSION,
   MAX_CONFIGURATION_WRITES_PER_PROFILE,
+  MAX_DURABLE_MUTATION_REPLAYS_PER_PROFILE,
   MAX_UNREFERENCED_IDENTITIES_PER_ROOT,
   MAX_UNREFERENCED_IDENTITY_BYTES_PER_ROOT,
   migrateCatalogDatabase,
@@ -60,6 +115,12 @@ type SqlValue = string | number | bigint | Uint8Array | null;
 
 interface Row {
   [key: string]: unknown;
+}
+
+export interface CoverProviderCredentialSnapshot {
+  provider: ConfigurableCoverProvider;
+  apiKey: string;
+  revision: number;
 }
 
 export interface ExtractedBookInput {
@@ -138,6 +199,25 @@ export interface CoverMutationResult {
   unreferencedAssetKey: string | null;
 }
 
+export interface CatalogIssueMutationResult {
+  issue: CatalogHealthIssue;
+  applied: boolean;
+}
+
+interface MetadataLookupAcceptance {
+  readonly jobId: string;
+  readonly provider: CoverProvider;
+  readonly candidateId: string;
+}
+
+export interface MetadataLookupClaim {
+  jobId: string;
+  profileId: string;
+  bookId: string;
+  provider: CoverProvider;
+  terms: MetadataCandidateSearchTerms;
+}
+
 export interface ScanRoot {
   id: string;
   path: string;
@@ -179,6 +259,7 @@ export class CatalogDatabaseError extends Error {
       | "conflict"
       | "invalid_state"
       | "too_large"
+      | "selection_too_large"
       | "response_too_large"
       | "match_index_too_large",
     message: string,
@@ -196,6 +277,7 @@ interface MatchIndexLimits {
 
 interface MatchBookRow extends Row {
   id: string;
+  preferred_presentation: number;
   title: string;
   authors_json: string;
   author_sort: string | null;
@@ -271,6 +353,18 @@ const MAX_FILTER_VALUES_PER_FACET = Math.floor(MAX_CATALOG_FILTER_VALUES / CATAL
  */
 export const MAX_NON_DELIVERED_DELIVERIES_PER_PROFILE = 10_000;
 const DELIVERY_HISTORY_MAINTENANCE_KEY = "delivery-history-retention-v1";
+const COVER_PROVIDER_KEY_MASK = "••••••••";
+const MAX_COVER_PROVIDER_API_KEY_LENGTH = 512;
+
+export interface SendQueueMutationResult {
+  queue: SendQueue;
+  applied: boolean;
+}
+
+export interface SmartShelfMutationResult {
+  shelf: SmartShelf;
+  applied: boolean;
+}
 
 function opaqueId(prefix: string): string {
   return `${prefix}_${randomBytes(12).toString("base64url")}`;
@@ -312,6 +406,52 @@ function stringOrNull(value: unknown): string | null {
   return typeof value === "string" ? value : null;
 }
 
+function normalizedCoverProviderApiKey(value: string): string {
+  const normalized = value.trim();
+  if (
+    normalized.length === 0
+    || normalized.length > MAX_COVER_PROVIDER_API_KEY_LENGTH
+    || /[\u0000-\u0020\u007f]/u.test(normalized)
+  ) {
+    throw new RangeError("Cover-provider API key is invalid.");
+  }
+  return normalized;
+}
+
+function normalizedShelfName(value: string): string {
+  const normalized = value.trim().replace(/\s+/gu, " ");
+  if (!normalized || normalized.length > MAX_SMART_SHELF_NAME_LENGTH || /[\0\r\n]/u.test(normalized)) {
+    throw new RangeError("Smart-shelf name is invalid.");
+  }
+  return normalized;
+}
+
+function mutationRequestHash(value: unknown): string {
+  return createHash("sha256").update(stableJson(value)).digest("hex");
+}
+
+function coverProviderCredentialState(row: Row): CoverProviderCredentialState {
+  const provider = String(row.provider) as ConfigurableCoverProvider;
+  const configured = typeof row.api_key === "string" && row.api_key.length > 0;
+  const testStatus = stringOrNull(row.last_test_status);
+  const errorCode = stringOrNull(row.last_test_error_code) as CoverProviderCredentialErrorCode | null;
+  return {
+    provider,
+    configured,
+    maskedKey: configured ? COVER_PROVIDER_KEY_MASK : null,
+    revision: Number(row.revision),
+    status: !configured
+      ? "not-configured"
+      : testStatus === "working"
+        ? "working"
+        : testStatus === "error"
+          ? "error"
+          : "untested",
+    lastTestedAt: configured ? stringOrNull(row.last_tested_at) : null,
+    errorCode: configured ? errorCode : null,
+  };
+}
+
 function numberOrNull(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
@@ -323,6 +463,24 @@ function parseStringArray(value: unknown): string[] {
   try {
     const parsed: unknown = JSON.parse(value);
     return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+function parseMetadataCandidates(value: unknown): CatalogMetadataCandidate[] {
+  if (typeof value !== "string") return [];
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((candidate): candidate is CatalogMetadataCandidate => {
+      if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return false;
+      const item = candidate as Partial<CatalogMetadataCandidate>;
+      return (item.provider === "google-books" || item.provider === "open-library")
+        && typeof item.candidateId === "string"
+        && (item.confidence === "high" || item.confidence === "medium" || item.confidence === "low")
+        && item.metadata !== null && typeof item.metadata === "object" && !Array.isArray(item.metadata);
+    });
   } catch {
     return [];
   }
@@ -573,11 +731,17 @@ export class CatalogDatabase {
           ? managedTokenForBook(bookId, contentHash)
           : null,
     );
+    this.database.function(
+      "kindle_bridge_series_key",
+      { deterministic: true, directOnly: true },
+      (series) => typeof series === "string" ? canonicalSeriesKey(series) : "",
+    );
     this.schemaVersion = migrateCatalogDatabase(this.database);
     if (this.schemaVersion !== CATALOG_SCHEMA_VERSION) {
       throw new CatalogDatabaseError("invalid_state", "The catalog database schema is not supported.");
     }
     this.bootstrapSourceMetadata();
+    this.recoverInterruptedMetadataLookupJobs();
     // Supported databases created before retention was enforced may already
     // exceed the live ceilings. Normalize them atomically before callers can
     // request a match index; otherwise the fail-closed index preflight could
@@ -626,6 +790,931 @@ export class CatalogDatabase {
     this.database.close();
   }
 
+  initializeCoverProviderCredentials(legacyGoogleBooksApiKey?: string): void {
+    const timestamp = now();
+    const apiKey = legacyGoogleBooksApiKey === undefined
+      ? null
+      : normalizedCoverProviderApiKey(legacyGoogleBooksApiKey);
+    this.transaction(() => {
+      this.database.prepare(
+        `INSERT OR IGNORE INTO cover_provider_credentials(
+           provider, api_key, configuration_state, revision, created_at, updated_at
+         ) VALUES ('google-books', ?, ?, ?, ?, ?)`,
+      ).run(apiKey, apiKey === null ? "never-configured" : "configured", apiKey === null ? 0 : 1, timestamp, timestamp);
+      if (apiKey !== null) {
+        // The explicit state, rather than secret contents, distinguishes a
+        // first-start bootstrap from a deliberate removal.
+        // Once a user saves or removes a key, an old environment value must
+        // never silently reappear on a later restart.
+        this.database.prepare(
+          `UPDATE cover_provider_credentials
+           SET api_key = ?, configuration_state = 'configured', revision = 1, last_tested_at = NULL,
+             last_test_status = NULL, last_test_error_code = NULL, updated_at = ?
+           WHERE provider = 'google-books' AND configuration_state = 'never-configured'
+             AND revision = 0 AND api_key IS NULL`,
+        ).run(apiKey, timestamp);
+      }
+    });
+  }
+
+  listCoverProviderCredentialStates(): CoverProviderCredentialState[] {
+    return [this.getCoverProviderCredentialState("google-books")];
+  }
+
+  getCoverProviderCredentialState(provider: ConfigurableCoverProvider): CoverProviderCredentialState {
+    const row = this.database.prepare(
+      `SELECT provider, api_key, revision, last_tested_at, last_test_status, last_test_error_code
+       FROM cover_provider_credentials WHERE provider = ?`,
+    ).get(provider) as Row | undefined;
+    if (!row) {
+      return {
+        provider,
+        configured: false,
+        maskedKey: null,
+        revision: 0,
+        status: "not-configured",
+        lastTestedAt: null,
+        errorCode: null,
+      };
+    }
+    return coverProviderCredentialState(row);
+  }
+
+  getCoverProviderCredential(provider: ConfigurableCoverProvider): CoverProviderCredentialSnapshot | null {
+    const row = this.database.prepare(
+      `SELECT provider, api_key, revision FROM cover_provider_credentials WHERE provider = ?`,
+    ).get(provider) as Row | undefined;
+    const apiKey = stringOrNull(row?.api_key);
+    if (!row || !apiKey) return null;
+    return { provider, apiKey, revision: Number(row.revision) };
+  }
+
+  setCoverProviderCredential(
+    provider: ConfigurableCoverProvider,
+    apiKey: string,
+    expectedRevision: number,
+    idempotencyKey?: string,
+  ): CoverProviderCredentialState {
+    const normalized = normalizedCoverProviderApiKey(apiKey);
+    return this.transaction(() => {
+      const requestHash = mutationRequestHash({ apiKey: normalized, expectedRevision });
+      const replay = idempotencyKey
+        ? this.readCoverProviderMutationReplay(provider, "save", idempotencyKey, requestHash)
+        : null;
+      if (replay !== null) {
+        const state = this.getCoverProviderCredentialState(provider);
+        if (state.revision !== replay) {
+          throw new CatalogDatabaseError("conflict", "Cover-provider settings changed after this request completed.");
+        }
+        return state;
+      }
+      const timestamp = now();
+      this.database.prepare(
+        `INSERT OR IGNORE INTO cover_provider_credentials(
+           provider, api_key, configuration_state, revision, created_at, updated_at
+         ) VALUES (?, NULL, 'never-configured', 0, ?, ?)`,
+      ).run(provider, timestamp, timestamp);
+      const changed = this.database.prepare(
+        `UPDATE cover_provider_credentials
+         SET api_key = ?, configuration_state = 'configured', revision = revision + 1, last_tested_at = NULL,
+           last_test_status = NULL, last_test_error_code = NULL, updated_at = ?
+         WHERE provider = ? AND revision = ?`,
+      ).run(normalized, timestamp, provider, expectedRevision);
+      if (changed.changes !== 1) {
+        throw new CatalogDatabaseError("conflict", "Cover-provider settings changed in another browser.");
+      }
+      if (idempotencyKey) this.writeCoverProviderMutationReplay(provider, "save", idempotencyKey, requestHash, expectedRevision + 1, timestamp);
+      return this.getCoverProviderCredentialState(provider);
+    });
+  }
+
+  removeCoverProviderCredential(
+    provider: ConfigurableCoverProvider,
+    expectedRevision: number,
+    idempotencyKey?: string,
+  ): CoverProviderCredentialState {
+    return this.transaction(() => {
+      const requestHash = mutationRequestHash({ expectedRevision });
+      const replay = idempotencyKey
+        ? this.readCoverProviderMutationReplay(provider, "remove", idempotencyKey, requestHash)
+        : null;
+      if (replay !== null) {
+        const state = this.getCoverProviderCredentialState(provider);
+        if (state.revision !== replay) {
+          throw new CatalogDatabaseError("conflict", "Cover-provider settings changed after this request completed.");
+        }
+        return state;
+      }
+      const timestamp = now();
+      this.database.prepare(
+        `INSERT OR IGNORE INTO cover_provider_credentials(
+           provider, api_key, configuration_state, revision, created_at, updated_at
+         ) VALUES (?, NULL, 'never-configured', 0, ?, ?)`,
+      ).run(provider, timestamp, timestamp);
+      const changed = this.database.prepare(
+        `UPDATE cover_provider_credentials
+         SET api_key = NULL, configuration_state = 'removed', revision = revision + 1, last_tested_at = NULL,
+           last_test_status = NULL, last_test_error_code = NULL, updated_at = ?
+         WHERE provider = ? AND revision = ?`,
+      ).run(timestamp, provider, expectedRevision);
+      if (changed.changes !== 1) {
+        throw new CatalogDatabaseError("conflict", "Cover-provider settings changed in another browser.");
+      }
+      if (idempotencyKey) this.writeCoverProviderMutationReplay(provider, "remove", idempotencyKey, requestHash, expectedRevision + 1, timestamp);
+      return this.getCoverProviderCredentialState(provider);
+    });
+  }
+
+  private readCoverProviderMutationReplay(
+    provider: ConfigurableCoverProvider,
+    operation: "save" | "remove",
+    idempotencyKey: string,
+    requestHash: string,
+  ): number | null {
+    if (!idempotencyKey || idempotencyKey.length > 200 || !/^[A-Za-z0-9._:-]+$/u.test(idempotencyKey)) {
+      throw new RangeError("Idempotency key is invalid.");
+    }
+    const row = this.database
+      .prepare(
+        `SELECT request_hash, result_revision FROM cover_provider_mutation_replays
+         WHERE provider = ? AND operation = ? AND idempotency_key = ?`,
+      )
+      .get(provider, operation, idempotencyKey) as Row | undefined;
+    if (!row) return null;
+    if (String(row.request_hash) !== requestHash) {
+      throw new CatalogDatabaseError("conflict", "The idempotency key was already used for another provider request.");
+    }
+    return Number(row.result_revision);
+  }
+
+  private writeCoverProviderMutationReplay(
+    provider: ConfigurableCoverProvider,
+    operation: "save" | "remove",
+    idempotencyKey: string,
+    requestHash: string,
+    resultRevision: number,
+    timestamp: string,
+  ): void {
+    this.database
+      .prepare(
+        `INSERT INTO cover_provider_mutation_replays(
+           provider, operation, idempotency_key, request_hash, result_revision, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(provider, operation, idempotencyKey, requestHash, resultRevision, timestamp);
+    this.database
+      .prepare(
+        `DELETE FROM cover_provider_mutation_replays WHERE rowid IN (
+           SELECT rowid FROM cover_provider_mutation_replays WHERE provider = ?
+           ORDER BY created_at DESC, operation DESC, idempotency_key DESC LIMIT -1 OFFSET 1000
+         )`,
+      )
+      .run(provider);
+  }
+
+  recordCoverProviderCredentialTest(
+    provider: ConfigurableCoverProvider,
+    expectedRevision: number,
+    errorCode: CoverProviderCredentialErrorCode | null,
+  ): CoverProviderCredentialState {
+    const timestamp = now();
+    const changed = this.database.prepare(
+      `UPDATE cover_provider_credentials
+       SET last_tested_at = ?, last_test_status = ?, last_test_error_code = ?, updated_at = ?
+       WHERE provider = ? AND revision = ? AND api_key IS NOT NULL`,
+    ).run(timestamp, errorCode === null ? "working" : "error", errorCode, timestamp, provider, expectedRevision);
+    if (changed.changes !== 1) {
+      throw new CatalogDatabaseError("conflict", "Cover-provider settings changed while the key was being tested.");
+    }
+    return this.getCoverProviderCredentialState(provider);
+  }
+
+  getSendQueue(profileId: string): SendQueue {
+    this.assertDurableProfile(profileId);
+    const state = this.database.prepare(
+      "SELECT revision FROM send_queue_state WHERE profile_id = ?",
+    ).get(profileId) as Row | undefined;
+    const rows = this.database.prepare(
+      `SELECT profile_id, book_id, rank, queued_content_hash, queued_presentation_version,
+         created_at, updated_at
+       FROM send_queue_entries WHERE profile_id = ?
+       ORDER BY rank, created_at, book_id LIMIT ?`,
+    ).all(profileId, MAX_SEND_QUEUE_ENTRIES_PER_PROFILE + 1) as Row[];
+    if (rows.length > MAX_SEND_QUEUE_ENTRIES_PER_PROFILE) {
+      throw new CatalogDatabaseError("invalid_state", "The Send-later queue exceeds its durable limit.");
+    }
+    let totalSourceBytes = 0;
+    const entries = rows.map((row): SendQueueEntry => {
+      const bookId = String(row.book_id);
+      const queuedContentHash = String(row.queued_content_hash);
+      const queuedPresentationVersion = String(row.queued_presentation_version);
+      const book = this.getBook(profileId, bookId);
+      if (book) totalSourceBytes += book.size;
+      const sourceState: SendQueueEntry["sourceState"] = !book
+        ? "missing-or-retired"
+        : !book.available
+          ? "source-unavailable"
+          : book.format !== "epub" && book.format !== "azw3"
+            ? "unsupported"
+            : book.contentHash !== queuedContentHash
+              ? "source-changed"
+              : book.presentationVersion !== queuedPresentationVersion
+                ? "presentation-changed"
+                : "ready";
+      return {
+        profileId,
+        bookId,
+        rank: Number(row.rank),
+        queuedContentHash,
+        queuedPresentationVersion,
+        createdAt: String(row.created_at),
+        updatedAt: String(row.updated_at),
+        book,
+        sourceState,
+      };
+    });
+    if (!Number.isSafeInteger(totalSourceBytes)) {
+      throw new CatalogDatabaseError("invalid_state", "The Send-later queue byte total is invalid.");
+    }
+    return {
+      profileId,
+      revision: Number(state?.revision ?? 0),
+      entries,
+      total: entries.length,
+      totalSourceBytes,
+    };
+  }
+
+  addSendQueueEntries(
+    profileId: string,
+    bookIds: readonly string[],
+    expectedRevision: number,
+    idempotencyKey: string,
+  ): SendQueueMutationResult {
+    const ids = this.normalizedMutationBookIds(bookIds);
+    if (ids.length === 0) throw new RangeError("At least one book is required.");
+    const requestHash = mutationRequestHash({ expectedRevision, bookIds: ids });
+    return this.transaction(() => {
+      this.assertDurableProfile(profileId);
+      const replay = this.readDurableMutationReplay(profileId, "send-queue-add", idempotencyKey, requestHash);
+      if (replay) return { queue: this.getSendQueue(profileId), applied: false };
+      const currentRevision = this.ensureSendQueueState(profileId);
+      if (currentRevision !== expectedRevision) {
+        throw new CatalogDatabaseError("conflict", "The Send-later queue changed in another browser.");
+      }
+      const existingRows = this.database.prepare(
+        "SELECT book_id FROM send_queue_entries WHERE profile_id = ?",
+      ).all(profileId) as Row[];
+      const existing = new Set(existingRows.map((row) => String(row.book_id)));
+      const additions = ids.filter((id) => !existing.has(id));
+      if (existing.size + additions.length > MAX_SEND_QUEUE_ENTRIES_PER_PROFILE) {
+        throw new CatalogDatabaseError("too_large", "The Send-later queue has reached its per-profile limit.");
+      }
+      const timestamp = now();
+      const highest = this.database.prepare(
+        "SELECT coalesce(max(rank), -1) AS rank FROM send_queue_entries WHERE profile_id = ?",
+      ).get(profileId) as Row;
+      let rank = Number(highest.rank) + 1;
+      const insert = this.database.prepare(
+        `INSERT INTO send_queue_entries(
+           profile_id, book_id, rank, queued_content_hash, queued_presentation_version, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      );
+      for (const bookId of additions) {
+        const book = this.getBook(profileId, bookId);
+        if (!book) throw new CatalogDatabaseError("not_found", "A selected book is not available to this profile.");
+        insert.run(profileId, bookId, rank, book.contentHash, book.presentationVersion, timestamp, timestamp);
+        rank += 1;
+      }
+      const resultRevision = additions.length > 0
+        ? this.bumpSendQueueRevision(profileId, expectedRevision, timestamp)
+        : expectedRevision;
+      this.writeDurableMutationReplay(
+        profileId,
+        "send-queue-add",
+        idempotencyKey,
+        requestHash,
+        null,
+        resultRevision,
+        timestamp,
+      );
+      return { queue: this.getSendQueue(profileId), applied: additions.length > 0 };
+    });
+  }
+
+  replaceSendQueue(
+    profileId: string,
+    bookIds: readonly string[],
+    expectedRevision: number,
+  ): SendQueueMutationResult {
+    const ids = this.normalizedMutationBookIds(bookIds, MAX_SEND_QUEUE_ENTRIES_PER_PROFILE);
+    return this.transaction(() => {
+      this.assertDurableProfile(profileId);
+      const currentRevision = this.ensureSendQueueState(profileId);
+      if (currentRevision !== expectedRevision) {
+        throw new CatalogDatabaseError("conflict", "The Send-later queue changed in another browser.");
+      }
+      const existingRows = this.database.prepare(
+        `SELECT book_id, rank FROM send_queue_entries WHERE profile_id = ?
+         ORDER BY rank, created_at, book_id`,
+      ).all(profileId) as Row[];
+      const currentIds = existingRows.map((row) => String(row.book_id));
+      const changed = currentIds.length !== ids.length || currentIds.some((id, index) => id !== ids[index]);
+      if (!changed) return { queue: this.getSendQueue(profileId), applied: false };
+      const existing = new Set(currentIds);
+      for (const bookId of ids) {
+        if (!existing.has(bookId) && !this.getBook(profileId, bookId)) {
+          throw new CatalogDatabaseError("not_found", "A selected book is not available to this profile.");
+        }
+      }
+      const timestamp = now();
+      this.database.prepare(
+        `DELETE FROM send_queue_entries
+         WHERE profile_id = ? AND book_id NOT IN (SELECT value FROM json_each(?))`,
+      ).run(profileId, JSON.stringify(ids));
+      const insert = this.database.prepare(
+        `INSERT INTO send_queue_entries(
+           profile_id, book_id, rank, queued_content_hash, queued_presentation_version, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      );
+      const update = this.database.prepare(
+        "UPDATE send_queue_entries SET rank = ?, updated_at = ? WHERE profile_id = ? AND book_id = ?",
+      );
+      ids.forEach((bookId, rank) => {
+        if (existing.has(bookId)) {
+          update.run(rank, timestamp, profileId, bookId);
+          return;
+        }
+        const book = this.getBook(profileId, bookId) as CatalogBook;
+        insert.run(profileId, bookId, rank, book.contentHash, book.presentationVersion, timestamp, timestamp);
+      });
+      this.bumpSendQueueRevision(profileId, expectedRevision, timestamp);
+      return { queue: this.getSendQueue(profileId), applied: true };
+    });
+  }
+
+  removeSendQueueEntry(profileId: string, bookId: string, expectedRevision: number): SendQueueMutationResult {
+    return this.transaction(() => {
+      this.assertDurableProfile(profileId);
+      const currentRevision = this.ensureSendQueueState(profileId);
+      if (currentRevision !== expectedRevision) {
+        throw new CatalogDatabaseError("conflict", "The Send-later queue changed in another browser.");
+      }
+      const removed = this.database.prepare(
+        "DELETE FROM send_queue_entries WHERE profile_id = ? AND book_id = ?",
+      ).run(profileId, bookId);
+      if (removed.changes > 0) this.bumpSendQueueRevision(profileId, expectedRevision, now());
+      return { queue: this.getSendQueue(profileId), applied: removed.changes > 0 };
+    });
+  }
+
+  clearSendQueue(profileId: string, expectedRevision: number): SendQueueMutationResult {
+    return this.transaction(() => {
+      this.assertDurableProfile(profileId);
+      const currentRevision = this.ensureSendQueueState(profileId);
+      if (currentRevision !== expectedRevision) {
+        throw new CatalogDatabaseError("conflict", "The Send-later queue changed in another browser.");
+      }
+      const removed = this.database.prepare("DELETE FROM send_queue_entries WHERE profile_id = ?").run(profileId);
+      if (removed.changes > 0) this.bumpSendQueueRevision(profileId, expectedRevision, now());
+      return { queue: this.getSendQueue(profileId), applied: removed.changes > 0 };
+    });
+  }
+
+  resolveBookSelection(
+    profileId: string,
+    query: BookSetQuery,
+    ceiling = MAX_BOOK_SELECTION_IDS,
+  ): BookSelectionResult {
+    this.assertDurableProfile(profileId);
+    if (!Number.isSafeInteger(ceiling) || ceiling < 1 || ceiling > MAX_BOOK_SELECTION_IDS) {
+      throw new RangeError("Book-selection ceiling is invalid.");
+    }
+    const unpaged: BookSetQuery = { ...query };
+    delete unpaged.limit;
+    delete unpaged.offset;
+    const plan = this.bookQueryPlan(profileId, unpaged);
+    const count = this.database.prepare(
+      `SELECT count(DISTINCT b.id) AS total FROM books b
+       JOIN source_files sf ON sf.id = b.source_file_id
+       JOIN profile_roots pr ON pr.root_id = b.root_id AND pr.enabled = 1
+       JOIN profiles p ON p.id = pr.profile_id AND p.enabled = 1
+       ${plan.ftsJoin} WHERE ${plan.predicate}`,
+    ).get(...plan.values) as Row;
+    const total = Number(count.total ?? 0);
+    if (!Number.isSafeInteger(total) || total > ceiling) {
+      throw new CatalogDatabaseError(
+        "selection_too_large",
+        `The filtered selection exceeds the ${ceiling}-book limit. Narrow the filters and try again.`,
+      );
+    }
+    const rows = this.database.prepare(
+      `SELECT DISTINCT b.id FROM books b
+       JOIN source_files sf ON sf.id = b.source_file_id
+       JOIN profile_roots pr ON pr.root_id = b.root_id AND pr.enabled = 1
+       JOIN profiles p ON p.id = pr.profile_id AND p.enabled = 1
+       ${plan.ftsJoin} WHERE ${plan.predicate}
+       ORDER BY ${plan.orderBy} LIMIT ?`,
+    ).all(...plan.values, ceiling + 1) as Row[];
+    if (rows.length !== total) throw new CatalogDatabaseError("invalid_state", "Filtered selection changed unexpectedly.");
+    return { profileId, bookIds: rows.map((row) => String(row.id)), total, ceiling };
+  }
+
+  listSeries(
+    profileId: string,
+    options: { q?: string; limit?: number; offset?: number } = {},
+  ): CatalogSeriesSummaryPage {
+    this.assertDurableProfile(profileId);
+    const limit = Math.min(Math.max(options.limit ?? 50, 1), 200);
+    const offset = Math.max(options.offset ?? 0, 0);
+    const search = options.q === undefined ? null : canonicalSeriesKey(options.q);
+    if (options.q !== undefined && !search) return { items: [], total: 0, limit, offset };
+    const predicate = search === null ? "" : "AND kindle_bridge_series_key(b.series) LIKE '%' || ? || '%'";
+    const values: SqlValue[] = search === null ? [profileId] : [profileId, search];
+    const from = `FROM books b
+      JOIN source_files sf ON sf.id = b.source_file_id
+      JOIN profile_roots pr ON pr.root_id = b.root_id AND pr.enabled = 1
+      JOIN profiles p ON p.id = pr.profile_id AND p.enabled = 1
+      WHERE pr.profile_id = ? AND kindle_bridge_series_key(b.series) <> '' ${predicate}`;
+    const count = this.database.prepare(
+      `SELECT count(DISTINCT kindle_bridge_series_key(b.series)) AS total ${from}`,
+    ).get(...values) as Row;
+    const rows = this.database.prepare(
+      `SELECT kindle_bridge_series_key(b.series) AS series_key,
+         min(trim(b.series)) AS series_name,
+         count(*) AS book_count,
+         sum(CASE WHEN b.series_index > 0 AND b.series_index <= ${MAX_USABLE_SERIES_INDEX} THEN 1 ELSE 0 END)
+           AS numbered_count
+       ${from}
+       GROUP BY series_key
+       ORDER BY series_name COLLATE NOCASE, series_key
+       LIMIT ? OFFSET ?`,
+    ).all(...values, limit, offset) as Row[];
+    return {
+      items: rows.map((row) => {
+        const bookCount = Number(row.book_count);
+        const numberedCount = Number(row.numbered_count ?? 0);
+        return {
+          key: String(row.series_key),
+          name: String(row.series_name),
+          bookCount,
+          numberedCount,
+          unnumberedCount: bookCount - numberedCount,
+        };
+      }),
+      total: Number(count.total ?? 0),
+      limit,
+      offset,
+    };
+  }
+
+  getSeries(
+    profileId: string,
+    seriesKey: string,
+    options: { limit?: number; offset?: number } = {},
+  ): CatalogSeriesDetail | null {
+    this.assertDurableProfile(profileId);
+    if (!seriesKey || canonicalSeriesKey(seriesKey) !== seriesKey || seriesKey.length > 500) {
+      throw new RangeError("Series key is invalid.");
+    }
+    const summary = this.database.prepare(
+      `SELECT min(trim(b.series)) AS series_name, count(*) AS book_count,
+         sum(CASE WHEN b.series_index > 0 AND b.series_index <= ${MAX_USABLE_SERIES_INDEX} THEN 1 ELSE 0 END)
+           AS numbered_count
+       FROM books b
+       JOIN source_files sf ON sf.id = b.source_file_id
+       JOIN profile_roots pr ON pr.root_id = b.root_id AND pr.enabled = 1
+       JOIN profiles p ON p.id = pr.profile_id AND p.enabled = 1
+       WHERE pr.profile_id = ? AND kindle_bridge_series_key(b.series) = ?`,
+    ).get(profileId, seriesKey) as Row;
+    const total = Number(summary.book_count ?? 0);
+    if (total === 0) return null;
+    if (!Number.isSafeInteger(total) || total > MAX_SERIES_DETAIL_BOOKS) {
+      throw new CatalogDatabaseError("too_large", "This series exceeds the bounded detail limit.");
+    }
+    const indexRows = this.database.prepare(
+      `SELECT b.series_index FROM books b
+       JOIN source_files sf ON sf.id = b.source_file_id
+       JOIN profile_roots pr ON pr.root_id = b.root_id AND pr.enabled = 1
+       JOIN profiles p ON p.id = pr.profile_id AND p.enabled = 1
+       WHERE pr.profile_id = ? AND kindle_bridge_series_key(b.series) = ?
+       ORDER BY b.series_index, b.id LIMIT ?`,
+    ).all(profileId, seriesKey, MAX_SERIES_DETAIL_BOOKS + 1) as Row[];
+    const counts = new Map<number, number>();
+    const integerIndices = new Set<number>();
+    for (const row of indexRows) {
+      const index = usableSeriesIndex(numberOrNull(row.series_index));
+      if (index === null) continue;
+      counts.set(index, (counts.get(index) ?? 0) + 1);
+      if (Number.isInteger(index)) integerIndices.add(index);
+    }
+    const duplicateIndices = [...counts]
+      .filter(([, count]) => count > 1)
+      .map(([index]) => index)
+      .sort((left, right) => left - right);
+    const missingIntegerIndices: number[] = [];
+    if (integerIndices.size > 1) {
+      const minimum = Math.min(...integerIndices);
+      const maximum = Math.max(...integerIndices);
+      for (let index = minimum; index <= maximum && missingIntegerIndices.length < 1_000; index += 1) {
+        if (!integerIndices.has(index)) missingIntegerIndices.push(index);
+      }
+    }
+    const limit = Math.min(Math.max(options.limit ?? 50, 1), 200);
+    const offset = Math.max(options.offset ?? 0, 0);
+    return {
+      key: seriesKey,
+      name: String(summary.series_name),
+      books: this.listBooks(profileId, {
+        seriesKey,
+        sort: "series-index",
+        order: "asc",
+        limit,
+        offset,
+      }),
+      duplicateIndices,
+      missingIntegerIndices,
+      unnumberedCount: total - Number(summary.numbered_count ?? 0),
+    };
+  }
+
+  listSmartShelves(profileId: string): SmartShelf[] {
+    this.assertDurableProfile(profileId);
+    const rows = this.database.prepare(
+      `SELECT * FROM smart_shelves WHERE profile_id = ?
+       ORDER BY pinned_rank IS NULL, pinned_rank, name COLLATE NOCASE, id
+       LIMIT ?`,
+    ).all(profileId, MAX_SMART_SHELVES_PER_PROFILE + 1) as Row[];
+    if (rows.length > MAX_SMART_SHELVES_PER_PROFILE) {
+      throw new CatalogDatabaseError("invalid_state", "The smart-shelf collection exceeds its durable limit.");
+    }
+    return rows.map((row) => this.mapSmartShelf(row));
+  }
+
+  getSmartShelf(profileId: string, shelfId: string): SmartShelf | null {
+    this.assertDurableProfile(profileId);
+    const row = this.database.prepare(
+      "SELECT * FROM smart_shelves WHERE profile_id = ? AND id = ?",
+    ).get(profileId, shelfId) as Row | undefined;
+    return row ? this.mapSmartShelf(row) : null;
+  }
+
+  createSmartShelf(
+    profileId: string,
+    input: SmartShelfCreateInput,
+    idempotencyKey: string,
+  ): SmartShelfMutationResult {
+    const name = normalizedShelfName(input.name);
+    const queryJson = encodeSmartShelfQuery(input.query);
+    const pinned = input.pinned ?? false;
+    const requestHash = mutationRequestHash({ name, query: JSON.parse(queryJson), pinned });
+    return this.transaction(() => {
+      this.assertDurableProfile(profileId);
+      const replay = this.readDurableMutationReplay(profileId, "smart-shelf-create", idempotencyKey, requestHash);
+      if (replay) {
+        const shelf = replay.resourceId ? this.getSmartShelf(profileId, replay.resourceId) : null;
+        if (!shelf) throw new CatalogDatabaseError("invalid_state", "The replayed smart shelf no longer exists.");
+        return { shelf, applied: false };
+      }
+      const total = this.database.prepare(
+        "SELECT count(*) AS count FROM smart_shelves WHERE profile_id = ?",
+      ).get(profileId) as Row;
+      if (Number(total.count) >= MAX_SMART_SHELVES_PER_PROFILE) {
+        throw new CatalogDatabaseError("too_large", "This profile has reached its smart-shelf limit.");
+      }
+      this.assertShelfNameAvailable(profileId, name);
+      const pinnedRank = pinned ? this.nextPinnedShelfRank(profileId) : null;
+      const timestamp = now();
+      const shelfId = opaqueId("shelf");
+      this.database.prepare(
+        `INSERT INTO smart_shelves(
+           id, profile_id, name, query_version, query_json, pinned_rank, revision, created_at, updated_at
+         ) VALUES (?, ?, ?, 1, ?, ?, 1, ?, ?)`,
+      ).run(shelfId, profileId, name, queryJson, pinnedRank, timestamp, timestamp);
+      this.writeDurableMutationReplay(
+        profileId,
+        "smart-shelf-create",
+        idempotencyKey,
+        requestHash,
+        shelfId,
+        1,
+        timestamp,
+      );
+      return { shelf: this.getSmartShelf(profileId, shelfId) as SmartShelf, applied: true };
+    });
+  }
+
+  updateSmartShelf(profileId: string, shelfId: string, input: SmartShelfPatchInput): SmartShelfMutationResult {
+    return this.transaction(() => {
+      this.assertDurableProfile(profileId);
+      const current = this.database.prepare(
+        "SELECT * FROM smart_shelves WHERE profile_id = ? AND id = ?",
+      ).get(profileId, shelfId) as Row | undefined;
+      if (!current) throw new CatalogDatabaseError("not_found", "Smart shelf not found.");
+      if (Number(current.revision) !== input.expectedRevision) {
+        throw new CatalogDatabaseError("conflict", "The smart shelf changed in another browser.");
+      }
+      const name = input.name === undefined ? String(current.name) : normalizedShelfName(input.name);
+      if (name.toLocaleLowerCase() !== String(current.name).toLocaleLowerCase()) {
+        this.assertShelfNameAvailable(profileId, name, shelfId);
+      }
+      const queryJson = input.query === undefined ? String(current.query_json) : encodeSmartShelfQuery(input.query);
+      let pinnedRank = current.pinned_rank === null ? null : Number(current.pinned_rank);
+      if (input.pinned === false) pinnedRank = null;
+      if (input.pinned === true && pinnedRank === null) pinnedRank = this.nextPinnedShelfRank(profileId);
+      const changed = name !== String(current.name)
+        || queryJson !== String(current.query_json)
+        || pinnedRank !== (current.pinned_rank === null ? null : Number(current.pinned_rank));
+      if (!changed) return { shelf: this.mapSmartShelf(current), applied: false };
+      const timestamp = now();
+      const updated = this.database.prepare(
+        `UPDATE smart_shelves SET name = ?, query_json = ?, pinned_rank = ?, revision = revision + 1, updated_at = ?
+         WHERE profile_id = ? AND id = ? AND revision = ?`,
+      ).run(name, queryJson, pinnedRank, timestamp, profileId, shelfId, input.expectedRevision);
+      if (updated.changes !== 1) throw new CatalogDatabaseError("conflict", "The smart shelf changed in another browser.");
+      return { shelf: this.getSmartShelf(profileId, shelfId) as SmartShelf, applied: true };
+    });
+  }
+
+  reorderPinnedSmartShelves(
+    profileId: string,
+    input: SmartShelfPinnedOrderInput,
+  ): { shelves: SmartShelf[]; applied: boolean; affectedShelfIds: string[] } {
+    return this.transaction(() => {
+      this.assertDurableProfile(profileId);
+      if (input.shelves.length > MAX_PINNED_SMART_SHELVES_PER_PROFILE) {
+        throw new CatalogDatabaseError("too_large", "Pinned smart-shelf order exceeds its limit.");
+      }
+      const ids = input.shelves.map((item) => item.id);
+      if (new Set(ids).size !== ids.length) throw new RangeError("Pinned smart-shelf order contains duplicates.");
+      const rows = this.database.prepare(
+        `SELECT id, revision, pinned_rank FROM smart_shelves
+         WHERE profile_id = ? AND pinned_rank IS NOT NULL ORDER BY pinned_rank, id`,
+      ).all(profileId) as Row[];
+      const currentIds = rows.map((row) => String(row.id));
+      if (currentIds.length !== ids.length || currentIds.some((id) => !ids.includes(id))) {
+        throw new CatalogDatabaseError("conflict", "The pinned smart-shelf set changed in another browser.");
+      }
+      const expected = new Map(input.shelves.map((item) => [item.id, item.expectedRevision]));
+      if (rows.some((row) => expected.get(String(row.id)) !== Number(row.revision))) {
+        throw new CatalogDatabaseError("conflict", "A pinned smart shelf changed in another browser.");
+      }
+      const timestamp = now();
+      const affectedShelfIds: string[] = [];
+      ids.forEach((id, rank) => {
+        const current = rows.find((row) => String(row.id) === id) as Row;
+        if (Number(current.pinned_rank) === rank) return;
+        const update = this.database.prepare(
+          `UPDATE smart_shelves SET pinned_rank = ?, revision = revision + 1, updated_at = ?
+           WHERE profile_id = ? AND id = ? AND revision = ?`,
+        ).run(rank, timestamp, profileId, id, Number(current.revision));
+        if (update.changes !== 1) throw new CatalogDatabaseError("conflict", "A pinned smart shelf changed in another browser.");
+        affectedShelfIds.push(id);
+      });
+      return { shelves: this.listSmartShelves(profileId), applied: affectedShelfIds.length > 0, affectedShelfIds };
+    });
+  }
+
+  deleteSmartShelf(profileId: string, shelfId: string, expectedRevision: number): boolean {
+    return this.transaction(() => {
+      this.assertDurableProfile(profileId);
+      const result = this.database.prepare(
+        "DELETE FROM smart_shelves WHERE profile_id = ? AND id = ? AND revision = ?",
+      ).run(profileId, shelfId, expectedRevision);
+      if (result.changes > 0) return true;
+      const exists = this.database.prepare(
+        "SELECT 1 AS present FROM smart_shelves WHERE profile_id = ? AND id = ?",
+      ).get(profileId, shelfId);
+      if (exists) throw new CatalogDatabaseError("conflict", "The smart shelf changed in another browser.");
+      throw new CatalogDatabaseError("not_found", "Smart shelf not found.");
+    });
+  }
+
+  getProfileBookAnnotation(profileId: string, bookId: string): ProfileBookAnnotation {
+    this.assertDurableProfile(profileId);
+    const row = this.database.prepare(
+      "SELECT * FROM profile_book_annotations WHERE profile_id = ? AND book_id = ?",
+    ).get(profileId, bookId) as Row | undefined;
+    if (!row) {
+      this.assertStableBookScope(profileId, bookId);
+      return {
+        profileId,
+        bookId,
+        favorite: false,
+        wantToRead: false,
+        revision: 0,
+        createdAt: null,
+        updatedAt: null,
+      };
+    }
+    return this.mapProfileBookAnnotation(row);
+  }
+
+  updateProfileBookAnnotation(
+    profileId: string,
+    bookId: string,
+    input: ProfileBookAnnotationPatchInput,
+  ): { annotation: ProfileBookAnnotation; applied: boolean } {
+    return this.transaction(() => {
+      this.assertDurableProfile(profileId);
+      const row = this.database.prepare(
+        "SELECT * FROM profile_book_annotations WHERE profile_id = ? AND book_id = ?",
+      ).get(profileId, bookId) as Row | undefined;
+      if (!row) this.assertStableBookScope(profileId, bookId);
+      const currentRevision = Number(row?.revision ?? 0);
+      if (currentRevision !== input.expectedRevision) {
+        throw new CatalogDatabaseError("conflict", "The book annotation changed in another browser.");
+      }
+      const favorite = input.favorite ?? (row ? bool(row.favorite) : false);
+      const wantToRead = input.wantToRead ?? (row ? bool(row.want_to_read) : false);
+      const changed = row
+        ? favorite !== bool(row.favorite) || wantToRead !== bool(row.want_to_read)
+        : favorite || wantToRead;
+      if (!changed) {
+        return {
+          annotation: row ? this.mapProfileBookAnnotation(row) : this.getProfileBookAnnotation(profileId, bookId),
+          applied: false,
+        };
+      }
+      if (!row) {
+        const total = this.database.prepare(
+          "SELECT count(*) AS count FROM profile_book_annotations WHERE profile_id = ?",
+        ).get(profileId) as Row;
+        if (Number(total.count) >= MAX_PROFILE_BOOK_ANNOTATIONS_PER_PROFILE) {
+          throw new CatalogDatabaseError("too_large", "This profile has reached its personal-annotation limit.");
+        }
+      }
+      const timestamp = now();
+      this.database.prepare(
+        `INSERT INTO profile_book_annotations(
+           profile_id, book_id, favorite, want_to_read, revision, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, 1, ?, ?)
+         ON CONFLICT(profile_id, book_id) DO UPDATE SET
+           favorite = excluded.favorite, want_to_read = excluded.want_to_read,
+           revision = profile_book_annotations.revision + 1, updated_at = excluded.updated_at`,
+      ).run(profileId, bookId, favorite ? 1 : 0, wantToRead ? 1 : 0, timestamp, timestamp);
+      return {
+        annotation: this.getProfileBookAnnotation(profileId, bookId),
+        applied: true,
+      };
+    });
+  }
+
+  private assertDurableProfile(profileId: string): void {
+    if (!this.database.prepare("SELECT 1 AS present FROM profiles WHERE id = ?").get(profileId)) {
+      throw new CatalogDatabaseError("not_found", "Profile not found.");
+    }
+  }
+
+  private assertStableBookScope(profileId: string, bookId: string): void {
+    const row = this.database.prepare(
+      `SELECT 1 AS present FROM profile_roots pr
+       JOIN catalog_book_identities identity ON identity.root_id = pr.root_id
+       WHERE pr.profile_id = ? AND identity.book_id = ? LIMIT 1`,
+    ).get(profileId, bookId);
+    if (!row) throw new CatalogDatabaseError("not_found", "Book not found for this profile.");
+  }
+
+  private normalizedMutationBookIds(
+    bookIds: readonly string[],
+    maximum = MAX_SEND_QUEUE_MUTATION_BOOK_IDS,
+  ): string[] {
+    if (!Array.isArray(bookIds) || bookIds.length > maximum) {
+      throw new RangeError("Send-later queue mutation exceeds its book limit.");
+    }
+    const ids = bookIds.map((value) => {
+      if (typeof value !== "string" || !/^book_[A-Za-z0-9_-]{8,80}$/u.test(value)) {
+        throw new RangeError("Send-later queue contains an invalid book identifier.");
+      }
+      return value;
+    });
+    if (new Set(ids).size !== ids.length) throw new RangeError("Send-later queue mutation contains duplicate books.");
+    return ids;
+  }
+
+  private ensureSendQueueState(profileId: string): number {
+    const timestamp = now();
+    this.database.prepare(
+      "INSERT OR IGNORE INTO send_queue_state(profile_id, revision, updated_at) VALUES (?, 0, ?)",
+    ).run(profileId, timestamp);
+    const row = this.database.prepare(
+      "SELECT revision FROM send_queue_state WHERE profile_id = ?",
+    ).get(profileId) as Row;
+    return Number(row.revision);
+  }
+
+  private bumpSendQueueRevision(profileId: string, expectedRevision: number, timestamp: string): number {
+    const updated = this.database.prepare(
+      `UPDATE send_queue_state SET revision = revision + 1, updated_at = ?
+       WHERE profile_id = ? AND revision = ?`,
+    ).run(timestamp, profileId, expectedRevision);
+    if (updated.changes !== 1) throw new CatalogDatabaseError("conflict", "The Send-later queue changed in another browser.");
+    return expectedRevision + 1;
+  }
+
+  private readDurableMutationReplay(
+    profileId: string,
+    operation: "send-queue-add" | "smart-shelf-create",
+    idempotencyKey: string,
+    requestHash: string,
+  ): { resourceId: string | null; resultRevision: number } | null {
+    const row = this.database.prepare(
+      `SELECT request_hash, resource_id, result_revision FROM durable_mutation_replays
+       WHERE profile_id = ? AND operation = ? AND idempotency_key = ?`,
+    ).get(profileId, operation, idempotencyKey) as Row | undefined;
+    if (!row) return null;
+    if (String(row.request_hash) !== requestHash) {
+      throw new CatalogDatabaseError("conflict", "The idempotency key was already used for another request.");
+    }
+    return { resourceId: stringOrNull(row.resource_id), resultRevision: Number(row.result_revision) };
+  }
+
+  private writeDurableMutationReplay(
+    profileId: string,
+    operation: "send-queue-add" | "smart-shelf-create",
+    idempotencyKey: string,
+    requestHash: string,
+    resourceId: string | null,
+    resultRevision: number,
+    timestamp: string,
+  ): void {
+    if (!idempotencyKey || idempotencyKey.length > 200 || !/^[A-Za-z0-9._:-]+$/u.test(idempotencyKey)) {
+      throw new RangeError("Idempotency key is invalid.");
+    }
+    this.database.prepare(
+      `INSERT INTO durable_mutation_replays(
+         profile_id, operation, idempotency_key, request_hash, resource_id, result_revision, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(profileId, operation, idempotencyKey, requestHash, resourceId, resultRevision, timestamp);
+    this.database.prepare(
+      `DELETE FROM durable_mutation_replays
+       WHERE profile_id = ? AND rowid IN (
+         SELECT rowid FROM durable_mutation_replays WHERE profile_id = ?
+         ORDER BY created_at DESC, operation DESC, idempotency_key DESC
+         LIMIT -1 OFFSET ?
+       )`,
+    ).run(profileId, profileId, MAX_DURABLE_MUTATION_REPLAYS_PER_PROFILE);
+  }
+
+  private assertShelfNameAvailable(profileId: string, name: string, excludingId?: string): void {
+    const row = this.database.prepare(
+      `SELECT 1 AS present FROM smart_shelves
+       WHERE profile_id = ? AND name = ? COLLATE NOCASE AND (? IS NULL OR id <> ?) LIMIT 1`,
+    ).get(profileId, name, excludingId ?? null, excludingId ?? null);
+    if (row) throw new CatalogDatabaseError("conflict", "A smart shelf with that name already exists.");
+  }
+
+  private nextPinnedShelfRank(profileId: string): number {
+    const count = this.database.prepare(
+      "SELECT count(*) AS count FROM smart_shelves WHERE profile_id = ? AND pinned_rank IS NOT NULL",
+    ).get(profileId) as Row;
+    if (Number(count.count) >= MAX_PINNED_SMART_SHELVES_PER_PROFILE) {
+      throw new CatalogDatabaseError("too_large", "This profile has reached its pinned smart-shelf limit.");
+    }
+    const row = this.database.prepare(
+      "SELECT coalesce(max(pinned_rank), -1) AS rank FROM smart_shelves WHERE profile_id = ?",
+    ).get(profileId) as Row;
+    return Number(row.rank) + 1;
+  }
+
+  private mapSmartShelf(row: Row): SmartShelf {
+    let query: SmartShelfQuery;
+    try {
+      query = decodeSmartShelfQuery(String(row.query_json));
+    } catch (error) {
+      if (error instanceof SmartShelfQueryError) {
+        throw new CatalogDatabaseError("invalid_state", "A persisted smart-shelf query is invalid.");
+      }
+      throw error;
+    }
+    const serverCount = query.kindleStatus === undefined
+      ? this.listBooks(String(row.profile_id), { ...smartShelfQueryToBookQuery(query), limit: 1, offset: 0 }).total
+      : null;
+    return {
+      id: String(row.id),
+      profileId: String(row.profile_id),
+      name: String(row.name),
+      query,
+      pinnedRank: row.pinned_rank === null ? null : Number(row.pinned_rank),
+      revision: Number(row.revision),
+      serverCount,
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at),
+    };
+  }
+
+  private mapProfileBookAnnotation(row: Row): ProfileBookAnnotation {
+    return {
+      profileId: String(row.profile_id),
+      bookId: String(row.book_id),
+      favorite: bool(row.favorite),
+      wantToRead: bool(row.want_to_read),
+      revision: Number(row.revision),
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at),
+    };
+  }
+
   private bootstrapSourceMetadata(): void {
     this.database.exec(`
       INSERT INTO book_source_metadata(
@@ -639,6 +1728,25 @@ export class CatalogDatabase {
       FROM books b
       WHERE NOT EXISTS (SELECT 1 FROM book_source_metadata sm WHERE sm.book_id = b.id);
     `);
+  }
+
+  private recoverInterruptedMetadataLookupJobs(): void {
+    this.transaction(() => {
+      const timestamp = now();
+      this.database
+        .prepare(
+          `UPDATE metadata_lookup_entries SET status = 'pending', error_code = NULL, updated_at = ?
+           WHERE status = 'searching'
+             AND job_id IN (SELECT id FROM metadata_lookup_jobs WHERE status = 'running')`,
+        )
+        .run(timestamp);
+      this.database
+        .prepare(
+          `UPDATE metadata_lookup_jobs SET status = 'paused', revision = revision + 1, updated_at = ?
+           WHERE status = 'running'`,
+        )
+        .run(timestamp);
+    });
   }
 
   private transaction<T>(operation: () => T): T {
@@ -2204,6 +3312,691 @@ export class CatalogDatabase {
     return row ? mapBook(row) : null;
   }
 
+  listCatalogIssues(profileId: string, query: CatalogHealthQuery = {}): CatalogHealthPage {
+    const issues = this.derivedCatalogIssues(profileId);
+    // A disposition can outlive its derived issue after metadata is fixed, a
+    // source returns, or a duplicate group changes. Retain a useful recent
+    // history, but deterministically retire older inactive rows so a long-lived
+    // installation never becomes unable to act on new issues.
+    this.transaction(() => this.pruneRetiredCatalogIssueDispositions(profileId, issues));
+    const dispositionRows = this.database
+      .prepare(
+        `SELECT issue_signature, ignored, preferred_book_id, revision, retry_count, last_retry_at
+         FROM catalog_issue_dispositions WHERE profile_id = ?
+         ORDER BY updated_at DESC, issue_signature LIMIT ?`,
+      )
+      .all(profileId, MAX_DERIVED_CATALOG_ISSUES + 1) as Row[];
+    if (dispositionRows.length > MAX_DERIVED_CATALOG_ISSUES) {
+      throw new CatalogDatabaseError("too_large", "Catalog issue disposition history exceeds its bounded limit.");
+    }
+    const dispositions = new Map(dispositionRows.map((row) => [String(row.issue_signature), row]));
+    const decorated = issues.map((issue) => this.decorateCatalogIssue(issue, dispositions.get(issue.signature)));
+    const byType = {
+      "missing-cover": 0,
+      "incomplete-metadata": 0,
+      "metadata-parser-failure": 0,
+      "low-confidence-provider-data": 0,
+      "unavailable-source": 0,
+      "suspected-duplicate": 0,
+    } as Record<CatalogHealthIssue["type"], number>;
+    const bySeverity = { info: 0, warning: 0, error: 0 } as Record<CatalogHealthIssue["severity"], number>;
+    let ignored = 0;
+    for (const issue of decorated) {
+      byType[issue.type] += 1;
+      bySeverity[issue.severity] += 1;
+      if (issue.disposition.ignored) ignored += 1;
+    }
+    const filtered = decorated.filter((issue) => (
+      (query.type === undefined || issue.type === query.type)
+      && (query.severity === undefined || issue.severity === query.severity)
+      && (query.ignored === undefined || issue.disposition.ignored === query.ignored)
+    ));
+    const limit = query.limit ?? 100;
+    const offset = query.offset ?? 0;
+    return {
+      items: filtered.slice(offset, offset + limit),
+      total: filtered.length,
+      limit,
+      offset,
+      counts: {
+        total: decorated.length,
+        active: decorated.length - ignored,
+        ignored,
+        byType,
+        bySeverity,
+      },
+    };
+  }
+
+  getCatalogIssue(profileId: string, signature: string): CatalogHealthIssue | null {
+    const issue = this.derivedCatalogIssues(profileId).find((candidate) => candidate.signature === signature);
+    if (!issue) return null;
+    const row = this.database
+      .prepare(
+        `SELECT ignored, preferred_book_id, revision, retry_count, last_retry_at
+         FROM catalog_issue_dispositions WHERE profile_id = ? AND issue_signature = ?`,
+      )
+      .get(profileId, signature) as Row | undefined;
+    return this.decorateCatalogIssue(issue, row);
+  }
+
+  setCatalogIssueIgnored(
+    profileId: string,
+    signature: string,
+    expectedRevision: number,
+    ignored: boolean,
+  ): CatalogIssueMutationResult {
+    const current = this.getCatalogIssue(profileId, signature);
+    if (!current) throw new CatalogDatabaseError("not_found", "Catalog issue not found.");
+    if (current.disposition.revision !== expectedRevision) {
+      throw new CatalogDatabaseError("conflict", "The catalog issue changed; reload before saving.");
+    }
+    if (current.disposition.ignored === ignored) return { issue: current, applied: false };
+    this.transaction(() => {
+      const existing = this.database
+        .prepare("SELECT revision FROM catalog_issue_dispositions WHERE profile_id = ? AND issue_signature = ?")
+        .get(profileId, signature) as Row | undefined;
+      const revision = Number(existing?.revision ?? 0);
+      if (revision !== expectedRevision) {
+        throw new CatalogDatabaseError("conflict", "The catalog issue changed; reload before saving.");
+      }
+      if (!existing) this.assertCatalogIssueDispositionCapacity(profileId);
+      const timestamp = now();
+      this.database
+        .prepare(
+          `INSERT INTO catalog_issue_dispositions(
+             profile_id, issue_signature, issue_type, ignored, revision, retry_count,
+             last_retry_at, created_at, updated_at
+           ) VALUES (?, ?, ?, ?, 1, 0, NULL, ?, ?)
+           ON CONFLICT(profile_id, issue_signature) DO UPDATE SET
+             issue_type = excluded.issue_type, ignored = excluded.ignored,
+             revision = catalog_issue_dispositions.revision + 1, updated_at = excluded.updated_at`,
+        )
+        .run(profileId, signature, current.type, ignored ? 1 : 0, timestamp, timestamp);
+    });
+    const updated = this.getCatalogIssue(profileId, signature);
+    if (!updated) throw new CatalogDatabaseError("invalid_state", "Catalog issue changed while saving its disposition.");
+    return { issue: updated, applied: true };
+  }
+
+  recordCatalogIssueRetry(
+    profileId: string,
+    signature: string,
+    expectedRevision: number,
+  ): CatalogIssueMutationResult {
+    const current = this.getCatalogIssue(profileId, signature);
+    if (!current) throw new CatalogDatabaseError("not_found", "Catalog issue not found.");
+    if (current.disposition.revision !== expectedRevision) {
+      throw new CatalogDatabaseError("conflict", "The catalog issue changed; reload before retrying.");
+    }
+    this.transaction(() => {
+      const existing = this.database
+        .prepare("SELECT revision FROM catalog_issue_dispositions WHERE profile_id = ? AND issue_signature = ?")
+        .get(profileId, signature) as Row | undefined;
+      const revision = Number(existing?.revision ?? 0);
+      if (revision !== expectedRevision) {
+        throw new CatalogDatabaseError("conflict", "The catalog issue changed; reload before retrying.");
+      }
+      if (!existing) this.assertCatalogIssueDispositionCapacity(profileId);
+      const timestamp = now();
+      this.database
+        .prepare(
+          `INSERT INTO catalog_issue_dispositions(
+             profile_id, issue_signature, issue_type, ignored, revision, retry_count,
+             last_retry_at, created_at, updated_at
+           ) VALUES (?, ?, ?, 0, 1, 1, ?, ?, ?)
+           ON CONFLICT(profile_id, issue_signature) DO UPDATE SET
+             issue_type = excluded.issue_type,
+             revision = catalog_issue_dispositions.revision + 1,
+             retry_count = catalog_issue_dispositions.retry_count + 1,
+             last_retry_at = excluded.last_retry_at, updated_at = excluded.updated_at`,
+        )
+        .run(profileId, signature, current.type, timestamp, timestamp, timestamp);
+    });
+    const updated = this.getCatalogIssue(profileId, signature);
+    if (!updated) throw new CatalogDatabaseError("invalid_state", "Catalog issue changed while recording its retry.");
+    return { issue: updated, applied: true };
+  }
+
+  setCatalogDuplicatePreference(
+    profileId: string,
+    signature: string,
+    input: CatalogDuplicatePreferenceInput,
+  ): CatalogIssueMutationResult {
+    const current = this.getCatalogIssue(profileId, signature);
+    if (!current) throw new CatalogDatabaseError("not_found", "Catalog issue not found.");
+    if (current.type !== "suspected-duplicate") {
+      throw new CatalogDatabaseError("conflict", "Only duplicate groups accept a preferred presentation.");
+    }
+    if (current.disposition.revision !== input.expectedRevision) {
+      throw new CatalogDatabaseError("conflict", "The catalog issue changed; reload before saving.");
+    }
+    if (input.preferredBookId !== null && !current.bookIds.includes(input.preferredBookId)) {
+      throw new CatalogDatabaseError("conflict", "The preferred book is not part of this duplicate group.");
+    }
+    if (current.disposition.preferredBookId === input.preferredBookId) return { issue: current, applied: false };
+    if (input.preferredBookId === null && current.disposition.revision === 0) return { issue: current, applied: false };
+    this.transaction(() => {
+      const existing = this.database
+        .prepare("SELECT revision FROM catalog_issue_dispositions WHERE profile_id = ? AND issue_signature = ?")
+        .get(profileId, signature) as Row | undefined;
+      if (Number(existing?.revision ?? 0) !== input.expectedRevision) {
+        throw new CatalogDatabaseError("conflict", "The catalog issue changed; reload before saving.");
+      }
+      if (!existing) this.assertCatalogIssueDispositionCapacity(profileId);
+      const timestamp = now();
+      this.database
+        .prepare(
+          `INSERT INTO catalog_issue_dispositions(
+             profile_id, issue_signature, issue_type, ignored, preferred_book_id, revision,
+             retry_count, last_retry_at, created_at, updated_at
+           ) VALUES (?, ?, ?, 0, ?, 1, 0, NULL, ?, ?)
+           ON CONFLICT(profile_id, issue_signature) DO UPDATE SET
+             issue_type = excluded.issue_type, preferred_book_id = excluded.preferred_book_id,
+             revision = catalog_issue_dispositions.revision + 1, updated_at = excluded.updated_at`,
+        )
+        .run(profileId, signature, current.type, input.preferredBookId, timestamp, timestamp);
+    });
+    const updated = this.getCatalogIssue(profileId, signature);
+    if (!updated) throw new CatalogDatabaseError("invalid_state", "Duplicate evidence changed while saving its preference.");
+    return { issue: updated, applied: true };
+  }
+
+  private derivedCatalogIssues(profileId: string): readonly DerivedCatalogIssue[] {
+    if (!this.getProfile(profileId)) throw new CatalogDatabaseError("not_found", "Profile not found.");
+    const rows = this.database
+      .prepare(
+        `SELECT b.id AS book_id, b.root_id, b.title, b.authors_json, b.identifiers_json,
+           b.cover_media_type, b.cover_cache_key, b.metadata_complete, b.available AS book_available,
+           b.added_at, b.updated_at, sf.id AS source_id, sf.relative_path, sf.content_hash,
+           sf.available AS source_available, sf.last_error_code
+         FROM books b
+         JOIN source_files sf ON sf.id = b.source_file_id
+         JOIN profile_roots pr ON pr.root_id = b.root_id AND pr.enabled = 1
+         JOIN profiles p ON p.id = pr.profile_id AND p.enabled = 1
+         WHERE pr.profile_id = ? ORDER BY b.id LIMIT 100001`,
+      )
+      .all(profileId) as Row[];
+    if (rows.length > 100_000) {
+      throw new CatalogDatabaseError("too_large", "Catalog health derivation exceeds its 100,000-book limit.");
+    }
+    const lookupRows = this.database
+      .prepare(
+        `SELECT e.book_id, e.candidates_json, e.accepted_at, e.updated_at, e.job_id
+         FROM metadata_lookup_entries e
+         JOIN metadata_lookup_jobs j ON j.id = e.job_id
+         WHERE j.profile_id = ? AND e.status = 'ready'
+         ORDER BY e.book_id, e.updated_at DESC, j.rowid DESC, e.job_id DESC
+         LIMIT ?`,
+      )
+      .all(profileId, (MAX_METADATA_LOOKUP_JOBS_PER_PROFILE * MAX_METADATA_LOOKUP_JOB_BOOKS) + 1) as Row[];
+    if (lookupRows.length > MAX_METADATA_LOOKUP_JOBS_PER_PROFILE * MAX_METADATA_LOOKUP_JOB_BOOKS) {
+      throw new CatalogDatabaseError("too_large", "Metadata lookup evidence exceeds its durable bounds.");
+    }
+    const lowConfidenceByBook = new Map<string, boolean>();
+    for (const row of lookupRows) {
+      const bookId = String(row.book_id);
+      if (lowConfidenceByBook.has(bookId)) continue;
+      const candidates = parseMetadataCandidates(row.candidates_json);
+      lowConfidenceByBook.set(
+        bookId,
+        row.accepted_at === null && candidates.length > 0 && candidates.every(({ confidence }) => confidence === "low"),
+      );
+    }
+    const bookFacts: CatalogIssueBookFacts[] = rows.map((row) => ({
+      profileId,
+      bookId: String(row.book_id),
+      sourceId: String(row.source_id),
+      sourceLabel: String(row.relative_path),
+      rootId: String(row.root_id),
+      title: String(row.title),
+      authors: parseStringArray(row.authors_json),
+      identifiers: parseStringArray(row.identifiers_json),
+      contentHash: stringOrNull(row.content_hash) ?? undefined,
+      coverAvailable: row.cover_media_type !== null && row.cover_cache_key !== null,
+      metadataComplete: bool(row.metadata_complete),
+      sourceAvailable: bool(row.book_available) && bool(row.source_available),
+      parserErrorCode: stringOrNull(row.last_error_code) ?? undefined,
+      lowConfidenceProviderData: lowConfidenceByBook.get(String(row.book_id)) ?? false,
+      firstObservedAt: stringOrNull(row.added_at) ?? undefined,
+      lastObservedAt: String(row.updated_at),
+    }));
+    const sourceRows = this.database
+      .prepare(
+        `SELECT sf.id AS source_id, sf.root_id, sf.relative_path, sf.available, sf.last_error_code, sf.created_at, sf.updated_at
+         FROM source_files sf
+         JOIN profile_roots pr ON pr.root_id = sf.root_id AND pr.enabled = 1
+         JOIN profiles p ON p.id = pr.profile_id AND p.enabled = 1
+         LEFT JOIN books b ON b.source_file_id = sf.id
+         WHERE pr.profile_id = ? AND b.id IS NULL
+           AND (sf.available = 0 OR sf.last_error_code IS NOT NULL)
+         ORDER BY sf.id LIMIT 100001`,
+      )
+      .all(profileId) as Row[];
+    if (sourceRows.length > 100_000) {
+      throw new CatalogDatabaseError("too_large", "Catalog health derivation exceeds its 100,000-source limit.");
+    }
+    const sourceFacts: CatalogIssueSourceFacts[] = sourceRows.map((row) => ({
+      profileId,
+      sourceId: String(row.source_id),
+      rootId: String(row.root_id),
+      displayLabel: String(row.relative_path),
+      sourceAvailable: bool(row.available),
+      errorCode: stringOrNull(row.last_error_code) ?? undefined,
+      firstObservedAt: stringOrNull(row.created_at) ?? undefined,
+      lastObservedAt: String(row.updated_at),
+    }));
+    const rootRows = this.database
+      .prepare(
+        `SELECT r.id AS root_id, pr.label, r.status, r.last_error_code, r.created_at, r.updated_at
+         FROM library_roots r
+         JOIN profile_roots pr ON pr.root_id = r.id AND pr.enabled = 1
+         JOIN profiles p ON p.id = pr.profile_id AND p.enabled = 1
+         WHERE pr.profile_id = ?
+           AND r.status IN ('unavailable', 'permission_denied', 'error')
+           AND NOT EXISTS (SELECT 1 FROM source_files sf WHERE sf.root_id = r.id)
+         ORDER BY r.id LIMIT 100001`,
+      )
+      .all(profileId) as Row[];
+    if (rootRows.length > 100_000) {
+      throw new CatalogDatabaseError("too_large", "Catalog health derivation exceeds its 100,000-root limit.");
+    }
+    for (const row of rootRows) {
+      sourceFacts.push({
+        profileId,
+        rootId: String(row.root_id),
+        displayLabel: String(row.label),
+        sourceAvailable: false,
+        errorCode: stringOrNull(row.last_error_code) ?? undefined,
+        firstObservedAt: stringOrNull(row.created_at) ?? undefined,
+        lastObservedAt: String(row.updated_at),
+      });
+    }
+    try {
+      return deriveCatalogIssues(profileId, bookFacts, sourceFacts);
+    } catch (error) {
+      if (error instanceof RangeError) throw new CatalogDatabaseError("too_large", error.message);
+      throw error;
+    }
+  }
+
+  private decorateCatalogIssue(issue: DerivedCatalogIssue, row?: Row): CatalogHealthIssue {
+    const disposition: CatalogIssueDisposition = {
+      ignored: bool(row?.ignored),
+      preferredBookId: stringOrNull(row?.preferred_book_id),
+      revision: Number(row?.revision ?? 0),
+      retryCount: Number(row?.retry_count ?? 0),
+      lastRetryAt: stringOrNull(row?.last_retry_at),
+    };
+    return { ...issue, disposition };
+  }
+
+  private assertCatalogIssueDispositionCapacity(profileId: string): void {
+    this.pruneRetiredCatalogIssueDispositions(profileId, this.derivedCatalogIssues(profileId), 1);
+    const row = this.database
+      .prepare("SELECT count(*) AS count FROM catalog_issue_dispositions WHERE profile_id = ?")
+      .get(profileId) as Row;
+    if (Number(row.count) >= MAX_DERIVED_CATALOG_ISSUES) {
+      throw new CatalogDatabaseError("too_large", "Catalog issue disposition history reached its bounded limit.");
+    }
+  }
+
+  /**
+   * Must run inside the caller's writer transaction. Current derived issues
+   * are never removed; up to 5,000 most-recent resolved dispositions remain as
+   * bounded history, reduced only when current rows need the global ceiling.
+   */
+  private pruneRetiredCatalogIssueDispositions(
+    profileId: string,
+    currentIssues: readonly DerivedCatalogIssue[],
+    reserveRows = 0,
+  ): number {
+    const rows = this.database
+      .prepare(
+        `SELECT issue_signature FROM catalog_issue_dispositions
+         WHERE profile_id = ? ORDER BY updated_at DESC, issue_signature DESC
+         LIMIT ?`,
+      )
+      .all(profileId, MAX_DERIVED_CATALOG_ISSUES + 1) as Row[];
+    const current = new Set(currentIssues.map(({ signature }) => signature));
+    const currentRowCount = rows.reduce(
+      (count, row) => count + (current.has(String(row.issue_signature)) ? 1 : 0),
+      0,
+    );
+    const retired = rows.filter((row) => !current.has(String(row.issue_signature)));
+    const retainedRetired = Math.max(
+      0,
+      Math.min(5_000, MAX_DERIVED_CATALOG_ISSUES - reserveRows - currentRowCount),
+    );
+    const remove = retired.slice(retainedRetired);
+    if (remove.length === 0) return 0;
+    const statement = this.database.prepare(
+      "DELETE FROM catalog_issue_dispositions WHERE profile_id = ? AND issue_signature = ?",
+    );
+    let removed = 0;
+    for (const row of remove) {
+      removed += Number(statement.run(profileId, String(row.issue_signature)).changes);
+    }
+    return removed;
+  }
+
+  createMetadataLookupJob(
+    profileId: string,
+    input: MetadataLookupJobInput,
+    idempotencyKey: string,
+  ): { job: MetadataLookupJob; applied: boolean } {
+    const bookIds = [...new Set(input.bookIds)];
+    if (
+      input.bookIds.length === 0
+      || input.bookIds.length > MAX_METADATA_LOOKUP_JOB_BOOKS
+      || bookIds.length !== input.bookIds.length
+    ) {
+      throw new RangeError(`A metadata lookup job requires 1-${MAX_METADATA_LOOKUP_JOB_BOOKS} unique books.`);
+    }
+    const requestHash = mutationRequestHash({ provider: input.provider, bookIds });
+    return this.transaction(() => {
+      if (!this.getProfile(profileId)) throw new CatalogDatabaseError("not_found", "Profile not found.");
+      const replay = this.database
+        .prepare("SELECT request_hash, job_id FROM metadata_lookup_job_replays WHERE profile_id = ? AND idempotency_key = ?")
+        .get(profileId, idempotencyKey) as Row | undefined;
+      if (replay) {
+        if (String(replay.request_hash) !== requestHash) {
+          throw new CatalogDatabaseError("conflict", "Idempotency key was already used for different metadata lookup work.");
+        }
+        const job = this.getMetadataLookupJob(profileId, String(replay.job_id));
+        if (!job) throw new CatalogDatabaseError("invalid_state", "Metadata lookup replay target is unavailable.");
+        return { job, applied: false };
+      }
+      for (const bookId of bookIds) {
+        if (!this.getBook(profileId, bookId)) throw new CatalogDatabaseError("not_found", "A selected book was not found.");
+      }
+      const existing = this.database
+        .prepare("SELECT count(*) AS count FROM metadata_lookup_jobs WHERE profile_id = ?")
+        .get(profileId) as Row;
+      if (Number(existing.count) >= MAX_METADATA_LOOKUP_JOBS_PER_PROFILE) {
+        const retired = this.database
+          .prepare(
+            `SELECT id FROM metadata_lookup_jobs
+             WHERE profile_id = ? AND status IN ('completed', 'cancelled')
+             ORDER BY updated_at, id LIMIT 1`,
+          )
+          .get(profileId) as Row | undefined;
+        if (!retired) throw new CatalogDatabaseError("too_large", "Too many active metadata lookup jobs exist.");
+        this.database.prepare("DELETE FROM metadata_lookup_jobs WHERE id = ?").run(String(retired.id));
+      }
+      const timestamp = now();
+      const jobId = opaqueId("lookup");
+      this.database
+        .prepare(
+          `INSERT INTO metadata_lookup_jobs(id, profile_id, provider, status, revision, created_at, updated_at)
+           VALUES (?, ?, ?, 'queued', 1, ?, ?)`,
+        )
+        .run(jobId, profileId, input.provider, timestamp, timestamp);
+      const insert = this.database.prepare(
+        `INSERT INTO metadata_lookup_entries(
+           job_id, book_id, rank, status, attempts, candidates_json, error_code, updated_at
+         ) VALUES (?, ?, ?, 'pending', 0, '[]', NULL, ?)`,
+      );
+      bookIds.forEach((bookId, rank) => insert.run(jobId, bookId, rank, timestamp));
+      this.database
+        .prepare(
+          `INSERT INTO metadata_lookup_job_replays(profile_id, idempotency_key, request_hash, job_id, created_at)
+           VALUES (?, ?, ?, ?, ?)`,
+        )
+        .run(profileId, idempotencyKey, requestHash, jobId, timestamp);
+      this.database
+        .prepare(
+          `DELETE FROM metadata_lookup_job_replays WHERE profile_id = ? AND idempotency_key IN (
+             SELECT idempotency_key FROM metadata_lookup_job_replays WHERE profile_id = ?
+             ORDER BY created_at DESC, idempotency_key DESC LIMIT -1 OFFSET ?
+           )`,
+        )
+        .run(profileId, profileId, MAX_DURABLE_MUTATION_REPLAYS_PER_PROFILE);
+      return { job: this.getMetadataLookupJob(profileId, jobId) as MetadataLookupJob, applied: true };
+    });
+  }
+
+  listMetadataLookupJobs(profileId: string, limit = 20, offset = 0): MetadataLookupJobPage {
+    if (!this.getProfile(profileId)) throw new CatalogDatabaseError("not_found", "Profile not found.");
+    const totalRow = this.database
+      .prepare("SELECT count(*) AS count FROM metadata_lookup_jobs WHERE profile_id = ?")
+      .get(profileId) as Row;
+    const rows = this.database
+      .prepare(
+        `SELECT id FROM metadata_lookup_jobs WHERE profile_id = ?
+         ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?`,
+      )
+      .all(profileId, limit, offset) as Row[];
+    return {
+      items: rows.map((row) => this.getMetadataLookupJob(profileId, String(row.id), false) as MetadataLookupJob),
+      total: Number(totalRow.count),
+      limit,
+      offset,
+    };
+  }
+
+  getMetadataLookupJob(profileId: string, jobId: string, includeEntries = true): MetadataLookupJob | null {
+    const row = this.database
+      .prepare(
+        `SELECT j.*,
+           count(e.book_id) AS total_count,
+           coalesce(sum(CASE WHEN e.status IN ('pending', 'searching') THEN 1 ELSE 0 END), 0) AS pending_count,
+           coalesce(sum(CASE WHEN e.status = 'ready' THEN 1 ELSE 0 END), 0) AS ready_count,
+           coalesce(sum(CASE WHEN e.status = 'no-results' THEN 1 ELSE 0 END), 0) AS no_results_count,
+           coalesce(sum(CASE WHEN e.status = 'failed' THEN 1 ELSE 0 END), 0) AS failed_count,
+           coalesce(sum(CASE WHEN e.status = 'cancelled' THEN 1 ELSE 0 END), 0) AS cancelled_count
+         FROM metadata_lookup_jobs j
+         LEFT JOIN metadata_lookup_entries e ON e.job_id = j.id
+         WHERE j.profile_id = ? AND j.id = ?
+         GROUP BY j.id`,
+      )
+      .get(profileId, jobId) as Row | undefined;
+    if (!row) return null;
+    const entryRows = includeEntries
+      ? this.database
+          .prepare("SELECT * FROM metadata_lookup_entries WHERE job_id = ? ORDER BY rank, book_id")
+          .all(jobId) as Row[]
+      : [];
+    const entries = entryRows.map((entry): MetadataLookupJobEntry => ({
+      jobId,
+      bookId: String(entry.book_id),
+      rank: Number(entry.rank),
+      status: String(entry.status) as MetadataLookupJobEntry["status"],
+      attempts: Number(entry.attempts),
+      candidates: parseMetadataCandidates(entry.candidates_json),
+      errorCode: stringOrNull(entry.error_code) as MetadataLookupErrorCode | null,
+      acceptedAt: stringOrNull(entry.accepted_at),
+      updatedAt: String(entry.updated_at),
+    }));
+    return {
+      id: String(row.id),
+      profileId: String(row.profile_id),
+      provider: String(row.provider) as CoverProvider,
+      status: String(row.status) as MetadataLookupJobStatus,
+      revision: Number(row.revision),
+      entriesIncluded: includeEntries,
+      entries,
+      total: Number(row.total_count),
+      pending: Number(row.pending_count),
+      ready: Number(row.ready_count),
+      noResults: Number(row.no_results_count),
+      failed: Number(row.failed_count),
+      cancelled: Number(row.cancelled_count),
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at),
+    };
+  }
+
+  controlMetadataLookupJob(
+    profileId: string,
+    jobId: string,
+    action: "resume" | "pause" | "cancel" | "retry",
+    expectedRevision: number,
+  ): { job: MetadataLookupJob; applied: boolean } {
+    const applied = this.transaction(() => {
+      const row = this.database
+        .prepare("SELECT status, revision FROM metadata_lookup_jobs WHERE profile_id = ? AND id = ?")
+        .get(profileId, jobId) as Row | undefined;
+      if (!row) throw new CatalogDatabaseError("not_found", "Metadata lookup job not found.");
+      if (Number(row.revision) !== expectedRevision) {
+        throw new CatalogDatabaseError("conflict", "Metadata lookup job changed; reload before continuing.");
+      }
+      const status = String(row.status) as MetadataLookupJobStatus;
+      const target = action === "resume" || action === "retry" ? "running" : action === "pause" ? "paused" : "cancelled";
+      if (status === target) return false;
+      if (
+        status === "cancelled"
+        || (action === "retry" && status !== "completed")
+        || (action !== "retry" && status === "completed")
+        || (action === "pause" && status !== "running")
+      ) {
+        throw new CatalogDatabaseError("conflict", "Metadata lookup job cannot make that transition.");
+      }
+      const timestamp = now();
+      if (action === "retry") {
+        const retried = this.database
+          .prepare(
+            `UPDATE metadata_lookup_entries SET status = 'pending', candidates_json = '[]',
+             error_code = NULL, accepted_at = NULL, updated_at = ? WHERE job_id = ? AND status = 'failed'`,
+          )
+          .run(timestamp, jobId);
+        if (retried.changes === 0) {
+          throw new CatalogDatabaseError("conflict", "Metadata lookup job has no failed books to retry.");
+        }
+      } else if (action === "pause") {
+        this.database
+          .prepare("UPDATE metadata_lookup_entries SET status = 'pending', updated_at = ? WHERE job_id = ? AND status = 'searching'")
+          .run(timestamp, jobId);
+      } else if (action === "cancel") {
+        this.database
+          .prepare(
+            `UPDATE metadata_lookup_entries SET status = 'cancelled', candidates_json = '[]',
+             error_code = NULL, updated_at = ? WHERE job_id = ? AND status IN ('pending', 'searching')`,
+          )
+          .run(timestamp, jobId);
+      }
+      this.database
+        .prepare("UPDATE metadata_lookup_jobs SET status = ?, revision = revision + 1, updated_at = ? WHERE id = ?")
+        .run(target, timestamp, jobId);
+      return true;
+    });
+    return { job: this.getMetadataLookupJob(profileId, jobId) as MetadataLookupJob, applied };
+  }
+
+  claimMetadataLookupEntries(profileId: string, jobId: string, maximum = 2): MetadataLookupClaim[] {
+    if (!Number.isSafeInteger(maximum) || maximum < 1 || maximum > 2) throw new RangeError("Lookup claim size is invalid.");
+    return this.transaction(() => {
+      const job = this.database
+        .prepare("SELECT provider, status FROM metadata_lookup_jobs WHERE profile_id = ? AND id = ?")
+        .get(profileId, jobId) as Row | undefined;
+      if (!job) throw new CatalogDatabaseError("not_found", "Metadata lookup job not found.");
+      if (String(job.status) !== "running") throw new CatalogDatabaseError("invalid_state", "Metadata lookup job is not running.");
+      const rows = this.database
+        .prepare("SELECT book_id FROM metadata_lookup_entries WHERE job_id = ? AND status = 'pending' ORDER BY rank LIMIT ?")
+        .all(jobId, maximum) as Row[];
+      const timestamp = now();
+      const claims: MetadataLookupClaim[] = [];
+      let changed = false;
+      for (const row of rows) {
+        const bookId = String(row.book_id);
+        const book = this.getBook(profileId, bookId);
+        if (!book) {
+          this.database
+            .prepare(
+              `UPDATE metadata_lookup_entries SET status = 'failed', attempts = attempts + 1,
+               candidates_json = '[]', error_code = 'book-unavailable', updated_at = ?
+               WHERE job_id = ? AND book_id = ? AND status = 'pending'`,
+            )
+            .run(timestamp, jobId, bookId);
+          changed = true;
+          continue;
+        }
+        this.database
+          .prepare(
+            `UPDATE metadata_lookup_entries SET status = 'searching', attempts = attempts + 1,
+             error_code = NULL, updated_at = ? WHERE job_id = ? AND book_id = ? AND status = 'pending'`,
+          )
+          .run(timestamp, jobId, bookId);
+        const identifier = book.identifiers.find((value) => /isbn/iu.test(value)) ?? book.identifiers[0];
+        claims.push({
+          jobId,
+          profileId,
+          bookId,
+          provider: String(job.provider) as CoverProvider,
+          terms: {
+            title: book.title,
+            ...(book.authors[0] ? { author: book.authors[0] } : {}),
+            ...(identifier ? { identifier: identifier.replace(/^isbn(?:_1[03])?\s*[:=-]?\s*/iu, "") } : {}),
+          },
+        });
+        changed = true;
+      }
+      if (changed) {
+        this.database
+          .prepare("UPDATE metadata_lookup_jobs SET revision = revision + 1, updated_at = ? WHERE id = ?")
+          .run(timestamp, jobId);
+      }
+      this.finalizeMetadataLookupJob(jobId, timestamp);
+      return claims;
+    });
+  }
+
+  completeMetadataLookupEntry(
+    profileId: string,
+    jobId: string,
+    bookId: string,
+    candidates: readonly CatalogMetadataCandidate[],
+    errorCode: MetadataLookupErrorCode | null,
+  ): MetadataLookupJob {
+    if (candidates.length > MAX_METADATA_CANDIDATES) throw new RangeError("Too many metadata candidates were returned.");
+    this.transaction(() => {
+      const job = this.database
+        .prepare("SELECT provider FROM metadata_lookup_jobs WHERE profile_id = ? AND id = ?")
+        .get(profileId, jobId) as Row | undefined;
+      if (!job) throw new CatalogDatabaseError("not_found", "Metadata lookup job not found.");
+      const entry = this.database
+        .prepare("SELECT status FROM metadata_lookup_entries WHERE job_id = ? AND book_id = ?")
+        .get(jobId, bookId) as Row | undefined;
+      if (!entry) throw new CatalogDatabaseError("not_found", "Metadata lookup entry not found.");
+      // Pause/cancel wins over a late provider response.
+      if (String(entry.status) !== "searching") return;
+      if (candidates.some((candidate) => candidate.provider !== String(job.provider))) {
+        throw new CatalogDatabaseError("invalid_state", "Metadata provider returned a cross-provider candidate.");
+      }
+      const encoded = JSON.stringify(candidates);
+      if (Buffer.byteLength(encoded, "utf8") > 2 * 1024 * 1024) {
+        throw new CatalogDatabaseError("too_large", "Metadata candidates exceed their durable result limit.");
+      }
+      const status = errorCode ? "failed" : candidates.length > 0 ? "ready" : "no-results";
+      const timestamp = now();
+      this.database
+        .prepare(
+          `UPDATE metadata_lookup_entries SET status = ?, candidates_json = ?, error_code = ?, updated_at = ?
+           WHERE job_id = ? AND book_id = ? AND status = 'searching'`,
+        )
+        .run(status, errorCode ? "[]" : encoded, errorCode, timestamp, jobId, bookId);
+      this.database
+        .prepare("UPDATE metadata_lookup_jobs SET revision = revision + 1, updated_at = ? WHERE id = ?")
+        .run(timestamp, jobId);
+      this.finalizeMetadataLookupJob(jobId, timestamp);
+    });
+    return this.getMetadataLookupJob(profileId, jobId) as MetadataLookupJob;
+  }
+
+  private finalizeMetadataLookupJob(jobId: string, timestamp: string): void {
+    const pending = this.database
+      .prepare("SELECT 1 AS pending FROM metadata_lookup_entries WHERE job_id = ? AND status IN ('pending', 'searching') LIMIT 1")
+      .get(jobId);
+    if (!pending) {
+      this.database
+        .prepare(
+          `UPDATE metadata_lookup_jobs SET status = 'completed', revision = revision + 1, updated_at = ?
+           WHERE id = ? AND status = 'running'`,
+        )
+        .run(timestamp, jobId);
+    }
+  }
+
   getBookMetadataState(profileId: string, bookId: string): BookMetadataState | null {
     const book = this.getBook(profileId, bookId);
     if (!book) return null;
@@ -2247,6 +4040,58 @@ export class CatalogDatabase {
     };
   }
 
+  getBookDetailsState(profileId: string, bookId: string): BookDetailsState | null {
+    const state = this.getBookMetadataState(profileId, bookId);
+    if (!state) return null;
+    const source = this.database
+      .prepare(
+        `SELECT b.root_id, pr.label AS root_label, r.path AS root_path, r.status AS root_status,
+           r.last_scan_at AS root_last_scan_at, r.last_error_code AS root_last_error_code,
+           sf.relative_path, b.available AS book_available, sf.available AS source_available
+         FROM books b
+         JOIN source_files sf ON sf.id = b.source_file_id
+         JOIN library_roots r ON r.id = b.root_id
+         JOIN profile_roots pr ON pr.root_id = b.root_id AND pr.enabled = 1
+         JOIN profiles p ON p.id = pr.profile_id AND p.enabled = 1
+         WHERE pr.profile_id = ? AND b.id = ?`,
+      )
+      .get(profileId, bookId) as Row | undefined;
+    if (!source) throw new CatalogDatabaseError("invalid_state", "Book source provenance is unavailable.");
+    const latest = this.database
+      .prepare(
+        `SELECT filename, size, managed_token, updated_at
+         FROM deliveries
+         WHERE profile_id = ? AND book_id = ? AND status = 'delivered'
+         ORDER BY updated_at DESC, id DESC
+         LIMIT 1`,
+      )
+      .get(profileId, bookId) as Row | undefined;
+    return {
+      ...state,
+      source: {
+        rootId: String(source.root_id),
+        rootLabel: String(source.root_label),
+        rootPath: String(source.root_path),
+        rootStatus: String(source.root_status) as RootStatus,
+        rootLastScanAt: stringOrNull(source.root_last_scan_at),
+        rootLastErrorCode: stringOrNull(source.root_last_error_code),
+        relativePath: String(source.relative_path),
+        available: bool(source.book_available) && bool(source.source_available),
+      },
+      latestVerifiedDelivery: latest
+        ? {
+            filename: stringOrNull(latest.filename),
+            size: numberOrNull(latest.size),
+            deliveredAt: String(latest.updated_at),
+            currentPresentation: stringOrNull(latest.managed_token) === managedTokenForBook(
+              state.book.id,
+              state.book.presentationVersion,
+            ),
+          }
+        : null,
+    };
+  }
+
   patchBookMetadata(profileId: string, bookId: string, input: BookMetadataPatchInput): BookMetadataState {
     this.transaction(() => {
       const context = this.metadataMutationContext(profileId, bookId, input.expectedRevision, input.expectedContentHash);
@@ -2255,6 +4100,71 @@ export class CatalogDatabase {
       this.refreshEffectiveBook(bookId);
     });
     return this.getBookMetadataState(profileId, bookId) as BookMetadataState;
+  }
+
+  /** Apply provider-selected fields and an optional derived cover as one SQLite
+   * commit. The caller may stage cover bytes first, but a failed/stale database
+   * mutation can never leave a partial metadata-only or cover-only overlay. */
+  importBookMetadata(
+    profileId: string,
+    bookId: string,
+    input: BookMetadataPatchInput,
+    asset: MetadataCoverAssetInput | null,
+    acceptedLookup: MetadataLookupAcceptance | null = null,
+  ): CoverMutationResult {
+    let previousAssetKey: string | null = null;
+    this.transaction(() => {
+      const context = this.metadataMutationContext(profileId, bookId, input.expectedRevision, input.expectedContentHash);
+      previousAssetKey = context.coverAssetKey;
+      if (asset) this.insertMetadataCoverAsset(asset);
+      this.writeMetadataOverride(
+        bookId,
+        context.rootId,
+        context.contentHash,
+        context.nextRevision,
+        { ...overridesFromRow(context.override), ...input.changes },
+        asset?.assetKey ?? context.coverAssetKey,
+      );
+      this.refreshEffectiveBook(bookId);
+      if (acceptedLookup) this.acceptMetadataLookupCandidate(profileId, bookId, acceptedLookup);
+    });
+    const stale = previousAssetKey && asset && previousAssetKey !== asset.assetKey
+      && !this.isMetadataCoverReferenced(previousAssetKey)
+      ? previousAssetKey
+      : null;
+    return { state: this.getBookMetadataState(profileId, bookId) as BookMetadataState, unreferencedAssetKey: stale };
+  }
+
+  private acceptMetadataLookupCandidate(
+    profileId: string,
+    bookId: string,
+    accepted: MetadataLookupAcceptance,
+  ): void {
+    const row = this.database
+      .prepare(
+        `SELECT j.provider, e.status, e.candidates_json
+         FROM metadata_lookup_entries e
+         JOIN metadata_lookup_jobs j ON j.id = e.job_id
+         WHERE j.profile_id = ? AND j.id = ? AND e.book_id = ?`,
+      )
+      .get(profileId, accepted.jobId, bookId) as Row | undefined;
+    const candidates = row ? parseMetadataCandidates(row.candidates_json) : [];
+    if (
+      !row
+      || String(row.status) !== "ready"
+      || String(row.provider) !== accepted.provider
+      || !candidates.some((candidate) => candidate.provider === accepted.provider
+        && candidate.candidateId === accepted.candidateId)
+    ) {
+      throw new CatalogDatabaseError("conflict", "The reviewed metadata candidate is no longer available.");
+    }
+    const timestamp = now();
+    this.database
+      .prepare("UPDATE metadata_lookup_entries SET accepted_at = ?, updated_at = ? WHERE job_id = ? AND book_id = ?")
+      .run(timestamp, timestamp, accepted.jobId, bookId);
+    this.database
+      .prepare("UPDATE metadata_lookup_jobs SET revision = revision + 1, updated_at = ? WHERE id = ?")
+      .run(timestamp, accepted.jobId);
   }
 
   resetBookMetadata(profileId: string, bookId: string, input: BookMetadataResetInput): BookMetadataState {
@@ -2279,27 +4189,7 @@ export class CatalogDatabase {
     this.transaction(() => {
       const context = this.metadataMutationContext(profileId, bookId, expectedRevision, expectedContentHash);
       previousAssetKey = context.coverAssetKey;
-      this.database
-        .prepare(
-          `INSERT INTO metadata_cover_assets(
-             asset_key, checksum, media_type, byte_length, width, height, source_kind,
-             provider, provider_reference, source_url, created_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(asset_key) DO NOTHING`,
-        )
-        .run(
-          asset.assetKey,
-          asset.checksum,
-          asset.mediaType,
-          asset.byteLength,
-          asset.width,
-          asset.height,
-          asset.sourceKind,
-          asset.provider,
-          asset.providerReference,
-          asset.sourceUrl,
-          now(),
-        );
+      this.insertMetadataCoverAsset(asset);
       this.writeMetadataOverride(
         bookId,
         context.rootId,
@@ -2314,6 +4204,30 @@ export class CatalogDatabase {
       ? previousAssetKey
       : null;
     return { state: this.getBookMetadataState(profileId, bookId) as BookMetadataState, unreferencedAssetKey: stale };
+  }
+
+  private insertMetadataCoverAsset(asset: MetadataCoverAssetInput): void {
+    this.database
+      .prepare(
+        `INSERT INTO metadata_cover_assets(
+           asset_key, checksum, media_type, byte_length, width, height, source_kind,
+           provider, provider_reference, source_url, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(asset_key) DO NOTHING`,
+      )
+      .run(
+        asset.assetKey,
+        asset.checksum,
+        asset.mediaType,
+        asset.byteLength,
+        asset.width,
+        asset.height,
+        asset.sourceKind,
+        asset.provider,
+        asset.providerReference,
+        asset.sourceUrl,
+        now(),
+      );
   }
 
   resetBookCover(
@@ -2639,6 +4553,13 @@ export class CatalogDatabase {
       where.push("b.series = ? COLLATE NOCASE");
       values.push(query.series);
     }
+    if (query.seriesKey) {
+      if (canonicalSeriesKey(query.seriesKey) !== query.seriesKey || query.seriesKey.length > 500) {
+        throw new RangeError("Series key is invalid.");
+      }
+      where.push("kindle_bridge_series_key(b.series) = ?");
+      values.push(query.seriesKey);
+    }
     if (query.year) {
       where.push("substr(b.published_at, 1, 4) = ?");
       values.push(query.year);
@@ -2656,6 +4577,27 @@ export class CatalogDatabase {
     }
     if (query.available !== undefined) {
       where.push(`b.available = ${query.available ? 1 : 0}`);
+    }
+    if (query.coverAvailable !== undefined) {
+      where.push(query.coverAvailable
+        ? "b.cover_media_type IS NOT NULL AND b.cover_cache_key IS NOT NULL"
+        : "(b.cover_media_type IS NULL OR b.cover_cache_key IS NULL)");
+    }
+    if (query.favorite !== undefined) {
+      where.push(
+        `${query.favorite ? "" : "NOT "}EXISTS (
+          SELECT 1 FROM profile_book_annotations annotation
+          WHERE annotation.profile_id = pr.profile_id AND annotation.book_id = b.id AND annotation.favorite = 1
+        )`,
+      );
+    }
+    if (query.wantToRead !== undefined) {
+      where.push(
+        `${query.wantToRead ? "" : "NOT "}EXISTS (
+          SELECT 1 FROM profile_book_annotations annotation
+          WHERE annotation.profile_id = pr.profile_id AND annotation.book_id = b.id AND annotation.want_to_read = 1
+        )`,
+      );
     }
     if (query.includeBookIds) {
       where.push("b.id IN (SELECT value FROM json_each(?))");
@@ -2676,16 +4618,25 @@ export class CatalogDatabase {
       updated: "b.updated_at",
       size: "sf.size",
     } as const;
-    const sort = sortColumns[query.sort ?? "title"];
+    const selectedSort = query.sort ?? "title";
     const descendingByDefault = ["recent", "published", "added", "updated"].includes(query.sort ?? "");
     const order = query.order ? (query.order === "desc" ? "DESC" : "ASC") : descendingByDefault ? "DESC" : "ASC";
+    const numberedFirst = `CASE WHEN b.series_index > 0 AND b.series_index <= ${MAX_USABLE_SERIES_INDEX}
+      THEN 0 ELSE 1 END ASC`;
+    const seriesIndex = `CASE WHEN b.series_index > 0 AND b.series_index <= ${MAX_USABLE_SERIES_INDEX}
+      THEN b.series_index END ${order}`;
+    const orderBy = selectedSort === "series"
+      ? `kindle_bridge_series_key(b.series) ${order}, ${numberedFirst}, ${seriesIndex}, b.title COLLATE NOCASE, b.id`
+      : selectedSort === "series-index"
+        ? `${numberedFirst}, ${seriesIndex}, b.title COLLATE NOCASE, b.id`
+        : `${sortColumns[selectedSort]} ${order}, b.id ASC`;
     return {
       predicate: where.join(" AND "),
       ftsJoin,
       values,
       limit,
       offset,
-      orderBy: `${sort} ${order}, b.id ASC`,
+      orderBy,
     };
   }
 
@@ -3008,6 +4959,7 @@ export class CatalogDatabase {
             const relativePath = String(row.relative_path);
             current = {
               bookId: String(row.id),
+              ...(bool(row.preferred_presentation) ? { preferredPresentation: true as const } : {}),
               title: String(row.title),
               authors: parseStringArray(row.authors_json),
               authorSort: stringOrNull(row.author_sort),
@@ -3419,6 +5371,7 @@ export class CatalogDatabase {
         const relativePath = String(row.relative_path);
         sink.raw('{"bookId":');
         sink.string(String(row.id));
+        if (bool(row.preferred_presentation)) sink.raw(',"preferredPresentation":true');
         sink.raw(',"title":');
         sink.string(String(row.title));
         sink.raw(',"authors":');
@@ -3467,13 +5420,22 @@ export class CatalogDatabase {
   ): void {
     const books = this.database
       .prepare(
-        `SELECT b.id, b.title, b.authors_json, b.author_sort, b.identifiers_json,
+        `WITH preferred_books AS (
+           SELECT preferred_book_id AS book_id
+           FROM catalog_issue_dispositions
+           WHERE profile_id = ?1 AND issue_type = 'suspected-duplicate'
+             AND ignored = 0 AND preferred_book_id IS NOT NULL
+           GROUP BY preferred_book_id
+         )
+         SELECT b.id, preferred_books.book_id IS NOT NULL AS preferred_presentation,
+           b.title, b.authors_json, b.author_sort, b.identifiers_json,
            b.presentation_version, sf.format, sf.size, sf.content_hash, sf.relative_path
          FROM books b
          JOIN source_files sf ON sf.id = b.source_file_id
          JOIN profile_roots pr ON pr.root_id = b.root_id AND pr.enabled = 1
          JOIN profiles p ON p.id = pr.profile_id AND p.enabled = 1
-         WHERE pr.profile_id = ? AND b.available = 1 AND sf.available = 1 ORDER BY b.id`,
+         LEFT JOIN preferred_books ON preferred_books.book_id = b.id
+         WHERE pr.profile_id = ?1 AND b.available = 1 AND sf.available = 1 ORDER BY b.id`,
       )
       .iterate(profileId) as IterableIterator<MatchBookRow>;
     const deliveryIterator = (this.database
@@ -3701,6 +5663,8 @@ export class CatalogDatabase {
                )
                AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.book_id = h.book_id)
                AND NOT EXISTS (SELECT 1 FROM book_metadata_overrides o WHERE o.book_id = h.book_id)
+               AND NOT EXISTS (SELECT 1 FROM send_queue_entries q WHERE q.book_id = h.book_id)
+               AND NOT EXISTS (SELECT 1 FROM profile_book_annotations a WHERE a.book_id = h.book_id)
                AND NOT EXISTS (
                  SELECT 1 FROM catalog_rebuild_pending_roots pending WHERE pending.root_id = h.root_id
                )

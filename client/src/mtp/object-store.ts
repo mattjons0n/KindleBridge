@@ -39,6 +39,8 @@ import type {
 
 const UINT32_MAX = 0xffff_ffff;
 const MTP_MAX_DATA_PAYLOAD_LENGTH = UINT32_MAX - 12;
+/** Hard allocation ceiling for every individual GetPartialObject response. */
+export const MTP_MAX_PARTIAL_OBJECT_READ_BYTES = 4 * 1024 * 1024;
 const DEFAULT_UPLOAD_CHUNK_SIZE = 256 * 1024;
 const DEFAULT_MAX_OBJECT_HANDLES = 100_000;
 const MAX_STORAGE_IDS_DATA_BYTES = 4 + 64 * 4;
@@ -109,6 +111,14 @@ export interface MtpReadObjectOptions extends MtpOperationOptions {
   readonly maxBytes?: number;
 }
 
+export interface MtpReadObjectRangeRequest {
+  readonly handle: number;
+  /** Unsigned 32-bit byte offset from the beginning of the object. */
+  readonly offset: number;
+  /** Positive bounded byte count requested from the device. */
+  readonly length: number;
+}
+
 export type MtpObjectStoreErrorCode =
   | "MTP_DATASET_MISSING"
   | "MTP_INVALID_SEND_OBJECT_INFO_RESPONSE"
@@ -120,6 +130,7 @@ export type MtpObjectStoreErrorCode =
   | "MTP_OBJECT_DELETE_UNVERIFIED"
   | "MTP_OBJECT_DELETE_MISMATCH"
   | "MTP_READ_LIMIT_EXCEEDED"
+  | "MTP_PARTIAL_READ_LENGTH_MISMATCH"
   | "MTP_HANDLE_LIMIT_EXCEEDED";
 
 export class MtpObjectStoreError extends Error {
@@ -394,6 +405,69 @@ export class MtpObjectStore {
       throw new MtpObjectStoreError(
         "MTP_READ_LIMIT_EXCEEDED",
         `object contains ${data.byteLength} byte(s), exceeding the ${maxBytes}-byte read limit`,
+      );
+    }
+    return data;
+  }
+
+  /**
+   * Reads one explicitly bounded object range with MTP GetPartialObject.
+   *
+   * This is a protocol primitive only. Normal Kindle inventory deliberately
+   * continues to use GetObject until the real device capability probe has
+   * passed and a separate production rollout is accepted.
+   */
+  async readObjectRange(
+    request: MtpReadObjectRangeRequest,
+    options: MtpOperationOptions = {},
+  ): Promise<Uint8Array> {
+    assertSpecificObjectHandle(request.handle, "object handle");
+    assertUint32(request.offset, "partial-object offset");
+    if (
+      !Number.isSafeInteger(request.length)
+      || request.length <= 0
+      || request.length > MTP_MAX_PARTIAL_OBJECT_READ_BYTES
+    ) {
+      throw new RangeError(
+        `partial-object length must be an integer from 1 to ${MTP_MAX_PARTIAL_OBJECT_READ_BYTES}`,
+      );
+    }
+    const rangeEnd = request.offset + request.length;
+    if (!Number.isSafeInteger(rangeEnd) || rangeEnd > UINT32_MAX) {
+      throw new RangeError("partial-object offset and length exceed the unsigned 32-bit object boundary");
+    }
+
+    let result: MtpTransactionResult;
+    try {
+      result = await this.session.execute(
+        {
+          operationCode: MtpOperationCode.GetPartialObject,
+          parameters: [request.handle, request.offset, request.length],
+          expectData: true,
+          maxDataBytes: request.length,
+          // GetPartialObject returns the actual byte count as its sole
+          // response parameter. It must agree exactly with the data phase.
+          expectedResponseParameterCount: 1,
+        },
+        options,
+      );
+    } catch (error) {
+      if (error instanceof MtpSessionError && error.code === "MTP_INCOMING_DATA_TOO_LARGE") {
+        throw new MtpObjectStoreError(
+          "MTP_READ_LIMIT_EXCEEDED",
+          `partial-object response exceeds the ${request.length}-byte range limit`,
+          error,
+        );
+      }
+      throw error;
+    }
+
+    const data = requireData(result);
+    const reportedLength = result.responseParameters[0];
+    if (reportedLength !== data.byteLength || data.byteLength > request.length) {
+      throw new MtpObjectStoreError(
+        "MTP_PARTIAL_READ_LENGTH_MISMATCH",
+        "GetPartialObject returned inconsistent or excessive byte-count metadata",
       );
     }
     return data;

@@ -171,6 +171,51 @@ describe("HttpCatalogClient", () => {
     await expect(client.listProfiles()).resolves.toEqual([expect.objectContaining({ id: "prf_1", name: "Home", description: "Household collection", bookCount: 12 })]);
   });
 
+  it("uses fixed Settings routes and never trusts a server-supplied credential mask", async () => {
+    const configured = {
+      provider: "google-books",
+      configured: true,
+      maskedKey: "raw-key-must-not-pass",
+      revision: 4,
+      status: "untested",
+      lastTestedAt: null,
+      errorCode: null,
+    };
+    const fetch = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({ items: [configured] }))
+      .mockResolvedValueOnce(jsonResponse(configured))
+      .mockResolvedValueOnce(jsonResponse({ ...configured, status: "working", lastTestedAt: "2026-09-03T00:00:00.000Z" }))
+      .mockResolvedValueOnce(jsonResponse({ ...configured, configured: false, revision: 5, status: "not-configured" }));
+    const client = new HttpCatalogClient({ fetch });
+
+    await expect(client.listCoverProviderCredentials()).resolves.toEqual([expect.objectContaining({
+      provider: "google-books",
+      configured: true,
+      maskedKey: "••••••••",
+      revision: 4,
+    })]);
+    await client.saveCoverProviderCredential("google-books", { apiKey: "entered-key", expectedRevision: 3 });
+    await client.testCoverProviderCredential("google-books", { expectedRevision: 4 });
+    await client.removeCoverProviderCredential("google-books", 4);
+
+    expect(fetch.mock.calls[1]?.[0]).toBe("/api/settings/cover-providers/google-books");
+    expect(fetch.mock.calls[1]?.[1]).toMatchObject({ method: "PUT" });
+    expect((fetch.mock.calls[1]?.[1] as RequestInit).headers).toMatchObject({
+      "Idempotency-Key": expect.stringMatching(/^provider-save-/u),
+    });
+    expect(JSON.parse(String((fetch.mock.calls[1]?.[1] as RequestInit).body))).toEqual({
+      apiKey: "entered-key",
+      expectedRevision: 3,
+    });
+    expect(fetch.mock.calls[2]?.[0]).toBe("/api/settings/cover-providers/google-books/test");
+    expect(fetch.mock.calls[2]?.[1]).toMatchObject({ method: "POST" });
+    expect(fetch.mock.calls[3]?.[0]).toBe("/api/settings/cover-providers/google-books?expectedRevision=4");
+    expect(fetch.mock.calls[3]?.[1]).toMatchObject({ method: "DELETE" });
+    expect((fetch.mock.calls[3]?.[1] as RequestInit).headers).toMatchObject({
+      "Idempotency-Key": expect.stringMatching(/^provider-remove-/u),
+    });
+  });
+
   it("maps durable database failure and recoverable cache degradation distinctly", async () => {
     const fetch = vi.fn()
       .mockResolvedValueOnce(jsonResponse({ live: true, ready: false, database: "error", cache: "ready" }))
@@ -194,11 +239,11 @@ describe("HttpCatalogClient", () => {
   it("encodes profile-scoped discovery filters, year, sort, and pagination", async () => {
     const fetch = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => jsonResponse({ items: [], total: 0, limit: 24, offset: 48 }));
     const client = new HttpCatalogClient({ fetch });
-    await client.listBooks("profile/one", { q: "wells & time", author: "H. G. Wells", year: "1895", metadata: "partial", sort: "published", order: "desc", limit: 24, offset: 48 });
+    await client.listBooks("profile/one", { q: "wells & time", author: "H. G. Wells", year: "1895", metadata: "partial", coverAvailable: false, sort: "published", order: "desc", limit: 24, offset: 48 });
 
     const url = new URL(String(fetch.mock.calls[0][0]), "http://127.0.0.1");
     expect(url.pathname).toBe("/api/profiles/profile%2Fone/books");
-    expect(Object.fromEntries(url.searchParams)).toMatchObject({ q: "wells & time", author: "H. G. Wells", year: "1895", metadata: "partial", sort: "published", order: "desc", limit: "24", offset: "48" });
+    expect(Object.fromEntries(url.searchParams)).toMatchObject({ q: "wells & time", author: "H. G. Wells", year: "1895", metadata: "partial", coverAvailable: "false", sort: "published", order: "desc", limit: "24", offset: "48" });
   });
 
   it("posts large include/exclude match sets before server pagination", async () => {
@@ -208,6 +253,185 @@ describe("HttpCatalogClient", () => {
 
     expect(fetch).toHaveBeenCalledWith("/api/profiles/prf_1/books/query", expect.objectContaining({ method: "POST" }));
     expect(JSON.parse(String((fetch.mock.calls[0][1] as RequestInit).body))).toMatchObject({ includeBookIds: ["book_a", "book_b"], excludeBookIds: ["book_c"] });
+  });
+
+  it("uses the durable queue, shelf, annotation, filtered-selection, and series routes", async () => {
+    const queue = {
+      profileId: "prf_12345678",
+      revision: 1,
+      entries: [{
+        profileId: "prf_12345678",
+        bookId: "book_12345678",
+        rank: 0,
+        queuedContentHash: "a".repeat(64),
+        queuedPresentationVersion: "a".repeat(64),
+        createdAt: "2026-09-03T00:00:00.000Z",
+        updatedAt: "2026-09-03T00:00:00.000Z",
+        book: null,
+        sourceState: "missing-or-retired",
+      }],
+      total: 1,
+      totalSourceBytes: 0,
+    };
+    const shelf = {
+      id: "shelf_12345678",
+      profileId: "prf_12345678",
+      name: "Favorites",
+      query: { version: 1, personal: { favorite: true } },
+      pinnedRank: 0,
+      revision: 1,
+      serverCount: 1,
+      createdAt: "2026-09-03T00:00:00.000Z",
+      updatedAt: "2026-09-03T00:00:00.000Z",
+    };
+    const annotation = {
+      profileId: "prf_12345678",
+      bookId: "book_12345678",
+      favorite: true,
+      wantToRead: false,
+      revision: 1,
+      createdAt: "2026-09-03T00:00:00.000Z",
+      updatedAt: "2026-09-03T00:00:00.000Z",
+    };
+    const fetch = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({ profileId: "prf_12345678", bookIds: ["book_12345678"], total: 1, ceiling: 5000 }))
+      .mockResolvedValueOnce(jsonResponse(queue, 201))
+      .mockResolvedValueOnce(jsonResponse(shelf, 201))
+      .mockResolvedValueOnce(jsonResponse(annotation))
+      .mockResolvedValueOnce(jsonResponse({ items: [{ key: "saga", name: "Saga", bookCount: 2, numberedCount: 2, unnumberedCount: 0 }], total: 1, limit: 50, offset: 0 }))
+      .mockResolvedValueOnce(jsonResponse({ key: "saga", name: "Saga", books: { items: [], total: 2, limit: 1, offset: 1 }, duplicateIndices: [], missingIntegerIndices: [], unnumberedCount: 0 }));
+    const client = new HttpCatalogClient({ fetch });
+
+    await client.resolveBookSelection("prf_12345678", { q: "space", limit: 24, offset: 48, favorite: true });
+    await client.addSendQueueEntries("prf_12345678", {
+      expectedRevision: 0,
+      bookIds: ["book_12345678"],
+    }, "queue-add-1");
+    await client.createSmartShelf("prf_12345678", {
+      name: "Favorites",
+      query: { version: 1, personal: { favorite: true } },
+      pinned: true,
+    }, "shelf-create-1");
+    await client.updateBookAnnotation("prf_12345678", "book_12345678", {
+      expectedRevision: 0,
+      favorite: true,
+    });
+    await client.listSeries("prf_12345678");
+    await client.getSeries("prf_12345678", "saga", { limit: 1, offset: 1 });
+
+    expect(fetch.mock.calls[0]?.[0]).toBe("/api/profiles/prf_12345678/books/selection");
+    expect(JSON.parse(String((fetch.mock.calls[0]?.[1] as RequestInit).body))).toEqual({ q: "space", favorite: true });
+    expect(fetch.mock.calls[1]?.[0]).toBe("/api/profiles/prf_12345678/send-queue");
+    expect(fetch.mock.calls[1]?.[1]).toMatchObject({
+      method: "POST",
+      headers: expect.objectContaining({ "Idempotency-Key": "queue-add-1" }),
+    });
+    expect(fetch.mock.calls[2]?.[0]).toBe("/api/profiles/prf_12345678/shelves");
+    expect(fetch.mock.calls[3]?.[0]).toBe("/api/profiles/prf_12345678/books/book_12345678/annotation");
+    expect(fetch.mock.calls[4]?.[0]).toBe("/api/profiles/prf_12345678/series");
+    expect(fetch.mock.calls[5]?.[0]).toBe("/api/profiles/prf_12345678/series/saga?limit=1&offset=1");
+  });
+
+  it("uses catalog-health, provider metadata, and review-only bulk lookup routes", async () => {
+    const issue = {
+      version: 1,
+      signature: "issue-aaaaaaaaaaaaaaaa",
+      profileId: "prf_12345678",
+      type: "missing-cover",
+      severity: "info",
+      reasonCode: "cover-missing",
+      bookIds: ["book_12345678"],
+      sourceIds: ["source_12345678"],
+      rootIds: ["root_12345678"],
+      lastObservedAt: "2026-09-03T00:00:00.000Z",
+      disposition: { ignored: false, revision: 0, retryCount: 0, lastRetryAt: null },
+    };
+    const candidate = {
+      provider: "open-library",
+      candidateId: "/works/OL1W",
+      confidence: "high",
+      metadata: { title: "Provider title", authors: ["Provider Author"] },
+      coverCandidateId: "42",
+    };
+    const job = {
+      id: "lookup_12345678",
+      profileId: "prf_12345678",
+      provider: "open-library",
+      status: "queued",
+      revision: 1,
+      entries: [{
+        jobId: "lookup_12345678",
+        bookId: "book_12345678",
+        rank: 0,
+        status: "pending",
+        attempts: 0,
+        candidates: [],
+        errorCode: null,
+        updatedAt: "2026-09-03T00:00:00.000Z",
+      }],
+      total: 1,
+      pending: 1,
+      ready: 0,
+      noResults: 0,
+      failed: 0,
+      cancelled: 0,
+      createdAt: "2026-09-03T00:00:00.000Z",
+      updatedAt: "2026-09-03T00:00:00.000Z",
+    };
+    const fetch = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({
+        items: [issue], total: 1, limit: 100, offset: 0,
+        counts: {
+          total: 1, active: 1, ignored: 0,
+          byType: { "missing-cover": 1 }, bySeverity: { info: 1 },
+        },
+      }))
+      .mockResolvedValueOnce(jsonResponse({ ...issue, disposition: { ...issue.disposition, ignored: true, revision: 1 } }))
+      .mockResolvedValueOnce(jsonResponse({
+        ...issue,
+        type: "suspected-duplicate",
+        bookIds: ["book_12345678", "book_87654321"],
+        disposition: { ...issue.disposition, preferredBookId: "book_12345678", revision: 1 },
+      }))
+      .mockResolvedValueOnce(jsonResponse({ issue, acceptedRootIds: ["root_12345678"], blockedRootIds: [] }, 202))
+      .mockResolvedValueOnce(jsonResponse({ provider: "open-library", items: [candidate] }))
+      .mockResolvedValueOnce(jsonResponse({}))
+      .mockResolvedValueOnce(jsonResponse(job, 201))
+      .mockResolvedValueOnce(jsonResponse({ ...job, status: "running", revision: 2 }))
+      .mockResolvedValueOnce(jsonResponse({ ...job, status: "completed", revision: 4, pending: 0, ready: 1 }));
+    const client = new HttpCatalogClient({ fetch });
+
+    await expect(client.listCatalogIssues("prf_12345678", { ignored: false, limit: 10 })).resolves.toMatchObject({
+      total: 1, items: [{ signature: issue.signature }],
+    });
+    await client.updateCatalogIssueDisposition("prf_12345678", issue.signature, { expectedRevision: 0, ignored: true });
+    await expect(client.updateCatalogDuplicatePreference("prf_12345678", issue.signature, {
+      expectedRevision: 0,
+      preferredBookId: "book_12345678",
+    })).resolves.toMatchObject({ disposition: { preferredBookId: "book_12345678" } });
+    await client.retryCatalogIssue("prf_12345678", issue.signature, { expectedRevision: 0 });
+    await expect(client.searchBookMetadata("prf_12345678", "book_12345678", "open-library", {
+      title: "Provider title", author: "Provider Author",
+    })).resolves.toMatchObject({ items: [{ candidateId: "/works/OL1W" }] });
+    await client.importBookMetadata("prf_12345678", "book_12345678", {
+      provider: "open-library",
+      candidateId: "/works/OL1W",
+      selectedFields: ["title"],
+      includeCover: false,
+      expectedRevision: 0,
+      expectedContentHash: "a".repeat(64),
+    });
+    await client.createMetadataLookupJob("prf_12345678", {
+      provider: "open-library", bookIds: ["book_12345678"],
+    }, "metadata-job-1");
+    await client.controlMetadataLookupJob("prf_12345678", job.id, "resume", { expectedRevision: 1 });
+    await client.runMetadataLookupJobStep("prf_12345678", job.id);
+
+    expect(fetch.mock.calls[0]?.[0]).toContain("/issues?ignored=false&limit=10");
+    expect(fetch.mock.calls[2]?.[0]).toContain(`/issues/${issue.signature}/preferred-book`);
+    expect(fetch.mock.calls[4]?.[0]).toContain("metadata-search?provider=open-library&limit=12&title=Provider+title");
+    expect(fetch.mock.calls[6]?.[1]).toMatchObject({ headers: expect.objectContaining({ "Idempotency-Key": "metadata-job-1" }) });
+    expect(fetch.mock.calls[8]?.[0]).toContain("/metadata-lookup-jobs/lookup_12345678/run");
   });
 
   it("loads and updates durable metadata overlays without changing the source hash", async () => {
@@ -376,9 +600,46 @@ describe("HttpCatalogClient", () => {
   });
 
   it("parses match-index data without requiring raw device identity", async () => {
-    const fetch = vi.fn(async () => jsonResponse({ profileId: "prf_1", generatedAt: "2026-08-29T12:00:00Z", metadataClaims: { complete: true, collisionBitmap: EMPTY_METADATA_CLAIM_BITMAP }, entries: [{ bookId: "book_1", sourceFilename: "book.epub", sourceFormat: "epub", sourceSize: 100, contentHash: "hash", identifiers: ["isbn:1"], title: "Book", authors: ["Author"], authorSort: "Author, Test", staleManagedTokens: ["kb-0123456789abcdefabcd"], deliveries: [{ deviceKey: "digest", filename: "book.azw3", artifactHash: "artifact", artifactSize: 120, objectIdentity: "persistent", managedToken: "kb-token", status: "delivered", deliveredAt: "2026-08-29T12:05:00Z" }] }] }));
+    const fetch = vi.fn(async () => jsonResponse({ profileId: "prf_1", generatedAt: "2026-08-29T12:00:00Z", metadataClaims: { complete: true, collisionBitmap: EMPTY_METADATA_CLAIM_BITMAP }, entries: [{ bookId: "book_1", preferredPresentation: true, sourceFilename: "book.epub", sourceFormat: "epub", sourceSize: 100, contentHash: "hash", identifiers: ["isbn:1"], title: "Book", authors: ["Author"], authorSort: "Author, Test", staleManagedTokens: ["kb-0123456789abcdefabcd"], deliveries: [{ deviceKey: "digest", filename: "book.azw3", artifactHash: "artifact", artifactSize: 120, objectIdentity: "persistent", managedToken: "kb-token", status: "delivered", deliveredAt: "2026-08-29T12:05:00Z" }] }] }));
     const client = new HttpCatalogClient({ fetch });
-    await expect(client.getMatchIndex("prf_1")).resolves.toEqual(expect.objectContaining({ metadataClaims: { complete: true, collisionBitmap: EMPTY_METADATA_CLAIM_BITMAP }, entries: [expect.objectContaining({ sourceFilename: "book.epub", sourceFormat: "EPUB", authorSort: "Author, Test", staleManagedTokens: ["kb-0123456789abcdefabcd"], deliveries: [expect.objectContaining({ managedToken: "kb-token" })] })] }));
+    await expect(client.getMatchIndex("prf_1")).resolves.toEqual(expect.objectContaining({ metadataClaims: { complete: true, collisionBitmap: EMPTY_METADATA_CLAIM_BITMAP }, entries: [expect.objectContaining({ preferredPresentation: true, sourceFilename: "book.epub", sourceFormat: "EPUB", authorSort: "Author, Test", staleManagedTokens: ["kb-0123456789abcdefabcd"], deliveries: [expect.objectContaining({ managedToken: "kb-token" })] })] }));
+  });
+
+  it("loads the dedicated device-anonymous Book details DTO", async () => {
+    const fetch = vi.fn(async () => jsonResponse({
+      book: {
+        id: "book_1", profileId: "prf_1", rootId: "root_1", sourceFilename: "Book.epub",
+        title: "Book", authors: ["Author"], format: "epub", size: 100,
+        contentHash: "a".repeat(64), presentationVersion: "b".repeat(64),
+        addedAt: "2026-09-01T00:00:00Z", updatedAt: "2026-09-01T00:00:00Z",
+        metadataComplete: true, available: true,
+      },
+      sourceMetadata: { title: "Book", authors: ["Author"], authorSort: null, language: "en", publisher: null, publishedAt: null, series: null, seriesIndex: null, description: null, subjects: [], identifiers: [] },
+      sourceCoverUrl: null,
+      overrides: {},
+      revision: 0,
+      basedOnContentHash: "a".repeat(64),
+      sourceChanged: false,
+      coverOverride: null,
+      source: {
+        rootId: "root_1", rootLabel: "NAS", rootPath: "/libraries/reader", rootStatus: "watching",
+        rootLastScanAt: "2026-09-04T10:00:00Z", rootLastErrorCode: null,
+        relativePath: "series/Book.epub", available: true,
+      },
+      latestVerifiedDelivery: {
+        filename: "Book.azw3", size: 120, deliveredAt: "2026-09-04T11:00:00Z", currentPresentation: true,
+      },
+    }));
+    const client = new HttpCatalogClient({ fetch });
+
+    await expect(client.getBookDetails("prf_1", "book_1")).resolves.toMatchObject({
+      source: { rootPath: "/libraries/reader", relativePath: "series/Book.epub", rootStatus: "watching" },
+      latestVerifiedDelivery: { filename: "Book.azw3", size: 120, currentPresentation: true },
+    });
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/profiles/prf_1/books/book_1/details",
+      expect.objectContaining({ credentials: "same-origin", signal: expect.any(AbortSignal) }),
+    );
   });
 
   it.each([

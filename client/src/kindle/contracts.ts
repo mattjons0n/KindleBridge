@@ -105,6 +105,15 @@ export interface KindleObjectStore {
     handle: number,
     options?: KindleReadObjectOptions,
   ): Promise<Uint8Array>;
+  /** Bounded standard MTP GetPartialObject range read; not used by normal inventory yet. */
+  readObjectRange(
+    request: {
+      readonly handle: number;
+      readonly offset: number;
+      readonly length: number;
+    },
+    options?: KindleOperationOptions,
+  ): Promise<Uint8Array>;
   /** The concrete store must reject handles it did not create this session. */
   deleteObject(handle: number, options?: KindleOperationOptions): Promise<void>;
   /**

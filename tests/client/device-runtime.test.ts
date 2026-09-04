@@ -271,6 +271,71 @@ describe("openKindle cross-layer orchestration", () => {
     await connection.disconnect();
   });
 
+  it("keeps the programmatic partial-object probe opt-in and outside normal runtime work", async () => {
+    const device = new FakeUsbDevice();
+    const session = { isOpen: true, close: vi.fn(async () => undefined) };
+    const transport = { close: vi.fn(async () => undefined) };
+    const lease = { release: vi.fn(async () => undefined) };
+    const source = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const readObjectRange = vi.fn(async (
+      request: { readonly offset: number; readonly length: number },
+    ) => source.slice(request.offset, request.offset + request.length));
+    const kindle = { store: { readObjectRange } };
+    const details = {
+      vendorId: device.vendorId,
+      productId: device.productId,
+      operationsSupported: [MtpOperationCode.GetPartialObject, 0x9805],
+    };
+    const ordinaryConnection = new ConnectedKindle(
+      device,
+      details,
+      transport as never,
+      session as never,
+      kindle as never,
+      lease as never,
+    );
+
+    await expect(ordinaryConnection.runDevelopmentPartialObjectProbe({
+      handle: 7,
+      objectSize: source.byteLength,
+      sampleBytes: 8,
+    })).rejects.toMatchObject({ code: "KINDLE_PARTIAL_OBJECT_PROBE_DISABLED" });
+    expect(readObjectRange).not.toHaveBeenCalled();
+
+    const enabledConnection = new ConnectedKindle(
+      device,
+      details,
+      transport as never,
+      session as never,
+      kindle as never,
+      lease as never,
+      undefined,
+      undefined,
+      true,
+    );
+    await expect(enabledConnection.runDevelopmentPartialObjectProbe({
+      handle: 7,
+      objectSize: source.byteLength,
+      sampleBytes: 8,
+    })).resolves.toMatchObject({
+      operationCode: MtpOperationCode.GetPartialObject,
+      operationAdvertised: true,
+      repeatBytesVerified: 8,
+    });
+    expect(readObjectRange).toHaveBeenCalledTimes(7);
+    await expect(enabledConnection.runDevelopmentPartialObjectProbe({
+      handle: 7,
+      objectSize: source.byteLength,
+      sampleBytes: 8,
+    })).rejects.toMatchObject({ code: "KINDLE_PARTIAL_OBJECT_PROBE_ALREADY_RUN" });
+    await expect(enabledConnection.runDevelopmentPartialObjectProbe({
+      handle: 7,
+      objectSize: source.byteLength,
+      sampleBytes: 8,
+    }, { allowRepeat: true })).resolves.toMatchObject({ repeatBytesVerified: 8 });
+    expect(readObjectRange).toHaveBeenCalledTimes(14);
+  });
+
   it("refuses a writable Kindle metadata-cache refresh until this connection passes self-test", async () => {
     const device = new FakeUsbDevice();
     const session = { isOpen: true, close: vi.fn(async () => undefined) };

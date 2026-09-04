@@ -4,6 +4,7 @@
 # The per-platform digests and verification date are recorded in
 # deploy/docker/base-image.lock.
 ARG NODE_IMAGE="node:24.20.0-bookworm-slim@sha256:ba849c60be29959425b8734d57b8b4b7d56f98edd9504c9af091d5281095a71e"
+ARG BUILDPLATFORM
 
 # Build/test outputs are architecture-neutral JavaScript, CSS, and WebAssembly.
 # Keep this stage native so a cross-build never runs timing-sensitive tests
@@ -17,7 +18,7 @@ RUN npm ci
 
 COPY tsconfig.json tsconfig.server.json vite.config.ts vitest.config.ts ./
 COPY Dockerfile compose.yaml .dockerignore ./
-COPY LICENSE THIRD_PARTY_NOTICES.md README.md PROJECT_HANDOFF.md AGENTS.md ./
+COPY LICENSE THIRD_PARTY_NOTICES.md README.md PROJECT_HANDOFF.md BACKLOG.md AGENTS.md ./
 COPY client ./client
 COPY server ./server
 COPY shared ./shared
@@ -49,7 +50,7 @@ ARG SOURCE_URL="local"
 
 ENV NODE_ENV=production \
     NODE_OPTIONS=--enable-source-maps \
-    TMPDIR=/cache/tmp \
+    TMPDIR=/cache \
     CATALOG_HOST=0.0.0.0 \
     CATALOG_PORT=8080 \
     CATALOG_DATABASE_PATH=/data/catalog.sqlite \
@@ -72,7 +73,7 @@ LABEL org.opencontainers.image.title="Kindle Bridge" \
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.source="${SOURCE_URL}"
 
-RUN mkdir -p /data /cache/tmp /libraries /usr/share/kindle-bridge/source \
+RUN mkdir -p /data /cache /libraries /usr/share/kindle-bridge/source \
     && chown -R 1000:1000 /data /cache
 
 COPY --from=build --chown=1000:1000 /app/dist ./dist
@@ -83,7 +84,7 @@ COPY --from=build --chown=1000:1000 /app/LICENSE /app/THIRD_PARTY_NOTICES.md /us
 # Corresponding source and deterministic build inputs accompany every image.
 COPY --from=build --chown=1000:1000 /app/package.json /app/package-lock.json /app/tsconfig.json /app/tsconfig.server.json /app/vite.config.ts /app/vitest.config.ts /usr/share/kindle-bridge/source/
 COPY --from=build --chown=1000:1000 /app/Dockerfile /app/compose.yaml /app/.dockerignore /usr/share/kindle-bridge/source/
-COPY --from=build --chown=1000:1000 /app/README.md /app/PROJECT_HANDOFF.md /app/AGENTS.md /usr/share/kindle-bridge/source/
+COPY --from=build --chown=1000:1000 /app/README.md /app/PROJECT_HANDOFF.md /app/BACKLOG.md /app/AGENTS.md /usr/share/kindle-bridge/source/
 COPY --from=build --chown=1000:1000 /app/client /usr/share/kindle-bridge/source/client
 COPY --from=build --chown=1000:1000 /app/server /usr/share/kindle-bridge/source/server
 COPY --from=build --chown=1000:1000 /app/shared /usr/share/kindle-bridge/source/shared

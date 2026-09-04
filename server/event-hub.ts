@@ -102,6 +102,9 @@ function encodeEvent(event: CatalogEvent): string {
         at: event.at,
         ...(event.profileId ? { profileId: event.profileId } : {}),
         ...(event.rootId ? { rootId: event.rootId } : {}),
+        ...(event.bookId ? { bookId: event.bookId } : {}),
+        ...(event.shelfId ? { shelfId: event.shelfId } : {}),
+        ...(event.jobId ? { jobId: event.jobId } : {}),
         data: { truncated: true },
       });
   return `id: ${event.id}\ndata: ${data}\n\n`;

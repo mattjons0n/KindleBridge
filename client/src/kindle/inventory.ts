@@ -27,6 +27,16 @@ import {
   type KindleModificationDateProbeSummary,
 } from "./modification-date-diagnostics";
 import { isFatalTransportFailure } from "../error-diagnostics";
+import {
+  readKindleKfxSidecarMetadata,
+  type KindleKfxSidecarMetadataOptions,
+  type KindleKfxSidecarMetadataResult,
+} from "./kfx-sidecar";
+import {
+  readKindleReadingSidecars,
+  type KindleReadingSidecarOptions,
+} from "./reading-sidecars";
+import type { KindleReadingEvidence } from "./reading-state";
 
 const UINT32_MAX = 0xffff_ffff;
 const DEFAULT_MAX_OBJECTS = 10_000;
@@ -112,6 +122,8 @@ export interface KindleInventoryObject {
   readonly identifiers?: readonly string[];
   readonly language?: string;
   readonly bookMetadataState?: KindleInventoryObjectMetadataState;
+  /** Browser-only read-side evidence; never serialized to the catalog service. */
+  readonly readingEvidence?: KindleReadingEvidence;
 }
 
 export type KindleInventoryObjectMetadataState =
@@ -347,6 +359,14 @@ export interface KindleInventoryOptions extends KindleOperationOptions {
   /** Enabled with conservative limits by default; `false` performs metadata-only hierarchy enumeration. */
   readonly bookMetadata?: false | KindleInventoryMetadataOptions;
   /**
+   * Internal physical-acceptance gate. Default-off so normal inventory keeps
+   * treating KFX/AZW8 metadata as unavailable until a real Kindle validates
+   * the exact sidecar hierarchy and format subset.
+   */
+  readonly kfxSidecarMetadata?: false | KindleKfxSidecarMetadataOptions;
+  /** Internal default-off gate pending controlled physical KRDS fixtures. */
+  readonly readingSidecars?: false | KindleReadingSidecarOptions;
+  /**
    * Portable cache reads are enabled by default. A write request is honored
    * only after this KindleDevice instance has passed its exact-byte self-test.
    */
@@ -360,6 +380,8 @@ interface ResolvedInventoryLimits {
   readonly maxPathLength: number;
   readonly maxIssues: number;
   readonly bookMetadata: false | ResolvedInventoryMetadataLimits;
+  readonly kfxSidecarMetadata: false | KindleKfxSidecarMetadataOptions;
+  readonly readingSidecars: false | KindleReadingSidecarOptions;
 }
 
 interface ResolvedInventoryMetadataLimits {
@@ -439,6 +461,8 @@ function resolveLimits(options: KindleInventoryOptions): ResolvedInventoryLimits
         "bookMetadata.maxTotalBytes",
       ),
     },
+    kfxSidecarMetadata: options.kfxSidecarMetadata ?? false,
+    readingSidecars: options.readingSidecars ?? false,
   };
 }
 
@@ -962,6 +986,7 @@ async function enrichBookMetadata(
     readonly invalidObjectCount: number;
   } = { missingObjectCount: 0, invalidObjectCount: 0 },
   modificationDateProbe?: KindleModificationDateProbeSummary,
+  kfxSidecars?: KindleKfxSidecarMetadataResult,
 ): Promise<{
   readonly objects: readonly KindleInventoryObject[];
   readonly summary: KindleInventoryMetadataSummary;
@@ -1102,6 +1127,45 @@ async function enrichBookMetadata(
     }
 
     if (!hasSupportedEmbeddedMetadata(object.filename)) {
+      const sidecar = kfxSidecars?.byBookHandle.get(object.handle);
+      if (sidecar?.state === "enriched") {
+        counters.attempted += 1;
+        counters.parsed += 1;
+        counters.readBytes += sidecar.readBytes;
+        counters.budgetedBytes += sidecar.budgetedBytes;
+        if (hasParsedMetadata(sidecar.metadata)) counters.enriched += 1;
+        const enrichedObject = objectWithParsedMetadata(object, sidecar.metadata);
+        if (!hasSufficientKindleObjectDistinguishability(enrichedObject)) {
+          counters.indistinguishable += 1;
+        }
+        enrichedObjects.push(enrichedObject);
+        continue;
+      }
+      if (sidecar?.state === "failed") {
+        // Until physical acceptance, every failed/ambiguous KFX sidecar path
+        // deliberately collapses to the same conservative state as the
+        // pre-feature implementation. It must never strengthen absence or a
+        // match merely because the opt-in experiment ran.
+        counters.skipped += 1;
+        reasons.add("unsupported-format");
+        enrichedObjects.push(Object.freeze({
+          ...object,
+          bookMetadataState: "skipped-unsupported-format",
+        }));
+        continue;
+      }
+      if (sidecar?.state === "skipped") {
+        counters.skipped += 1;
+        const state = sidecar.reason === "object-size"
+          ? "skipped-object-size"
+          : sidecar.reason === "total-bytes"
+            ? "skipped-total-bytes"
+            : "skipped-object-count";
+        const reason = sidecar.reason === "book-limit" ? "object-count" : sidecar.reason;
+        reasons.add(reason);
+        enrichedObjects.push(Object.freeze({ ...object, bookMetadataState: state }));
+        continue;
+      }
       counters.skipped += 1;
       reasons.add("unsupported-format");
       enrichedObjects.push(Object.freeze({
@@ -1419,6 +1483,28 @@ export async function buildKindleInventory(
     })),
   });
 
+  const kfxSidecars = limits.bookMetadata !== false && limits.kfxSidecarMetadata !== false
+    ? await readKindleKfxSidecarMetadata(store, objects, {
+        ...limits.kfxSidecarMetadata,
+        maxBooks: Math.min(
+          limits.kfxSidecarMetadata.maxBooks ?? 2_000,
+          limits.bookMetadata.maxObjects,
+        ),
+        maxSidecarBytes: Math.min(
+          limits.kfxSidecarMetadata.maxSidecarBytes ?? 4 * 1024 * 1024,
+          limits.bookMetadata.maxObjectBytes,
+        ),
+        maxTotalBytes: Math.min(
+          limits.kfxSidecarMetadata.maxTotalBytes ?? 128 * 1024 * 1024,
+          limits.bookMetadata.maxTotalBytes,
+        ),
+      }, operationOptions)
+    : undefined;
+
+  const readingSidecars = limits.readingSidecars === false
+    ? undefined
+    : await readKindleReadingSidecars(store, objects, limits.readingSidecars, operationOptions);
+
   const enrichment = await enrichBookMetadata(
     store,
     objects,
@@ -1432,12 +1518,21 @@ export async function buildKindleInventory(
       invalidObjectCount: invalidModificationDateObjectCount,
     },
     modificationDateProbe,
+    kfxSidecars,
   );
+  const inventoryObjects = readingSidecars === undefined
+    ? enrichment.objects
+    : Object.freeze(enrichment.objects.map((object) => {
+        const readingEvidence = readingSidecars.evidenceByBookHandle.get(object.handle);
+        return readingEvidence === undefined
+          ? object
+          : Object.freeze({ ...object, readingEvidence });
+      }));
   const inventory: KindleInventorySnapshot = Object.freeze({
     status: issueCount === 0 ? "complete" : "partial",
     storageId: target.storageId,
     documentsHandle: target.documentsHandle,
-    objects: enrichment.objects,
+    objects: inventoryObjects,
     issues: Object.freeze(issues.slice()),
     issueCount,
     scannedObjectCount: objects.length,

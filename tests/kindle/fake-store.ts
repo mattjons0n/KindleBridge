@@ -62,10 +62,12 @@ export class FakeKindleObjectStore implements KindleObjectStore {
   readonly conditionallyDeletedHandles: number[] = [];
   readonly createRequests: KindleCreateObjectRequest[] = [];
   readonly childListFailures = new Map<number, unknown>();
+  readonly childListRequests: Array<{ storageId: number; associationHandle?: number; maxHandles?: number }> = [];
   readonly metadataFailures = new Map<number, unknown>();
   readonly metadataRequests: number[] = [];
   readonly readFailures = new Map<number, unknown>();
   readonly readRequests: Array<{ handle: number; maxBytes?: number }> = [];
+  readonly rangeReadRequests: Array<{ handle: number; offset: number; length: number }> = [];
   nextHandle = 100;
   corruptReadback = false;
   failDelete = false;
@@ -112,6 +114,11 @@ export class FakeKindleObjectStore implements KindleObjectStore {
     },
     _options?: KindleOperationOptions,
   ): Promise<readonly number[]> {
+    this.childListRequests.push({
+      storageId: query.storageId,
+      ...(query.associationHandle === undefined ? {} : { associationHandle: query.associationHandle }),
+      ...(query.maxHandles === undefined ? {} : { maxHandles: query.maxHandles }),
+    });
     const listFailure = query.associationHandle === undefined
       ? undefined
       : this.childListFailures.get(query.associationHandle);
@@ -231,6 +238,18 @@ export class FakeKindleObjectStore implements KindleObjectStore {
     const result = data.slice();
     if (this.corruptReadback && result.byteLength) result[0] ^= 0xff;
     return result;
+  }
+
+  async readObjectRange(
+    request: { readonly handle: number; readonly offset: number; readonly length: number },
+    _options?: KindleOperationOptions,
+  ): Promise<Uint8Array> {
+    this.rangeReadRequests.push({ ...request });
+    const failure = this.readFailures.get(request.handle);
+    if (failure) throw failure;
+    const data = this.objectData.get(request.handle);
+    if (!data) throw new Error(`No data for ${request.handle}`);
+    return data.slice(request.offset, request.offset + request.length);
   }
 
   async deleteObject(

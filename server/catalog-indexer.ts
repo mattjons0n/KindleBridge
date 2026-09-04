@@ -21,6 +21,8 @@ export interface ScannerEvent {
   profileId?: string;
   rootId?: string;
   bookId?: string;
+  shelfId?: string;
+  jobId?: string;
   data?: Record<string, unknown>;
 }
 

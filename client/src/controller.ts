@@ -1,6 +1,11 @@
 import { convertEpub, type ConversionResult } from "./api/convert";
 import type { ConversionOverrides } from "./api/conversion-overrides";
 import { AppError, toAppError } from "./app-error";
+import {
+  advancedPartialObjectProbeTargets,
+  exportAdvancedPartialObjectProbeResult,
+  type AdvancedPartialObjectProbeRunRequest,
+} from "./advanced-partial-object-diagnostic";
 import type {
   CatalogSendBatchResult,
   CatalogKindleInventory,
@@ -10,14 +15,27 @@ import type {
 import {
   createCatalogClient,
   type CatalogApi,
+  type CatalogBook,
+  type CatalogBookMetadataState,
+  type CatalogBookSource,
   type CatalogMatchIndex,
   type CreateDeliveryInput,
 } from "./catalog-client";
 import {
   asLastSeenInventory,
+  manualMatchEvidenceKey,
   reconcileCatalogIndexes,
 } from "./catalog-reconciliation";
 import { prepareCatalogArtifact } from "./catalog-transfer";
+import {
+  catalogManagedUpdateResult,
+  catalogManagedUpdateStagePresentation,
+  expectedCatalogSourceEtag,
+  normalizeCatalogManagedUpdateRequest,
+  sha256CatalogUpdateBlob,
+  type CatalogManagedUpdateRequest,
+  type CatalogManagedUpdateResult,
+} from "./catalog-managed-update";
 import {
   acknowledgePendingDelivery,
   flushPendingDeliveries,
@@ -28,18 +46,37 @@ import {
   openKindle,
   type DeviceRuntimeHooks,
   type KindlePostConnectResult,
+  type KindleManagedOldCopyEvidence,
+  type KindleManagedUpdateOptions,
+  type KindleManagedUpdateResult,
+  type KindleReplacementCleanupOptions,
+  type KindleReplacementCleanupResult,
+  type PreparedKindleManagedUpdate,
   type KindleRemoveBooksAndRefreshResult,
   type KindleSendAndRefreshResult,
   type RemoveKindleBooksOptions,
   type SendBookOptions,
 } from "./device-runtime";
 import {
+  acknowledgeReplacementCleanupRecord,
+  readReplacementCleanupJournal,
+  readReplacementCleanupRecords,
+  type ReplacementCleanupRecord,
+} from "./replacement-cleanup-journal";
+import {
   acquireKindleDeviceLease,
+  createKindleManualMatchDecisionStore,
   createManagedFilenameToken,
   extractManagedFilenameToken,
+  isKindleReadableBookFilename,
+  kindleAdvertisesPartialObject,
   type KindleBookTransferResult,
   type KindleDeviceLease,
   type KindleInventorySnapshot,
+  type KindleIdentityStability,
+  type KindleManualMatchDecisionStore,
+  type KindleManualMatchEvidence,
+  type KindlePartialObjectProbePresentation,
   type KindleSelfTestResult,
 } from "./kindle";
 import { DebugLog } from "./log";
@@ -81,6 +118,7 @@ export interface ConnectedKindlePort {
   readonly closed: boolean;
   /** Opaque, in-memory-only digest of a device serial, when available. */
   readonly identityKey?: string;
+  readonly identityKeyStability?: KindleIdentityStability;
   readonly readyForSend: boolean;
   readonly latestInventory?: KindleInventorySnapshot;
   runSelfTest(options?: SendBookOptions): Promise<KindleSelfTestResult>;
@@ -107,6 +145,19 @@ export interface ConnectedKindlePort {
     options?: RemoveKindleBooksOptions,
     inventoryOptions?: Parameters<ConnectedKindle["refreshInventory"]>[0],
   ): Promise<KindleRemoveBooksAndRefreshResult>;
+  updateManagedBook?(
+    prepared: PreparedKindleManagedUpdate,
+    oldEvidence: KindleManagedOldCopyEvidence,
+    options: KindleManagedUpdateOptions,
+  ): Promise<KindleManagedUpdateResult>;
+  cleanupManagedReplacement?(
+    record: ReplacementCleanupRecord,
+    options?: KindleReplacementCleanupOptions,
+  ): Promise<KindleReplacementCleanupResult>;
+  runAdvancedPartialObjectProbe?(
+    handle: number,
+    options?: Parameters<ConnectedKindle["runAdvancedPartialObjectProbe"]>[1],
+  ): Promise<KindlePartialObjectProbePresentation>;
   disconnect(): Promise<void>;
   closeAfterPhysicalDisconnect(): Promise<void>;
 }
@@ -118,6 +169,7 @@ export interface AppControllerDependencies {
     device: UsbDeviceLike,
     hooks: DeviceRuntimeHooks,
     signal: AbortSignal,
+    options?: AppControllerOpenDeviceOptions,
   ) => Promise<ConnectedKindlePort>;
   readonly convert: (
     file: File,
@@ -128,6 +180,7 @@ export interface AppControllerDependencies {
   readonly copyText: (value: string) => Promise<void>;
   readonly now: () => number;
   readonly catalogApi?: CatalogApi;
+  readonly manualMatchDecisions?: KindleManualMatchDecisionStore;
   /** Tests can disable the catalog's startup requests while exercising POC gates. */
   readonly autoStartCatalog?: boolean;
   /** Observable page lifecycle only; this does not claim generic OS sleep detection. */
@@ -165,6 +218,13 @@ export interface AppControllerDependencies {
   readonly postUploadInventoryTimeoutMs?: number;
   /** Acquires the same browser-wide lock held by every connected Kindle. */
   readonly acquireRecoveryLease?: () => Promise<KindleDeviceLease>;
+  /** Injectable browser-local journal used by replacement recovery tests. */
+  readonly replacementCleanupStorage?: Pick<Storage, "getItem" | "setItem" | "removeItem">;
+}
+
+export interface AppControllerOpenDeviceOptions {
+  /** Session-only Advanced diagnostic opt-in; never sourced from Settings or the container. */
+  readonly enableDevelopmentPartialObjectProbe?: boolean;
 }
 
 export interface BrowserLifecycleSource {
@@ -188,6 +248,7 @@ const DEFAULT_SELF_TEST_OPERATION_TIMEOUT_MS = 120_000;
 const DEFAULT_CONNECT_INVENTORY_TIMEOUT_MS = 10 * 60_000;
 const DEFAULT_POST_UPLOAD_INVENTORY_TIMEOUT_MS = 2 * 60_000;
 const DEFAULT_REMOVE_OPERATION_TIMEOUT_MS = 5 * 60_000;
+const DEFAULT_PARTIAL_OBJECT_PROBE_TIMEOUT_MS = 2 * 60_000;
 const MAX_SYNTHETIC_INVENTORY_OBJECTS = 10_000;
 const MAX_SYNTHETIC_INVENTORY_ISSUES = 64;
 const MAX_CATALOG_REMOVE_TARGETS = 1_000;
@@ -345,7 +406,11 @@ export function defaultControllerDependencies(): AppControllerDependencies {
   return {
     usb,
     requestDevice: () => requestKindleDevice({ usb }),
-    openDevice: (device, hooks, signal) => openKindle(device, hooks, usb, { signal }),
+    openDevice: (device, hooks, signal, options) => openKindle(device, hooks, usb, {
+      signal,
+      enableDevelopmentPartialObjectProbe:
+        options?.enableDevelopmentPartialObjectProbe === true,
+    }),
     convert: convertEpub,
     download: downloadBlob,
     copyText,
@@ -373,6 +438,80 @@ function manualCleanupInstruction(error: AppError): string | undefined {
 
 function errorContext(error: AppError): Readonly<Record<string, unknown>> {
   return { code: error.code, ...(error.details ?? {}) };
+}
+
+function assertCatalogManagedUpdateBook(
+  book: CatalogBook,
+  request: CatalogManagedUpdateRequest,
+  phase: "before" | "after",
+): void {
+  if (book.profileId !== request.profileId || book.id !== request.bookId) {
+    throw new AppError("INVALID_STATE", "The catalog returned a different book while preparing the Kindle update.");
+  }
+  const format = book.format.trim().toLocaleUpperCase("en-US");
+  if (format !== "EPUB") {
+    throw new AppError(
+      format === "AZW3" ? "UNSUPPORTED_EDITED_AZW3" : "CATALOG_FORMAT_MISMATCH",
+      format === "AZW3"
+        ? "Edited AZW3 replacement is not supported. Keep the existing Kindle copy or use an EPUB source."
+        : "Only an edited EPUB can use the guarded Kindle update workflow.",
+    );
+  }
+  if (!book.available || !book.contentHash || !book.presentationVersion) {
+    throw new AppError("CATALOG_SOURCE_CHANGED", "The edited EPUB is not currently available with complete version evidence.");
+  }
+  if (book.metadataEdited !== true && book.coverEdited !== true) {
+    throw new AppError("INVALID_STATE", "Update Kindle copy is available only after EPUB metadata or cover edits.");
+  }
+  if (book.contentHash.toLocaleLowerCase("en-US") !== request.expectedContentHash
+    || book.presentationVersion.toLocaleLowerCase("en-US") !== request.expectedPresentationVersion
+    || book.metadataRevision !== request.expectedMetadataRevision) {
+    throw new AppError(
+      "CATALOG_SOURCE_CHANGED",
+      phase === "after"
+        ? "The source, metadata, cover, or presentation version changed during replacement preparation. The Kindle was not modified."
+        : "The source, metadata, cover, or presentation version changed after Kindle comparison. Refresh before updating.",
+    );
+  }
+}
+
+function assertCatalogManagedUpdateMetadata(
+  metadata: CatalogBookMetadataState,
+  request: CatalogManagedUpdateRequest,
+  phase: "before" | "after",
+): void {
+  assertCatalogManagedUpdateBook(metadata.book, request, phase);
+  if (metadata.sourceChanged
+    || metadata.revision !== request.expectedMetadataRevision
+    || metadata.basedOnContentHash.toLocaleLowerCase("en-US") !== request.expectedContentHash) {
+    throw new AppError(
+      "CATALOG_SOURCE_CHANGED",
+      phase === "after"
+        ? "The metadata or cover revision changed during replacement preparation. The Kindle was not modified."
+        : "The metadata or cover revision is no longer based on the compared source. Refresh before updating.",
+    );
+  }
+}
+
+function assertCatalogManagedUpdateSource(
+  source: CatalogBookSource,
+  book: CatalogBook,
+  request: CatalogManagedUpdateRequest,
+  phase: "before" | "after",
+): void {
+  const expectedEtag = expectedCatalogSourceEtag(request.expectedContentHash);
+  const sourceEtag = source.etag?.trim().toLocaleLowerCase("en-US");
+  if (source.blob.size !== book.size
+    || source.contentLength !== book.size
+    || sourceEtag !== expectedEtag
+    || source.presentationVersion?.toLocaleLowerCase("en-US") !== request.expectedPresentationVersion) {
+    throw new AppError(
+      "CATALOG_SOURCE_CHANGED",
+      phase === "after"
+        ? "The source response, ETag, or presentation version changed during replacement preparation. The Kindle was not modified."
+        : "The source response no longer matches the compared hash, size, ETag, and presentation version.",
+    );
+  }
 }
 
 function isFatalInventoryError(error: unknown): boolean {
@@ -447,9 +586,15 @@ export class AppController {
   #catalogInventoryEpoch?: number;
   #catalogReadyProfileIds = new Set<string>();
   #catalogReconciledVersions = new Map<string, ReconciledCatalogVersion>();
+  #manualMatchEvidence = new Map<string, KindleManualMatchEvidence>();
+  readonly #manualMatchDecisions: KindleManualMatchDecisionStore;
   #catalogEventReconciliation?: Promise<void>;
   #catalogEventReconciliationQueued = false;
   #catalogSendBatch?: ActiveCatalogSendBatch;
+  #advancedPartialObjectProbeNextConnection = false;
+  #advancedPartialObjectProbeConnection?: ConnectedKindlePort;
+  #advancedPartialObjectProbeHasRun = false;
+  #advancedPartialObjectProbeResult?: KindlePartialObjectProbePresentation;
 
   readonly #handlePageHide = (event: Event): void => {
     this.#hiddenAt = undefined;
@@ -484,6 +629,7 @@ export class AppController {
     this.#deviceAbort = undefined;
     this.#pendingDevice = undefined;
     this.#connection = undefined;
+    this.#clearAdvancedPartialObjectProbeConnection();
     this.#clearCurrentCatalogInventoryAuthority();
     const error = new AppError(
       "USB_DEVICE_DISCONNECTED",
@@ -537,7 +683,11 @@ export class AppController {
   ) {
     this.#dependencies = dependencies;
     this.#catalogApi = dependencies.catalogApi ?? createCatalogClient();
-    this.#state = initialState;
+    this.#manualMatchDecisions = dependencies.manualMatchDecisions ?? createKindleManualMatchDecisionStore();
+    this.#state = {
+      ...initialState,
+      pendingReplacementCleanups: readReplacementCleanupRecords(dependencies.replacementCleanupStorage),
+    };
     this.log = log;
 
     const handlers: AppViewHandlers = {
@@ -551,14 +701,20 @@ export class AppController {
       onSendIntegrated: () => { void this.sendIntegrated(); },
       onIntegratedOpenConfirmed: () => this.confirmIntegratedOpened(),
       onCleanupInspectionConfirmed: () => { void this.confirmCleanupInspection(); },
+      onReplacementCleanupRequested: (operationId) => { void this.cleanupManagedReplacement(operationId); },
       onCopyLog: () => { void this.copyLog(); },
       onCatalogConnectRequested: () => this.connect("catalog"),
       onCatalogDisconnectRequested: () => this.disconnect(),
       onCatalogSendRequested: (request) => this.sendCatalogBook(request),
       onCatalogSendBatchFinished: (result) => this.finishCatalogSendBatch(result),
       onCatalogRemoveRequested: (request) => this.removeCatalogBooks(request),
+      onCatalogUpdateRequested: (request) => this.updateCatalogBook(request),
       onCatalogChanged: () => this.#queueConnectedCatalogReconciliation(),
       onCatalogProfileChanged: () => this.#queueConnectedCatalogReconciliation(),
+      onCatalogManualMatchDecision: (request) => this.#applyManualMatchDecision(request),
+      onAdvancedPartialObjectProbeArm: () => this.armAdvancedPartialObjectProbeForNextConnection(),
+      onAdvancedPartialObjectProbeRun: (request) => this.runAdvancedPartialObjectProbe(request),
+      onAdvancedPartialObjectProbeExport: () => this.exportAdvancedPartialObjectProbeResult(),
     };
     this.#view = new AppView(root, this.#state, handlers, this.log, {
       catalogApi: this.#catalogApi,
@@ -591,6 +747,11 @@ export class AppController {
         purpose: this.#state.pendingObjectCleanup.purpose,
         stage: this.#state.pendingObjectCleanup.stage,
         handleKnown: this.#state.pendingObjectCleanup.handle !== undefined,
+      });
+    }
+    if ((this.#state.pendingReplacementCleanups?.length ?? 0) > 0) {
+      this.log.warn("Verified replacement cleanup requires explicit attention", {
+        pendingCount: this.#state.pendingReplacementCleanups?.length ?? 0,
       });
     }
   }
@@ -648,6 +809,176 @@ export class AppController {
     this.log.info("EPUB selected", { filename: file.name, bytes: file.size });
   }
 
+  /**
+   * Arms a one-shot, page-memory-only development gate. The next clean
+   * connection consumes it before WebUSB opens; it is never persisted or read
+   * from ordinary application/container settings.
+   */
+  armAdvancedPartialObjectProbeForNextConnection(): void {
+    if (
+      this.#connection
+      || this.#pendingDevice
+      || this.#hardwareBusy
+      || this.#disconnectPromise
+      || !["disconnected", "error"].includes(this.#state.device.kind)
+    ) {
+      this.#view.setAdvancedPartialObjectProbe({
+        phase: "error",
+        targets: Object.freeze([]),
+        eligibleCount: 0,
+        targetsTruncated: false,
+        hasRun: false,
+        message: "Disconnect first, then enable the probe for the next clean connection.",
+      });
+      return;
+    }
+    this.#advancedPartialObjectProbeNextConnection = true;
+    this.#advancedPartialObjectProbeConnection = undefined;
+    this.#advancedPartialObjectProbeHasRun = false;
+    this.#advancedPartialObjectProbeResult = undefined;
+    this.#view.setAdvancedPartialObjectProbe({ phase: "armed" });
+    this.log.info("Development partial-object diagnostic armed for the next clean connection", {
+      sessionOnly: true,
+      ordinaryInventoryUse: false,
+    });
+  }
+
+  async runAdvancedPartialObjectProbe(
+    request: AdvancedPartialObjectProbeRunRequest,
+  ): Promise<void> {
+    const connection = this.#connection;
+    const targetSet = advancedPartialObjectProbeTargets(connection?.latestInventory);
+    const base = {
+      targets: targetSet.targets,
+      eligibleCount: targetSet.eligibleCount,
+      targetsTruncated: targetSet.truncated,
+    } as const;
+    if (request.confirmed !== true) {
+      this.#view.setAdvancedPartialObjectProbe({
+        phase: "error",
+        ...base,
+        hasRun: this.#advancedPartialObjectProbeHasRun,
+        message: "Select one current file and explicitly confirm the read-only diagnostic.",
+      });
+      return;
+    }
+    if (
+      !connection
+      || connection.closed
+      || connection !== this.#advancedPartialObjectProbeConnection
+      || connection.runAdvancedPartialObjectProbe === undefined
+      || this.#hardwareBusy
+      || this.#state.device.kind !== "ready"
+      || this.#state.selfTest.kind !== "passed"
+      || connection.latestInventory?.status !== "complete"
+      || !kindleAdvertisesPartialObject(connection.details.operationsSupported)
+    ) {
+      this.#view.setAdvancedPartialObjectProbe({
+        phase: "error",
+        ...base,
+        hasRun: this.#advancedPartialObjectProbeHasRun,
+        message: "Enable the development probe, reconnect, and wait for a complete live inventory.",
+      });
+      return;
+    }
+    if (!base.targets.some(({ handle }) => handle === request.handle)) {
+      this.#view.setAdvancedPartialObjectProbe({
+        phase: "error",
+        ...base,
+        hasRun: this.#advancedPartialObjectProbeHasRun,
+        message: "The selected file is not an eligible object in the current live inventory.",
+      });
+      return;
+    }
+    if (this.#advancedPartialObjectProbeHasRun && request.repeatConfirmed !== true) {
+      this.#view.setAdvancedPartialObjectProbe({
+        phase: "error",
+        ...base,
+        hasRun: true,
+        message: "This connection already ran the probe. Explicitly confirm the repeat to run it again.",
+      });
+      return;
+    }
+
+    const repeat = this.#advancedPartialObjectProbeHasRun;
+    this.#hardwareBusy = true;
+    this.#advancedPartialObjectProbeResult = undefined;
+    this.#view.setAdvancedPartialObjectProbe({
+      phase: "running",
+      ...base,
+      hasRun: repeat,
+    });
+    // ConnectedKindle consumes its once-per-connection allowance before the
+    // first transport read. Mirror that fact even when the physical probe
+    // fails so retries cannot accidentally bypass explicit repeat consent.
+    this.#advancedPartialObjectProbeHasRun = true;
+    try {
+      const result = await connection.runAdvancedPartialObjectProbe(request.handle, {
+        signal: this.#deviceAbort?.signal,
+        aggregateTimeoutMs: DEFAULT_PARTIAL_OBJECT_PROBE_TIMEOUT_MS,
+        allowRepeat: repeat && request.repeatConfirmed === true,
+      });
+      if (connection !== this.#connection || connection.closed) return;
+      this.#advancedPartialObjectProbeResult = result;
+      this.#view.setAdvancedPartialObjectProbe({ phase: "complete", ...base, result });
+      this.log.info("Kindle partial-object diagnostic completed", {
+        verdict: result.verdict,
+        operation: result.operation,
+        objectSize: result.objectSize,
+        rangeCount: result.rangeCount,
+        requestedRangeBytes: result.requestedRangeBytes,
+        returnedRangeBytes: result.returnedRangeBytes,
+        overlapBytesVerified: result.overlapBytesVerified,
+        repeatBytesVerified: result.repeatBytesVerified,
+        wholeObjectComparison: result.wholeObjectComparison,
+        referenceBytesRead: result.referenceBytesRead,
+        eofBehavior: result.eofBehavior,
+        elapsedMs: result.elapsedMs,
+      });
+    } catch (rawError) {
+      if (connection !== this.#connection) return;
+      const error = toAppError(rawError, "The bounded partial-object diagnostic failed");
+      this.#view.setAdvancedPartialObjectProbe({
+        phase: "error",
+        ...base,
+        hasRun: this.#advancedPartialObjectProbeHasRun,
+        message: `${error.code}: ${error.message}`,
+      });
+      this.log.warn("Kindle partial-object diagnostic failed", { code: error.code });
+      // This development probe shares the live MTP transaction stream. A
+      // transport/session failure is therefore just as terminal here as it is
+      // during inventory or transfer: never leave a visually ready connection
+      // available for a second command after synchronization may be lost.
+      if (connection.closed || !connection.readyForSend || isFatalTransportFailure(rawError)) {
+        await this.#retireFaultedConnection(connection, error);
+      }
+    } finally {
+      this.#finishHardwareOperation();
+    }
+  }
+
+  async exportAdvancedPartialObjectProbeResult(): Promise<void> {
+    const result = this.#advancedPartialObjectProbeResult;
+    if (!result) return;
+    try {
+      await this.#dependencies.copyText(exportAdvancedPartialObjectProbeResult(result));
+      this.log.info("Byte-free partial-object diagnostic metrics copied");
+    } catch {
+      const connection = this.#connection;
+      const targetSet = advancedPartialObjectProbeTargets(connection?.latestInventory);
+      this.#view.setAdvancedPartialObjectProbe({
+        phase: "error",
+        targets: targetSet.targets,
+        eligibleCount: targetSet.eligibleCount,
+        targetsTruncated: targetSet.truncated,
+        hasRun: this.#advancedPartialObjectProbeHasRun,
+        message: "The browser did not grant clipboard access for the byte-free metrics.",
+        result,
+      });
+      this.log.warn("Byte-free partial-object diagnostic metrics could not be copied");
+    }
+  }
+
   async connect(mode: "catalog" | "poc" = "catalog"): Promise<void> {
     if (!this.#state.secureContext || !this.#state.webUsbAvailable) {
       this.#invalidState("A trusted HTTPS or localhost context and a WebUSB-capable Chromium browser are required");
@@ -673,6 +1004,15 @@ export class AppController {
       this.#invalidState("A Kindle connection is already active");
       return;
     }
+
+    const enableAdvancedPartialObjectProbe = this.#advancedPartialObjectProbeNextConnection;
+    this.#advancedPartialObjectProbeNextConnection = false;
+    this.#advancedPartialObjectProbeConnection = undefined;
+    this.#advancedPartialObjectProbeHasRun = false;
+    this.#advancedPartialObjectProbeResult = undefined;
+    this.#view.setAdvancedPartialObjectProbe(
+      enableAdvancedPartialObjectProbe ? { phase: "opening" } : { phase: "off" },
+    );
 
     // A raw MTP inventory is connection-scoped evidence. Retain only its
     // sanitized Last seen presentation while a new chooser/session starts.
@@ -736,7 +1076,12 @@ export class AppController {
           this.#commit({ ...this.#state, device: { kind: "mtp-reading", details } });
         },
       };
-      const connection = await this.#openDeviceWithDeadline(device, hooks, abort.signal);
+      const connection = await this.#openDeviceWithDeadline(
+        device,
+        hooks,
+        abort.signal,
+        enableAdvancedPartialObjectProbe,
+      );
       this.#pendingDevice = undefined;
       if (!this.#isDeviceEpoch(epoch, abort)) {
         await connection.disconnect().catch(() => undefined);
@@ -747,6 +1092,7 @@ export class AppController {
       // already open when another tab crashed cannot begin the automatic
       // self-test from stale in-memory state.
       this.#synchronizePendingCleanupFromStorage();
+      this.#synchronizeReplacementCleanupsFromStorage();
       if (mode === "poc") {
         const identityError = this.#connectionIdentityError(connection);
         if (identityError) {
@@ -756,6 +1102,9 @@ export class AppController {
       }
       this.#connection = connection;
       this.#connectionMode = mode;
+      if (enableAdvancedPartialObjectProbe) {
+        this.#advancedPartialObjectProbeConnection = connection;
+      }
       if (mode === "poc" && connection.identityKey) {
         this.#provenDeviceIdentityKey ??= connection.identityKey;
       }
@@ -820,12 +1169,24 @@ export class AppController {
           }
           this.#finishHardwareOperation();
         }
+        if (enableAdvancedPartialObjectProbe) {
+          this.#advancedPartialObjectProbeConnection = undefined;
+          this.#view.setAdvancedPartialObjectProbe({
+            phase: "error",
+            targets: Object.freeze([]),
+            eligibleCount: 0,
+            targetsTruncated: false,
+            hasRun: false,
+            message: "A pending cleanup prevented a clean diagnostic connection. Resolve it, disconnect, and enable the probe again.",
+          });
+        }
         return;
       }
 
       this.#hardwareBusy = true;
       try {
         await this.#runAutomaticPostConnect(epoch, connection, abort.signal);
+        if (enableAdvancedPartialObjectProbe) this.#presentAdvancedPartialObjectProbeTargets(connection);
       } finally {
         this.#finishHardwareOperation();
       }
@@ -834,6 +1195,19 @@ export class AppController {
       this.#pendingDevice = undefined;
       this.#deviceAbort = undefined;
       this.#connectionMode = undefined;
+      this.#advancedPartialObjectProbeConnection = undefined;
+      this.#advancedPartialObjectProbeHasRun = false;
+      this.#advancedPartialObjectProbeResult = undefined;
+      if (enableAdvancedPartialObjectProbe) {
+        this.#view.setAdvancedPartialObjectProbe({
+          phase: "error",
+          targets: Object.freeze([]),
+          eligibleCount: 0,
+          targetsTruncated: false,
+          hasRun: false,
+          message: "The connection did not complete. Enable the probe again for the next clean connection.",
+        });
+      }
       const error = toAppError(rawError, "Could not connect to the Kindle");
       this.log.error(error.message, errorContext(error));
       this.#commit({
@@ -872,6 +1246,7 @@ export class AppController {
     this.#pendingDevice = undefined;
     const connection = this.#connection;
     this.#connection = undefined;
+    this.#clearAdvancedPartialObjectProbeConnection();
     this.#clearCurrentCatalogInventoryAuthority();
     if (!connection) {
       this.#connectionMode = undefined;
@@ -1109,6 +1484,469 @@ export class AppController {
     );
   }
 
+  /**
+   * Browser-local, upload-first replacement orchestration. The public request
+   * carries only opaque catalog IDs and the exact UI-observed version tuple;
+   * all source, overlay, cover, and device evidence is fetched again here.
+   */
+  async updateCatalogBook(rawRequest: CatalogManagedUpdateRequest): Promise<CatalogManagedUpdateResult> {
+    let request: CatalogManagedUpdateRequest;
+    try {
+      request = normalizeCatalogManagedUpdateRequest(rawRequest);
+    } catch (error) {
+      throw new AppError("INVALID_STATE", error instanceof Error ? error.message : "The update request is invalid.");
+    }
+    if (this.#hardwareBusy) {
+      throw new AppError("INVALID_STATE", "Another Kindle operation is already running");
+    }
+    if (this.#conversionPipelineBusy) {
+      throw new AppError("CONVERSION_BUSY", "Another browser-local book conversion is already running");
+    }
+    if (this.#synchronizePendingCleanupFromStorage()) {
+      throw new AppError(
+        "INVALID_STATE",
+        "Inspect and acknowledge the interrupted Kindle object before updating a book",
+      );
+    }
+    if (this.#synchronizeReplacementCleanupsFromStorage().length > 0) {
+      throw new AppError(
+        "INVALID_STATE",
+        "Finish the verified replacement cleanup before updating another book",
+      );
+    }
+    if (this.#state.selfTest.kind !== "passed") {
+      throw new AppError(
+        "MTP_SELF_TEST_REQUIRED",
+        "Safe-write check failed. The existing Kindle copy was not changed. Reconnect and let the automatic check pass.",
+      );
+    }
+    const connection = this.#readyConnection("Connect the Kindle before updating a catalog book");
+    if (!connection || !connection.readyForSend) {
+      throw new AppError(
+        "MTP_SELF_TEST_REQUIRED",
+        "Safe-write check failed. The existing Kindle copy was not changed. Reconnect and let the automatic check pass.",
+      );
+    }
+    if (!connection.updateManagedBook) {
+      throw new AppError("INVALID_STATE", "This Kindle connection does not support guarded managed-book replacement");
+    }
+    if (request.profileId !== this.#view.activeCatalogProfileId
+      || !this.#catalogInventoryReadyForCurrentConnection(connection, request.profileId)) {
+      throw new AppError(
+        "INVALID_STATE",
+        "Update requires the active profile's complete current Kindle comparison.",
+      );
+    }
+
+    const rawInventory = this.#currentRawCatalogInventory(connection);
+    const presentedInventory = this.#catalogInventory;
+    if (rawInventory?.status !== "complete"
+      || presentedInventory?.completeness !== "complete"
+      || presentedInventory.matching?.status !== "complete") {
+      throw new AppError("INVENTORY_INCOMPLETE", "Update requires a complete current Kindle inventory and match index.");
+    }
+    const claims = presentedInventory.items.filter((item) => item.bookId === request.bookId);
+    const prior = claims.length === 1 ? claims[0] : undefined;
+    const rawPrior = prior
+      ? rawInventory.objects.find((object) => (
+          `mtp-${object.handle.toString(16).padStart(8, "0")}` === prior.id
+        ))
+      : undefined;
+    const extractedPriorToken = rawPrior ? extractManagedFilenameToken(rawPrior.filename) : undefined;
+    if (!prior
+      || !rawPrior
+      || prior.match !== "possible"
+      || prior.stalePresentation !== true
+      || prior.managed !== true
+      || this.#view.catalogKindleStatus(request.bookId) !== "possible"
+      || rawPrior.kind !== "file"
+      || rawPrior.storageId !== rawInventory.storageId
+      || rawPrior.parentHandle !== rawInventory.documentsHandle
+      || rawPrior.depth !== 1
+      || rawPrior.relativePath !== rawPrior.filename
+      || rawPrior.protectionStatus !== 0
+      || rawPrior.associationType !== 0
+      || rawPrior.metadataAdjusted
+      || !rawPrior.managedToken
+      || extractedPriorToken !== rawPrior.managedToken
+      || !isKindleReadableBookFilename(rawPrior.filename)
+      || rawPrior.filename !== prior.filename
+      || rawPrior.size !== prior.size
+      || rawPrior.size <= 0) {
+      throw new AppError(
+        "OLD_COPY_NOT_MANAGED",
+        claims.length > 1
+          ? "More than one Kindle object claims this book. Resolve the ambiguity before updating."
+          : "Update requires exactly one current prior KindleBridge-managed presentation. Possible or manual-only files cannot be replaced.",
+      );
+    }
+
+    const comparedVersion = this.#catalogReconciledVersions.get(`${request.profileId}\u0000${request.bookId}`);
+    if (!comparedVersion
+      || comparedVersion.contentHash !== request.expectedContentHash
+      || comparedVersion.presentationVersion !== request.expectedPresentationVersion) {
+      throw new AppError(
+        "CATALOG_SOURCE_CHANGED",
+        "The requested source or presentation differs from the current Kindle comparison. Refresh before updating.",
+      );
+    }
+
+    const oldEvidence: KindleManagedOldCopyEvidence = {
+      handle: rawPrior.handle,
+      filename: rawPrior.filename,
+      byteLength: rawPrior.size,
+      managedToken: rawPrior.managedToken,
+    };
+    const epoch = this.#deviceEpoch;
+    const signal = this.#deviceAbort?.signal;
+    const operationId = `update-${globalThis.crypto?.randomUUID?.()
+      ?? `${Math.max(0, Math.floor(this.#dependencies.now())).toString(36)}-${(++this.#artifactSequence).toString(36)}`}`;
+    this.#hardwareBusy = true;
+    this.#conversionPipelineBusy = true;
+    this.#lastProgressRender = 0;
+    this.#view.setCatalogTransferUpdate({
+      phase: "preparing",
+      progress: 0,
+      message: "Rechecking the edited EPUB and its current overlay",
+    });
+
+    let verifiedDelivery: Parameters<KindleManagedUpdateOptions["recordVerifiedDelivery"]>[0] | undefined;
+    let deliveryDurability: "none" | "journal" | "server" | "journal-and-server" = "none";
+    let reconciliationComplete = false;
+    try {
+      if (!this.#catalogApi.getBookMetadata) {
+        throw new AppError("INVALID_STATE", "This catalog service cannot provide metadata overlays for a guarded update.");
+      }
+      const book = await this.#withCatalogDeadline(
+        (catalogSignal) => this.#catalogApi.getBook(request.profileId, request.bookId, catalogSignal),
+        this.#dependencies.preUploadCatalogTimeoutMs ?? DEFAULT_PRE_UPLOAD_CATALOG_TIMEOUT_MS,
+        "update-book-before",
+        signal,
+      );
+      this.#assertConnectionCurrent(epoch, connection, signal);
+      assertCatalogManagedUpdateBook(book, request, "before");
+      const metadata = await this.#withCatalogDeadline(
+        (catalogSignal) => this.#catalogApi.getBookMetadata!(request.profileId, request.bookId, catalogSignal),
+        this.#dependencies.preUploadCatalogTimeoutMs ?? DEFAULT_PRE_UPLOAD_CATALOG_TIMEOUT_MS,
+        "update-metadata-before",
+        signal,
+      );
+      this.#assertConnectionCurrent(epoch, connection, signal);
+      assertCatalogManagedUpdateMetadata(metadata, request, "before");
+
+      let cover: Blob | undefined;
+      let coverHash: string | undefined;
+      if (metadata.coverOverride) {
+        if (!this.#catalogApi.getBookCover) {
+          throw new AppError("INVALID_STATE", "This catalog service cannot provide the edited cover for a guarded update.");
+        }
+        cover = await this.#withCatalogDeadline(
+          (catalogSignal) => this.#catalogApi.getBookCover!(request.profileId, request.bookId, catalogSignal),
+          this.#dependencies.preUploadCatalogTimeoutMs ?? DEFAULT_PRE_UPLOAD_CATALOG_TIMEOUT_MS,
+          "update-cover-before",
+          signal,
+        );
+        this.#assertConnectionCurrent(epoch, connection, signal);
+        if (cover.size !== metadata.coverOverride.byteLength || cover.type !== metadata.coverOverride.mediaType) {
+          throw new AppError("CATALOG_SOURCE_CHANGED", "The edited cover no longer matches its catalog revision.");
+        }
+        coverHash = await sha256CatalogUpdateBlob(cover);
+      } else if (book.coverEdited === true) {
+        throw new AppError("CATALOG_SOURCE_CHANGED", "The edited cover record is unavailable.");
+      }
+
+      const source = await this.#withCatalogDeadline(
+        (catalogSignal) => this.#catalogApi.getBookSource(request.profileId, request.bookId, catalogSignal),
+        this.#dependencies.sourceDownloadTimeoutMs
+          ?? this.#dependencies.preUploadCatalogTimeoutMs
+          ?? DEFAULT_SOURCE_DOWNLOAD_TIMEOUT_MS,
+        "update-source-before",
+        signal,
+      );
+      this.#assertConnectionCurrent(epoch, connection, signal);
+      assertCatalogManagedUpdateSource(source, book, request, "before");
+      const overrides: ConversionOverrides = {
+        ...metadata.overrides,
+        ...(cover && metadata.coverOverride ? {
+          cover: { blob: cover, mediaType: metadata.coverOverride.mediaType },
+        } : {}),
+      };
+      const prepared = await prepareCatalogArtifact(book, source.blob, {
+        signal,
+        convertEpub: this.#dependencies.convert,
+        overrides,
+        onPhase: (phase) => {
+          if (phase === "preparing") {
+            this.#view.setCatalogTransferUpdate({
+              phase: "preparing",
+              progress: 3,
+              message: "Verifying the immutable EPUB copy and SHA-256",
+            });
+          } else if (phase === "converting") {
+            this.#view.setCatalogTransferUpdate({
+              phase: "converting",
+              progress: 10,
+              message: "Applying the overlay to a temporary EPUB and converting locally",
+            });
+          } else if (phase === "validating") {
+            this.#view.setCatalogTransferUpdate({
+              phase: "validating",
+              progress: 20,
+              message: "Validating the Kindle PDOC derivative",
+            });
+          }
+        },
+      });
+      this.#assertConnectionCurrent(epoch, connection, signal);
+      if (prepared.sourceFormat !== "EPUB"
+        || !prepared.converted
+        || !prepared.overridesApplied
+        || prepared.kindleDocumentType !== "PDOC"
+        || prepared.sourceHash !== request.expectedContentHash) {
+        throw new AppError("INVALID_UPDATE_ARTIFACT", "The edited EPUB did not produce the required validated PDOC derivative.");
+      }
+
+      // Repeat every mutable catalog binding after the potentially expensive
+      // conversion. This second source is hashed independently; an unchanged
+      // card or metadata revision alone cannot authorize device mutation.
+      const currentBook = await this.#withCatalogDeadline(
+        (catalogSignal) => this.#catalogApi.getBook(request.profileId, request.bookId, catalogSignal),
+        this.#dependencies.preUploadCatalogTimeoutMs ?? DEFAULT_PRE_UPLOAD_CATALOG_TIMEOUT_MS,
+        "update-book-after",
+        signal,
+      );
+      this.#assertConnectionCurrent(epoch, connection, signal);
+      assertCatalogManagedUpdateBook(currentBook, request, "after");
+      const currentMetadata = await this.#withCatalogDeadline(
+        (catalogSignal) => this.#catalogApi.getBookMetadata!(request.profileId, request.bookId, catalogSignal),
+        this.#dependencies.preUploadCatalogTimeoutMs ?? DEFAULT_PRE_UPLOAD_CATALOG_TIMEOUT_MS,
+        "update-metadata-after",
+        signal,
+      );
+      this.#assertConnectionCurrent(epoch, connection, signal);
+      assertCatalogManagedUpdateMetadata(currentMetadata, request, "after");
+      if (JSON.stringify(currentMetadata.coverOverride) !== JSON.stringify(metadata.coverOverride)) {
+        throw new AppError("CATALOG_SOURCE_CHANGED", "The edited cover identity changed during replacement preparation.");
+      }
+      if (coverHash !== undefined) {
+        const currentCover = await this.#withCatalogDeadline(
+          (catalogSignal) => this.#catalogApi.getBookCover!(request.profileId, request.bookId, catalogSignal),
+          this.#dependencies.preUploadCatalogTimeoutMs ?? DEFAULT_PRE_UPLOAD_CATALOG_TIMEOUT_MS,
+          "update-cover-after",
+          signal,
+        );
+        this.#assertConnectionCurrent(epoch, connection, signal);
+        if (currentCover.size !== cover?.size
+          || currentCover.type !== cover?.type
+          || await sha256CatalogUpdateBlob(currentCover) !== coverHash) {
+          throw new AppError("CATALOG_SOURCE_CHANGED", "The edited cover bytes changed during replacement preparation.");
+        }
+      }
+      const currentSource = await this.#withCatalogDeadline(
+        (catalogSignal) => this.#catalogApi.getBookSource(request.profileId, request.bookId, catalogSignal),
+        this.#dependencies.sourceDownloadTimeoutMs
+          ?? this.#dependencies.preUploadCatalogTimeoutMs
+          ?? DEFAULT_SOURCE_DOWNLOAD_TIMEOUT_MS,
+        "update-source-after",
+        signal,
+      );
+      this.#assertConnectionCurrent(epoch, connection, signal);
+      assertCatalogManagedUpdateSource(currentSource, currentBook, request, "after");
+      if (await sha256CatalogUpdateBlob(currentSource.blob) !== request.expectedContentHash) {
+        throw new AppError("CATALOG_SOURCE_CHANGED", "The EPUB source bytes changed during replacement preparation.");
+      }
+      this.#assertConnectionCurrent(epoch, connection, signal);
+
+      const managedToken = await createManagedFilenameToken(request.bookId, request.expectedPresentationVersion);
+      if (managedToken === oldEvidence.managedToken) {
+        throw new AppError("INVALID_UPDATE_ARTIFACT", "The edited presentation did not produce a new managed identity.");
+      }
+      this.#view.setCatalogTransferUpdate({
+        phase: "validating",
+        progress: 23,
+        message: `Ready to replace ${oldEvidence.filename} with ${prepared.filename}`,
+      });
+      const deviceResult = await connection.updateManagedBook({
+        blob: prepared.blob,
+        originalFilename: prepared.filename,
+        artifactHash: prepared.artifactHash,
+        managedToken,
+        sourceFormat: "epub",
+        hasPresentationEdits: true,
+      }, oldEvidence, {
+        operationId,
+        transfer: {
+          signal,
+          aggregateTimeoutMs: this.#dependencies.sendOperationTimeoutMs
+            ?? bookTransferCommandTimeoutMs(prepared.blob.size),
+          commandTimeoutMs: bookTransferCommandTimeoutMs(prepared.blob.size),
+          inactivityTimeoutMs: 10_000,
+          onObjectState: this.#objectStateHandler("catalog", operationId, connection.details),
+          onProgress: ({ bytesTransferred, totalBytes }) => {
+            if (!this.#isActiveConnection(epoch, connection)) return;
+            const now = this.#dependencies.now();
+            if (bytesTransferred !== totalBytes && now - this.#lastProgressRender < 100) return;
+            this.#lastProgressRender = now;
+            const ratio = totalBytes === 0 ? 1 : bytesTransferred / totalBytes;
+            this.#view.setCatalogTransferUpdate({
+              phase: bytesTransferred === totalBytes ? "verifying" : "sending",
+              progress: Math.round(35 + 45 * ratio),
+              message: bytesTransferred === totalBytes
+                ? "Replacement uploaded; verifying its exact MTP object"
+                : `Uploading replacement: ${bytesTransferred.toLocaleString()} of ${totalBytes.toLocaleString()} bytes`,
+            });
+          },
+        },
+        inventory: {
+          signal,
+          aggregateTimeoutMs:
+            this.#dependencies.postUploadInventoryTimeoutMs ?? DEFAULT_POST_UPLOAD_INVENTORY_TIMEOUT_MS,
+          deviceMetadataCache: "read-write",
+          onObjectState: this.#objectStateHandler("metadata-cache", undefined, connection.details),
+        },
+        replacementCleanupStorage: this.#dependencies.replacementCleanupStorage,
+        onStage: (stage) => {
+          if (this.#isActiveConnection(epoch, connection)) {
+            this.#view.setCatalogTransferUpdate(catalogManagedUpdateStagePresentation(stage));
+          }
+        },
+        recordVerifiedDelivery: async (delivery) => {
+          this.#assertConnectionCurrent(epoch, connection, signal);
+          verifiedDelivery = delivery;
+          const record: CreateDeliveryInput = {
+            profileId: request.profileId,
+            bookId: request.bookId,
+            deviceKey: connection.identityKey ?? "unidentified-device",
+            status: "delivered",
+            artifactHash: delivery.artifactHash,
+            filename: delivery.transfer.filename,
+            size: delivery.transfer.size,
+            managedToken: delivery.managedToken,
+            ...(delivery.exactIdentity.length <= 256 ? { objectIdentity: delivery.exactIdentity } : {}),
+          };
+          const provisionalInventory = this.#inventoryAfterVerifiedTransfer(
+            rawInventory,
+            delivery.transfer,
+            delivery.managedToken,
+          );
+          await this.#installVerifiedTransferFallback(
+            epoch,
+            request.profileId,
+            book,
+            prepared.sourceHash,
+            request.expectedPresentationVersion,
+            provisionalInventory,
+            connection,
+            record,
+          );
+          const journaled = await queuePendingDelivery({
+            version: 1,
+            operationId,
+            delivery: record,
+            recordedAt: Math.max(0, Math.floor(this.#dependencies.now())),
+          });
+          if (journaled) deliveryDurability = "journal";
+          try {
+            await this.#withPostUploadCatalogDeadline((catalogSignal) => (
+              this.#catalogApi.createDelivery(record, operationId, catalogSignal)
+            ));
+            deliveryDurability = journaled ? "journal-and-server" : "server";
+            if (journaled) await acknowledgePendingDelivery(operationId);
+          } catch (error) {
+            if (!journaled) throw error;
+            // The exact idempotent record remains durable for startup retry.
+          }
+        },
+        reconcile: async (inventory) => {
+          this.#assertConnectionCurrent(epoch, connection, signal);
+          const reconciliation = await this.#withPostUploadCatalogDeadline((catalogSignal) => (
+            this.#reconcileCatalogInventory(inventory, connection, catalogSignal)
+          ));
+          if (!reconciliation.activeProfileComplete) {
+            throw new AppError("CATALOG_REQUEST_FAILED", "The final active-profile match index was unavailable.");
+          }
+          reconciliationComplete = true;
+        },
+      });
+
+      if (deviceResult.cleanupRecord) this.#synchronizeReplacementCleanupsFromStorage();
+
+      if (this.#isActiveConnection(epoch, connection)) {
+        if (deviceResult.inventory && !reconciliationComplete) {
+          await this.#presentInventoryWithoutCatalogMatches(deviceResult.inventory, connection);
+        } else if (!deviceResult.inventory && verifiedDelivery) {
+          const knownPrevious = deviceResult.status === "updated-reconciliation-required"
+            ? {
+              ...rawInventory,
+              objects: rawInventory.objects.filter((object) => object.handle !== oldEvidence.handle),
+            }
+            : deviceResult.status === "new-copy-kept-old-recording-required"
+              ? rawInventory
+              : undefined;
+          if (knownPrevious) {
+            await this.#presentInventoryWithoutCatalogMatches(
+              this.#inventoryAfterVerifiedTransfer(
+                knownPrevious,
+                verifiedDelivery.transfer,
+                verifiedDelivery.managedToken,
+              ),
+              connection,
+            );
+          } else {
+            this.#clearCurrentCatalogInventoryAuthority();
+            this.#markCatalogInventoryLastSeen();
+            this.#commit({ ...this.#state, catalogInventoryState: "failed" });
+          }
+        }
+        if (deviceResult.status !== "updated") {
+          // Accurate evidence may remain visible, but no non-success outcome
+          // keeps mutation authority or causes a queued request to be removed.
+          this.#catalogInventoryEpoch = undefined;
+          this.#catalogReadyProfileIds.clear();
+          this.#catalogReconciledVersions.clear();
+          this.#commit({ ...this.#state, catalogInventoryState: "failed" });
+        }
+      }
+
+      const result = catalogManagedUpdateResult({
+        operationId,
+        status: deviceResult.status,
+        priorFilename: oldEvidence.filename,
+        replacementFilename: deviceResult.newCopy.filename,
+        reconciliationComplete,
+        cleanupRecordPersisted: deviceResult.cleanupRecord !== undefined,
+      });
+      this.#view.setCatalogTransferUpdate({
+        phase: result.status === "updated" ? "complete" : "failed",
+        progress: 100,
+        message: result.message,
+      });
+      this.log.info("Catalog managed update finished", {
+        profileId: request.profileId,
+        bookId: request.bookId,
+        status: result.status,
+        queueDisposition: result.queueDisposition,
+        deliveryDurability,
+        reconciliationComplete,
+        replacementCleanupReminder: result.replacementCleanupReminder,
+      });
+      return result;
+    } catch (rawError) {
+      const error = toAppError(rawError, "The Kindle copy could not be updated");
+      this.#view.setCatalogTransferUpdate({ phase: "failed", message: error.message });
+      this.log.error(error.message, errorContext(error));
+      const connectionFaulted = this.#connection === connection && (
+        (rawError !== null && typeof rawError === "object" && Reflect.get(rawError, "fatal") === true)
+        || !connection.readyForSend
+      );
+      if (connectionFaulted) await this.#retireFaultedConnection(connection, error);
+      throw error;
+    } finally {
+      this.#conversionPipelineBusy = false;
+      this.#finishHardwareOperation();
+    }
+  }
+
   async sendCatalogBook(request: CatalogSendRequest): Promise<void> {
     if (this.#hardwareBusy) {
       throw new AppError("INVALID_STATE", "Another Kindle operation is already running");
@@ -1121,6 +1959,12 @@ export class AppController {
       throw new AppError(
         "INVALID_STATE",
         "Inspect and acknowledge the interrupted Kindle object before sending another book",
+      );
+    }
+    if (this.#synchronizeReplacementCleanupsFromStorage().length > 0) {
+      throw new AppError(
+        "INVALID_STATE",
+        "Finish the verified replacement cleanup before sending another book",
       );
     }
     if (this.#state.selfTest.kind !== "passed") {
@@ -1700,6 +2544,12 @@ export class AppController {
         "Inspect and acknowledge the interrupted Kindle object before removing books",
       );
     }
+    if (this.#synchronizeReplacementCleanupsFromStorage().length > 0) {
+      throw new AppError(
+        "INVALID_STATE",
+        "Finish the verified replacement cleanup before removing other books",
+      );
+    }
     if (this.#state.selfTest.kind !== "passed") {
       throw new AppError(
         "MTP_SELF_TEST_REQUIRED",
@@ -1979,6 +2829,105 @@ export class AppController {
     }
   }
 
+  async cleanupManagedReplacement(operationId: string): Promise<void> {
+    if (this.#hardwareBusy || this.#conversionPipelineBusy) {
+      this.#invalidState("Wait for the current Kindle operation to finish before cleaning up a replacement");
+      return;
+    }
+    if (this.#synchronizePendingCleanupFromStorage()) {
+      this.#invalidState("Resolve the interrupted Kindle write before cleaning up a replacement");
+      return;
+    }
+    const durable = this.#synchronizeReplacementCleanupsFromStorage();
+    const record = durable.find((candidate) => candidate.operationId === operationId);
+    if (!record) {
+      this.#invalidState("The selected replacement cleanup task changed or was already resolved");
+      return;
+    }
+    if (this.#state.selfTest.kind !== "passed" || this.#state.catalogInventoryState !== "ready") {
+      this.#invalidState("Connect this Kindle and finish its safe-write and inventory checks before cleanup");
+      return;
+    }
+    const connection = this.#readyConnection("Connect the matching Kindle before cleaning up its prior copy");
+    if (!connection?.cleanupManagedReplacement) {
+      this.#invalidState("This Kindle connection does not support guarded replacement cleanup");
+      return;
+    }
+
+    const epoch = this.#deviceEpoch;
+    const signal = this.#deviceAbort?.signal;
+    this.#hardwareBusy = true;
+    this.#commit({
+      ...this.#state,
+      device: { kind: "recovering", details: connection.details },
+      catalogInventoryState: "loading",
+      activeError: undefined,
+    });
+    try {
+      const result = await connection.cleanupManagedReplacement(record, {
+        operation: {
+          signal,
+          aggregateTimeoutMs: this.#dependencies.removeOperationTimeoutMs
+            ?? DEFAULT_REMOVE_OPERATION_TIMEOUT_MS,
+        },
+        inventory: {
+          signal,
+          aggregateTimeoutMs: this.#dependencies.postUploadInventoryTimeoutMs
+            ?? DEFAULT_POST_UPLOAD_INVENTORY_TIMEOUT_MS,
+          deviceMetadataCache: "read-only",
+        },
+      });
+      this.#assertConnectionCurrent(epoch, connection, signal);
+      if (!acknowledgeReplacementCleanupRecord(record, this.#dependencies.replacementCleanupStorage)) {
+        throw new AppError(
+          "INVALID_STATE",
+          "The exact cleanup was verified, but its browser recovery record changed or could not be cleared. Leave the Kindle connected and retry this action.",
+        );
+      }
+      const remaining = readReplacementCleanupRecords(this.#dependencies.replacementCleanupStorage);
+      this.#commit({
+        ...this.#state,
+        pendingReplacementCleanups: remaining,
+        device: { kind: "ready", details: connection.details },
+        activeError: undefined,
+      });
+      try {
+        await this.#withPostUploadCatalogDeadline((catalogSignal) => (
+          this.#reconcileCatalogInventory(result.inventory, connection, catalogSignal)
+        ));
+      } catch (error) {
+        await this.#presentInventoryWithoutCatalogMatches(result.inventory, connection);
+        this.log.warn("Replacement cleanup succeeded, but catalog matching could not be refreshed", {
+          code: errorContext(toAppError(error)).code,
+        });
+      }
+      this.log.info(
+        result.status === "cleaned"
+          ? "Exact prior managed copy removed and absence verified"
+          : result.status === "rolled-back"
+            ? "Unrecorded replacement removed and prior managed copy retained"
+            : "Cleanup target was already absent and the cleanup was resolved",
+        { operationId: record.operationId, remainingCleanups: remaining.length },
+      );
+    } catch (rawError) {
+      const error = toAppError(rawError, "The exact replacement cleanup could not be completed");
+      this.#synchronizeReplacementCleanupsFromStorage();
+      this.log.error(error.message, errorContext(error));
+      if (isFatalInventoryError(rawError)) {
+        await this.#retireFaultedConnection(connection, error);
+      } else if (this.#isActiveConnection(epoch, connection)) {
+        this.#commit({
+          ...this.#state,
+          device: { kind: "ready", details: connection.details },
+          catalogInventoryState: connection.latestInventory?.status === "complete" ? "ready" : "failed",
+          activeError: error,
+        });
+      }
+    } finally {
+      this.#finishHardwareOperation();
+    }
+  }
+
   async copyLog(): Promise<void> {
     try {
       await this.#dependencies.copyText(this.log.format());
@@ -2002,6 +2951,10 @@ export class AppController {
     }
     if (this.#synchronizePendingCleanupFromStorage()) {
       this.#invalidState("Inspect and acknowledge the previously interrupted managed object before any new Kindle write");
+      return;
+    }
+    if (this.#synchronizeReplacementCleanupsFromStorage().length > 0) {
+      this.#invalidState("Finish the verified replacement cleanup before sending another book");
       return;
     }
     const connection = this.#readyConnection("Reconnect the Kindle before sending a book");
@@ -2509,6 +3462,13 @@ export class AppController {
     const reconciled = await reconcileCatalogIndexes(indexes, inventory, {
       deviceLabel: connection.details.model ?? connection.details.productName ?? "Connected Kindle",
       deviceKey: connection.identityKey,
+      ...(connection.identityKey ? {
+        deviceIdentity: {
+          key: connection.identityKey,
+          stability: connection.identityKeyStability ?? "session",
+        },
+        manualMatchDecisions: this.#manualMatchDecisions,
+      } : {}),
       scannedAt: new Date(this.#dependencies.now()),
       metadataClaimScopeComplete: indexes.every((index) => index.metadataClaims?.complete === true),
     });
@@ -2541,6 +3501,7 @@ export class AppController {
         presentationVersion: (entry.presentationVersion ?? entry.contentHash).toLocaleLowerCase("en-US"),
       },
     ] as const)));
+    this.#manualMatchEvidence = new Map(reconciled.manualMatchEvidence);
     this.#view.setCatalogKindleStatuses(reconciled.statuses, reconciled.statusCountsByProfile);
     this.#view.setCatalogKindleInventory(presentedInventory);
     const comparisonReady = presentedInventory.matching.status !== "unavailable";
@@ -2578,10 +3539,62 @@ export class AppController {
     );
   }
 
+  #presentAdvancedPartialObjectProbeTargets(connection: ConnectedKindlePort): void {
+    const targetSet = advancedPartialObjectProbeTargets(connection.latestInventory);
+    const base = {
+      targets: targetSet.targets,
+      eligibleCount: targetSet.eligibleCount,
+      targetsTruncated: targetSet.truncated,
+    } as const;
+    if (
+      connection !== this.#connection
+      || connection.closed
+      || connection !== this.#advancedPartialObjectProbeConnection
+      || this.#state.selfTest.kind !== "passed"
+      || connection.latestInventory?.status !== "complete"
+    ) {
+      this.#view.setAdvancedPartialObjectProbe({
+        phase: "error",
+        targets: Object.freeze([]),
+        eligibleCount: 0,
+        targetsTruncated: false,
+        hasRun: this.#advancedPartialObjectProbeHasRun,
+        message: "The diagnostic needs a clean connection, passed byte test, and complete live inventory.",
+      });
+      return;
+    }
+    if (!kindleAdvertisesPartialObject(connection.details.operationsSupported)) {
+      this.#view.setAdvancedPartialObjectProbe({
+        phase: "error",
+        targets: Object.freeze([]),
+        eligibleCount: 0,
+        targetsTruncated: false,
+        hasRun: false,
+        message: "This device does not advertise GetPartialObject (0x101b). No probe was run.",
+      });
+      return;
+    }
+    this.#view.setAdvancedPartialObjectProbe({
+      phase: "available",
+      ...base,
+      hasRun: this.#advancedPartialObjectProbeHasRun,
+    });
+  }
+
+  #clearAdvancedPartialObjectProbeConnection(): void {
+    this.#advancedPartialObjectProbeConnection = undefined;
+    this.#advancedPartialObjectProbeHasRun = false;
+    this.#advancedPartialObjectProbeResult = undefined;
+    this.#view.setAdvancedPartialObjectProbe(
+      this.#advancedPartialObjectProbeNextConnection ? { phase: "armed" } : { phase: "off" },
+    );
+  }
+
   async #openDeviceWithDeadline(
     device: UsbDeviceLike,
     hooks: DeviceRuntimeHooks,
     parentSignal: AbortSignal,
+    enableAdvancedPartialObjectProbe = false,
   ): Promise<ConnectedKindlePort> {
     parentSignal.throwIfAborted();
     const controller = new AbortController();
@@ -2614,6 +3627,7 @@ export class AppController {
       device,
       guardedHooks,
       controller.signal,
+      { enableDevelopmentPartialObjectProbe: enableAdvancedPartialObjectProbe },
     ).then(
       (connection) => {
         if (!retired) return connection;
@@ -2705,6 +3719,41 @@ export class AppController {
       if (timeoutId !== undefined) clearTimeout(timeoutId);
       removeParentAbort();
     }
+  }
+
+  async #applyManualMatchDecision(request: {
+    readonly profileId: string;
+    readonly bookId: string;
+    readonly itemId: string;
+    readonly decision: "same-book" | "not-this-book" | "undo";
+  }): Promise<void> {
+    const connection = this.#connection;
+    if (!connection
+      || connection.closed
+      || this.#hardwareBusy
+      || !this.#catalogInventoryReadyForCurrentConnection(connection, request.profileId)) {
+      throw new AppError("CATALOG_REQUEST_FAILED", "Reconnect and complete the current Kindle comparison before saving this choice");
+    }
+    const item = this.#catalogInventory?.items.find(({ id }) => id === request.itemId);
+    if (!item?.candidates?.some(({ profileId, bookId }) =>
+      profileId === request.profileId && bookId === request.bookId)) {
+      throw new AppError("CATALOG_REQUEST_FAILED", "This match candidate is no longer present in the current Kindle inventory");
+    }
+    const evidence = this.#manualMatchEvidence.get(
+      manualMatchEvidenceKey(request.profileId, request.bookId, request.itemId),
+    );
+    if (!evidence) {
+      throw new AppError("CATALOG_REQUEST_FAILED", "This Kindle file does not have complete exact evidence for a saved choice");
+    }
+    if (request.decision === "undo") {
+      await this.#manualMatchDecisions.forget(evidence);
+    } else {
+      const saved = await this.#manualMatchDecisions.remember(evidence, request.decision);
+      if (!saved) {
+        throw new AppError("CATALOG_REQUEST_FAILED", "The match choice could not be stored safely in this browser");
+      }
+    }
+    await this.#queueConnectedCatalogReconciliation();
   }
 
   #queueConnectedCatalogReconciliation(): Promise<void> {
@@ -2935,11 +3984,34 @@ export class AppController {
     return durable;
   }
 
+  #synchronizeReplacementCleanupsFromStorage(): readonly ReplacementCleanupRecord[] {
+    const read = readReplacementCleanupJournal(this.#dependencies.replacementCleanupStorage);
+    const current = this.#state.pendingReplacementCleanups ?? [];
+    if (read.status !== "ok") {
+      if (current.length > 0) {
+        this.log.warn("Replacement cleanup journal could not be re-read; Kindle writes remain blocked", {
+          journalStatus: read.status,
+          pendingCount: current.length,
+        });
+      }
+      return current;
+    }
+    if (JSON.stringify(current) === JSON.stringify(read.records)) return current;
+    this.#commit({ ...this.#state, pendingReplacementCleanups: read.records });
+    if (read.records.length > 0) {
+      this.log.warn("Verified replacement cleanup now blocks unrelated Kindle writes", {
+        pendingCount: read.records.length,
+      });
+    }
+    return read.records;
+  }
+
   #clearCurrentCatalogInventoryAuthority(): void {
     this.#rawCatalogInventory = undefined;
     this.#catalogInventoryEpoch = undefined;
     this.#catalogReadyProfileIds.clear();
     this.#catalogReconciledVersions.clear();
+    this.#manualMatchEvidence.clear();
   }
 
   #currentRawCatalogInventory(connection: ConnectedKindlePort): KindleInventorySnapshot | undefined {
@@ -3017,6 +4089,7 @@ export class AppController {
     this.#pendingDevice = undefined;
     this.#connection = undefined;
     this.#connectionMode = undefined;
+    this.#clearAdvancedPartialObjectProbeConnection();
     this.#clearCurrentCatalogInventoryAuthority();
     this.#catalogEventReconciliationQueued = false;
 
@@ -3230,6 +4303,7 @@ export class AppController {
     if (this.#connection !== connection) return;
     const epoch = this.#deviceEpoch;
     this.#connection = undefined;
+    this.#clearAdvancedPartialObjectProbeConnection();
     this.#clearCurrentCatalogInventoryAuthority();
     try {
       if (error.code === "USB_DEVICE_DISCONNECTED") {

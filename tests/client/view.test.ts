@@ -51,6 +51,29 @@ describe("AppView", () => {
     expect(root.querySelector<HTMLButtonElement>('button[data-action="connect"]')?.disabled).toBe(true);
   });
 
+  it("mounts the default-off partial-object diagnostic only inside Advanced activity controls", () => {
+    const root = document.createElement("div");
+    const onArm = vi.fn();
+    const view = new AppView(
+      root,
+      { ...initialAppState(), secureContext: true, webUsbAvailable: true },
+      { ...handlers(), onAdvancedPartialObjectProbeArm: onArm },
+      new DebugLog(),
+      { autoStartCatalog: false },
+    );
+
+    root.querySelector<HTMLButtonElement>('[data-ui-action="open-activity-center"]')?.click();
+    const mount = root.querySelector<HTMLElement>("[data-ui-partial-object-probe]");
+    expect(mount?.dataset.phase).toBe("off");
+    expect(mount?.textContent).toContain("not part of normal inventory");
+    mount?.querySelector<HTMLButtonElement>('[data-ui-action="arm-partial-object-probe"]')?.click();
+    expect(onArm).toHaveBeenCalledOnce();
+
+    view.setAdvancedPartialObjectProbe({ phase: "armed" });
+    expect(root.querySelector<HTMLElement>("[data-ui-partial-object-probe]")?.textContent)
+      .toContain("next clean connection");
+  });
+
   it("enables connection after a locally validated conversion", () => {
     const root = document.createElement("div");
     new AppView(root, {
@@ -191,6 +214,55 @@ describe("AppView", () => {
     expect(root.querySelector(".recovery-notice")?.textContent).toContain(
       "Inspect the Kindle storage root",
     );
+  });
+
+  it("surfaces every replacement cleanup and wires only durably recorded cleanup", () => {
+    const root = document.createElement("div");
+    const callbacks = { ...handlers(), onReplacementCleanupRequested: vi.fn() };
+    const cleanupObject = (handle: number, token: string, filename: string) => ({
+      handle,
+      storageId: 1,
+      parentHandle: 2,
+      filename,
+      byteLength: 123,
+      managedToken: token,
+      exactIdentity: `exact-${handle}`,
+    });
+    new AppView(root, {
+      ...initialAppState(),
+      device: { kind: "ready", details: { vendorId: 0x1949, productId: 0x9981 } },
+      selfTest: { kind: "passed", byteLength: 1012 },
+      catalogInventoryState: "ready",
+      pendingReplacementCleanups: [{
+        version: 1,
+        operationId: "cleanup-one",
+        recordedAt: 1,
+        vendorId: 0x1949,
+        productId: 0x9981,
+        reason: "old-copy-cleanup",
+        oldCopy: cleanupObject(10, "kb-0123456789abcdefabcd", "Old-kb-0123456789abcdefabcd.azw3"),
+        newCopy: cleanupObject(20, "kb-fedcba9876543210abcd", "New-kb-fedcba9876543210abcd.azw3"),
+      }, {
+        version: 1,
+        operationId: "delivery-one",
+        recordedAt: 2,
+        vendorId: 0x1949,
+        productId: 0x9981,
+        reason: "delivery-recording",
+        oldCopy: cleanupObject(30, "kb-11111111111111111111", "Old-kb-11111111111111111111.azw3"),
+        newCopy: cleanupObject(40, "kb-22222222222222222222", "New-kb-22222222222222222222.azw3"),
+      }],
+    }, callbacks, new DebugLog(), { autoStartCatalog: false });
+
+    const notices = root.querySelectorAll('[data-action="cleanup-managed-replacement"]');
+    expect(notices).toHaveLength(2);
+    const cleanup = root.querySelector<HTMLButtonElement>('[data-cleanup-operation-id="cleanup-one"]');
+    const delivery = root.querySelector<HTMLButtonElement>('[data-cleanup-operation-id="delivery-one"]');
+    expect(cleanup?.disabled).toBe(false);
+    expect(delivery?.disabled).toBe(false);
+    expect(delivery?.textContent).toContain("Remove unrecorded replacement");
+    cleanup?.click();
+    expect(callbacks.onReplacementCleanupRequested).toHaveBeenCalledWith("cleanup-one");
   });
 
   it("forwards the conversion action", () => {

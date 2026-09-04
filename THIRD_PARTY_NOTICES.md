@@ -50,3 +50,37 @@ base, downstream behavior, exact toolchain, build command, checksums, and
 license are recorded so the artifact remains auditable and reproducible. boko
 is provided without warranty under the terms of the GNU General Public License
 version 3 or later.
+
+## Calibre KFX format reference
+
+- Project: <https://github.com/kovidgoyal/calibre>
+- Source revision: `2601151d9233e8312b4e307222a9b3b05e2729bd`
+- Reference files: `src/calibre/ebooks/metadata/kfx.py` and
+  `src/calibre/devices/mtp/driver.py`
+- Copyright: Kovid Goyal and John Howell, with KFX reverse-engineering credit
+  recorded in the upstream source
+- License: GPL-3.0
+
+Kindle Bridge's separately written, bounded TypeScript reader uses Calibre's
+published descriptions of the CONT/ENTY/PackedIon framing, matching-relevant
+property numbers, and exact `<book stem>.sdr/assets/metadata.kfx` convention.
+It does not include or depend on Calibre at runtime, does not parse general KFX
+book content, and is distributed under Kindle Bridge's GPL-3.0 license.
+
+## KRDS reading-sidecar format reference
+
+- Project: <https://github.com/K-R-D-S/KRDS>
+- Source revision: `9c8a0b0ec9cb6af72fba900a6f9b09f92de477de`
+- Reference file: `krds.py`
+- Copyright: 2019 John Howell; the referenced revision also records later
+  contributor additions
+- License: GPL-3.0
+- Supplemental observed-format documentation:
+  <https://github.com/zevisvei/kindle-reading-dashboard/blob/main/docs/KRDS-format.md>
+
+Kindle Bridge's separately written bounded TypeScript reader uses the published
+KRDS signature, primitive/object framing, `timer.model`, and `lpr` structure
+descriptions. It retains only a validated percentage and last-read timestamp,
+never annotation text, positions, history, or arbitrary decoded objects. It has
+no KRDS runtime dependency and is distributed under Kindle Bridge's GPL-3.0
+license.

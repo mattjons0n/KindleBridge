@@ -2,7 +2,7 @@
 
 import { describe, expect, it } from "vitest";
 import { reconcileCatalogIndexes, asLastSeenInventory } from "../../client/src/catalog-reconciliation";
-import { createManagedFilenameToken, type KindleInventorySnapshot } from "../../client/src/kindle";
+import { createKindleManualMatchDecisionStore, createManagedFilenameToken, type KindleInventorySnapshot } from "../../client/src/kindle";
 import type { CatalogMatchIndex } from "../../client/src/catalog-client";
 import { METADATA_CLAIM_BITMAP_BYTES } from "../../shared/catalog-contracts";
 
@@ -95,6 +95,109 @@ async function inventory(bookId: string, status: "complete" | "partial" = "compl
 }
 
 describe("catalog/Kindle reconciliation", () => {
+  it("applies a manual same-book choice only to one unchanged candidate in a complete inventory", async () => {
+    const base = await inventory("another-book");
+    const possible: KindleInventorySnapshot = {
+      ...base,
+      objects: [{
+        ...base.objects[1]!,
+        filename: "Meditations.azw3",
+        relativePath: "Books/Meditations.azw3",
+        modificationDate: "20260903T120000",
+      }],
+      scannedObjectCount: 1,
+    };
+    const decisions = createKindleManualMatchDecisionStore({ persistence: null });
+    const options = {
+      deviceLabel: "Kindle",
+      deviceIdentity: { key: "d".repeat(64), stability: "session" as const },
+      manualMatchDecisions: decisions,
+    };
+    const first = await reconcileCatalogIndexes([index("book-1")], possible, options);
+    expect(first.statuses.get("book-1")).toBe("possible");
+    expect(first.inventory.items[0]?.candidates?.[0]?.evidence).toMatchObject({
+      tier: "filename-similarity",
+      candidateCount: 1,
+      comparisons: expect.objectContaining({ filename: "match" }),
+    });
+    const evidence = [...first.manualMatchEvidence.values()][0]!;
+    expect(await decisions.remember(evidence, "same-book")).toBe(true);
+
+    const confirmed = await reconcileCatalogIndexes([index("book-1")], possible, options);
+    expect(confirmed.statuses.get("book-1")).toBe("confirmed");
+    expect(confirmed.inventory.items[0]).toMatchObject({
+      bookId: "book-1",
+      match: "confirmed",
+      candidates: [expect.objectContaining({ decision: "same-book" })],
+    });
+
+    const changed = await reconcileCatalogIndexes([index("book-1")], {
+      ...possible,
+      objects: [{ ...possible.objects[0]!, size: possible.objects[0]!.size + 1 }],
+    }, options);
+    expect(changed.statuses.get("book-1")).toBe("possible");
+    expect(changed.inventory.items[0]?.candidates?.[0]?.decision).toBeUndefined();
+  });
+
+  it("retires a manual same-book choice when the catalog presentation changes", async () => {
+    const base = await inventory("another-book");
+    const possible: KindleInventorySnapshot = {
+      ...base,
+      objects: [{
+        ...base.objects[1]!,
+        filename: "Meditations.azw3",
+        relativePath: "Books/Meditations.azw3",
+        modificationDate: "20260903T120000",
+      }],
+      scannedObjectCount: 1,
+    };
+    const decisions = createKindleManualMatchDecisionStore({ persistence: null });
+    const options = {
+      deviceLabel: "Kindle",
+      deviceIdentity: { key: "d".repeat(64), stability: "session" as const },
+      manualMatchDecisions: decisions,
+    };
+    const baseIndex = index("book-1");
+    const original: CatalogMatchIndex = {
+      ...baseIndex,
+      entries: [{ ...baseIndex.entries[0]!, presentationVersion: "a".repeat(64) }],
+    };
+    const first = await reconcileCatalogIndexes([original], possible, options);
+    expect(await decisions.remember([...first.manualMatchEvidence.values()][0]!, "same-book")).toBe(true);
+    expect((await reconcileCatalogIndexes([original], possible, options)).statuses.get("book-1")).toBe("confirmed");
+
+    const changed: CatalogMatchIndex = {
+      ...original,
+      entries: [{ ...original.entries[0]!, presentationVersion: "b".repeat(64) }],
+    };
+    const result = await reconcileCatalogIndexes([changed], possible, options);
+
+    expect(result.statuses.get("book-1")).toBe("possible");
+    expect(result.inventory.items[0]?.candidates?.[0]?.decision).toBeUndefined();
+  });
+
+  it("removes a manually rejected exact candidate without resurrecting an absent object", async () => {
+    const base = await inventory("another-book");
+    const possible: KindleInventorySnapshot = {
+      ...base,
+      objects: [{ ...base.objects[1]!, filename: "Meditations.azw3", relativePath: "Meditations.azw3" }],
+      scannedObjectCount: 1,
+    };
+    const decisions = createKindleManualMatchDecisionStore({ persistence: null });
+    const options = {
+      deviceLabel: "Kindle",
+      deviceIdentity: { key: "d".repeat(64), stability: "session" as const },
+      manualMatchDecisions: decisions,
+    };
+    const first = await reconcileCatalogIndexes([index("book-1")], possible, options);
+    expect(await decisions.remember([...first.manualMatchEvidence.values()][0]!, "not-this-book")).toBe(true);
+    const rejected = await reconcileCatalogIndexes([index("book-1")], possible, options);
+
+    expect(rejected.statuses.get("book-1")).toBe("not-on-kindle");
+    expect(rejected.inventory.items[0]).toMatchObject({ match: "unmatched" });
+    expect(rejected.inventory.items[0]?.candidates?.[0]).toMatchObject({ decision: "not-this-book" });
+  });
+
   it("marks only a unique managed token in a complete inventory as confirmed", async () => {
     const result = await reconcileCatalogIndexes(
       [index("book-1")],
@@ -249,6 +352,13 @@ describe("catalog/Kindle reconciliation", () => {
       managed: true,
       stalePresentation: true,
     });
+    expect(result.inventory.possibleMatches).toEqual([
+      expect.objectContaining({
+        profileId: "profile-a",
+        bookId: "book-1",
+        evidence: expect.objectContaining({ tier: "prior-presentation", candidateCount: 1 }),
+      }),
+    ]);
   });
 
   it("never confirms a managed-looking token on a non-book Kindle object", async () => {
@@ -287,6 +397,51 @@ describe("catalog/Kindle reconciliation", () => {
 
     expect(result.statuses.get("book-1")).toBe("possible");
     expect(asLastSeenInventory(result.inventory)?.completeness).toBe("last-seen");
+  });
+
+  it("preserves an actionable explanation when a partial inventory has no candidate object", async () => {
+    const base = await inventory("different-book", "partial");
+    const partial: KindleInventorySnapshot = {
+      ...base,
+      objects: [],
+      scannedObjectCount: 0,
+      bookMetadata: {
+        ...base.bookMetadata!,
+        status: "partial",
+        eligibleObjectCount: 0,
+        attemptedObjectCount: 0,
+        parsedObjectCount: 0,
+        enrichedObjectCount: 0,
+        failedObjectCount: 0,
+        skippedObjectCount: 0,
+        indistinguishableObjectCount: 0,
+        readByteCount: 0,
+        budgetedByteCount: 0,
+      },
+    };
+
+    const result = await reconcileCatalogIndexes([index("book-1")], partial, { deviceLabel: "Kindle" });
+
+    expect(result.statuses.get("book-1")).toBe("possible");
+    expect(result.inventory.items).toHaveLength(0);
+    expect(result.inventory.possibleMatches).toEqual([{
+      profileId: "profile-a",
+      bookId: "book-1",
+      reason: "The Kindle scan was incomplete, so this possible match cannot be confirmed.",
+      evidence: expect.objectContaining({
+        tier: "inventory-partial",
+        inventoryCompleteness: "partial",
+        candidateCount: 0,
+        ambiguous: true,
+        comparisons: {
+          title: "not-compared",
+          authors: "not-compared",
+          identifiers: "not-compared",
+          filename: "not-compared",
+          size: "not-compared",
+        },
+      }),
+    }]);
   });
 
   it("never gives failed, queued, or sending delivery records strong match authority", async () => {
@@ -585,6 +740,92 @@ describe("catalog/Kindle reconciliation", () => {
       notOnKindle: 1,
       unknown: 0,
     });
+    expect(result.inventory.items[0]).toMatchObject({ bookId: "book-a", match: "confirmed" });
+  });
+
+  it("lets a non-lexicographic preferred presentation win a current confirmed tie", async () => {
+    const snapshot = await inventory("another-book");
+    const enriched: KindleInventorySnapshot = {
+      ...snapshot,
+      objects: [{
+        ...snapshot.objects[1]!,
+        title: "Meditations",
+        authors: ["Marcus Aurelius"],
+        identifiers: ["isbn:978-0-0000-0000-1"],
+        bookMetadataState: "enriched",
+      }],
+      scannedObjectCount: 1,
+      bookMetadata: {
+        ...snapshot.bookMetadata!,
+        eligibleObjectCount: 1,
+        attemptedObjectCount: 1,
+        parsedObjectCount: 1,
+        enrichedObjectCount: 1,
+        readByteCount: 20,
+        budgetedByteCount: 20,
+      },
+    };
+    const first = index("book-a");
+    const indistinguishable = { ...first.entries[0]!, identifiers: [] };
+    const preferredIndex: CatalogMatchIndex = {
+      ...first,
+      entries: [
+        indistinguishable,
+        { ...indistinguishable, bookId: "book-z", preferredPresentation: true },
+      ],
+    };
+
+    const result = await reconcileCatalogIndexes([preferredIndex], enriched, { deviceLabel: "Kindle" });
+
+    expect(result.statuses.get("book-a")).toBe("not-on-kindle");
+    expect(result.statuses.get("book-z")).toBe("confirmed");
+    expect(result.inventory.items[0]).toMatchObject({ bookId: "book-z", match: "confirmed" });
+  });
+
+  it("ignores a stale preference whose book is not among the current confirmed claims", async () => {
+    const snapshot = await inventory("another-book");
+    const enriched: KindleInventorySnapshot = {
+      ...snapshot,
+      objects: [{
+        ...snapshot.objects[1]!,
+        title: "Meditations",
+        authors: ["Marcus Aurelius"],
+        identifiers: ["isbn:978-0-0000-0000-1"],
+        bookMetadataState: "enriched",
+      }],
+      scannedObjectCount: 1,
+      bookMetadata: {
+        ...snapshot.bookMetadata!,
+        eligibleObjectCount: 1,
+        attemptedObjectCount: 1,
+        parsedObjectCount: 1,
+        enrichedObjectCount: 1,
+        readByteCount: 20,
+        budgetedByteCount: 20,
+      },
+    };
+    const first = index("book-a");
+    const indistinguishable = { ...first.entries[0]!, identifiers: [] };
+    const stalePreference: CatalogMatchIndex = {
+      ...first,
+      entries: [
+        { ...indistinguishable, bookId: "book-b" },
+        indistinguishable,
+        {
+          ...indistinguishable,
+          bookId: "book-z",
+          preferredPresentation: true,
+          title: "A different book",
+          authors: ["A different author"],
+        },
+      ],
+    };
+
+    const result = await reconcileCatalogIndexes([stalePreference], enriched, { deviceLabel: "Kindle" });
+
+    expect(result.statuses.get("book-a")).toBe("confirmed");
+    expect(result.statuses.get("book-b")).toBe("not-on-kindle");
+    expect(result.statuses.get("book-z")).toBe("not-on-kindle");
     expect(result.inventory.items[0]).toMatchObject({ bookId: "book-a", match: "confirmed" });
   });
 

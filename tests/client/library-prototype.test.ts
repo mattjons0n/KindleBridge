@@ -24,6 +24,7 @@ import { catalogQuery, countLibraryBooks, initialLibraryFilters } from "../../cl
 import { DebugLog } from "../../client/src/log";
 import { initialAppState } from "../../client/src/state";
 import { AppView, type AppViewHandlers } from "../../client/src/view";
+import { decodeLibraryRoute } from "../../client/src/library-route";
 
 const STATUS: CatalogServiceStatus = {
   available: true,
@@ -134,6 +135,10 @@ function setInput(input: HTMLInputElement | null, value: string): void {
 }
 
 async function loadedView(api = fakeApi(), callbacks = handlers()): Promise<{ root: HTMLElement; view: AppView; api: ReturnType<typeof fakeApi> }> {
+  // Each helper call represents a fresh page load. AppView writes its current
+  // route asynchronously, so make that boundary explicit even when another
+  // independent view was exercised earlier in the same test.
+  window.history.replaceState({}, "", "#library");
   const root = document.createElement("div");
   const view = new AppView(root, initialAppState(), callbacks, new DebugLog(), { catalogApi: api });
   await vi.waitFor(() => expect(root.querySelector("#library-heading")?.textContent).toBe("Your library"));
@@ -143,10 +148,58 @@ async function loadedView(api = fakeApi(), callbacks = handlers()): Promise<{ ro
 afterEach(() => {
   document.body.innerHTML = "";
   window.localStorage.clear();
+  window.history.replaceState({}, "", "#library");
   vi.useRealTimers();
 });
 
 describe("catalog-backed library model", () => {
+  it("writes active shelf routes that survive reload and back/forward for built-in and saved shelves", async () => {
+    const customShelf = {
+      id: "shelf-holiday", profileId: "prf_personal", name: "Holiday reading",
+      query: { version: 1 as const, catalog: { q: "holiday" } }, pinnedRank: 0, revision: 1, serverCount: 1,
+      createdAt: "2026-09-01T00:00:00Z", updatedAt: "2026-09-01T00:00:00Z",
+    };
+    const api = Object.assign(fakeApi(), {
+      getSendQueue: vi.fn(async () => ({ profileId: "prf_personal", revision: 0, entries: [], total: 0, totalSourceBytes: 0 })),
+      listSmartShelves: vi.fn(async () => [customShelf]),
+      getBookAnnotation: vi.fn(async (profileId: string, bookId: string) => ({
+        profileId, bookId, favorite: false, wantToRead: false, revision: 0,
+        createdAt: "2026-09-01T00:00:00Z", updatedAt: "2026-09-01T00:00:00Z",
+      })),
+    });
+    window.history.replaceState({}, "", "#library");
+    const first = await loadedView(api);
+    document.body.append(first.root);
+    await vi.waitFor(() => expect(first.root.querySelector('[data-shelf-id="shelf-holiday"]')).not.toBeNull());
+
+    click(first.root, '[data-shelf-id="builtin-favorites"]');
+    await vi.waitFor(() => expect(decodeLibraryRoute(window.location.hash)?.activeShelfId).toBe("builtin-favorites"));
+    const favoritesHash = window.location.hash;
+    click(first.root, '[data-shelf-id="builtin-want-to-read"]');
+    await vi.waitFor(() => expect(decodeLibraryRoute(window.location.hash)?.activeShelfId).toBe("builtin-want-to-read"));
+    const wantToReadHash = window.location.hash;
+    click(first.root, '[data-shelf-id="shelf-holiday"]');
+    await vi.waitFor(() => expect(decodeLibraryRoute(window.location.hash)?.activeShelfId).toBe(customShelf.id));
+    const customHash = window.location.hash;
+
+    first.root.remove();
+    window.history.replaceState({}, "", customHash);
+    const reloadedRoot = document.createElement("div");
+    document.body.append(reloadedRoot);
+    new AppView(reloadedRoot, initialAppState(), handlers(), new DebugLog(), { catalogApi: api });
+    await vi.waitFor(() => expect(reloadedRoot.querySelector(".library-active-shelf")?.textContent).toContain("Holiday reading"));
+
+    window.history.replaceState({}, "", favoritesHash);
+    window.dispatchEvent(new PopStateEvent("popstate"));
+    await vi.waitFor(() => expect(reloadedRoot.querySelector(".library-active-shelf")?.textContent).toContain("Favorites"));
+    window.history.replaceState({}, "", wantToReadHash);
+    window.dispatchEvent(new PopStateEvent("popstate"));
+    await vi.waitFor(() => expect(reloadedRoot.querySelector(".library-active-shelf")?.textContent).toContain("Want to read"));
+
+    click(reloadedRoot, '[data-ui-action="clear-smart-shelf"]');
+    expect(decodeLibraryRoute(window.location.hash)?.activeShelfId).toBeUndefined();
+  });
+
   it("maps every discovery control, including publication year and pagination, to the API query", () => {
     const query = catalogQuery({ ...initialLibraryFilters("prf_personal"), query: " wells ", author: "H. G. Wells", language: "en", subject: "Science fiction", publisher: "Bridge Press", series: "Classics", format: "epub", rootId: "root_personal", year: "1895", metadata: "complete", sort: "published", offset: 24 });
     expect(query).toMatchObject({ q: "wells", author: "H. G. Wells", language: "en", subject: "Science fiction", publisher: "Bridge Press", series: "Classics", format: "epub", rootId: "root_personal", year: "1895", metadata: "complete", sort: "published", limit: 24, offset: 24 });
@@ -463,7 +516,7 @@ describe("catalog-backed library model", () => {
     });
 
     const card = root.querySelector<HTMLElement>('[data-book-id="book_time"]');
-    expect(card?.querySelector('.library-kindle-check[aria-label="Possible Kindle match"]')).not.toBeNull();
+    expect(card?.querySelector('.library-kindle-check[aria-label="Review possible Kindle match for The Time Machine"]')).not.toBeNull();
     expect(card?.querySelector<HTMLButtonElement>('[data-ui-action="send-book"]')).toMatchObject({
       disabled: true,
       textContent: "Possible match",
@@ -722,6 +775,7 @@ describe("catalog-backed library model", () => {
       expect.objectContaining({ limit: 24, offset: 24 }),
       expect.any(AbortSignal),
     ));
+    await vi.waitFor(() => expect(decodeLibraryRoute(window.location.hash)?.filters.offset).toBe(24));
   });
 
   it("reduces an oversized catalog page until valid books remain browsable with stable pagination", async () => {
@@ -767,7 +821,7 @@ describe("catalog-backed library model", () => {
     click(root, 'button[data-ui-view="on-kindle"]');
     await vi.waitFor(() => expect(vi.mocked(api.queryBooks)).toHaveBeenCalledWith("prf_personal", expect.objectContaining({ includeBookIds: ["book_time", "book_dorian"] }), expect.any(AbortSignal)));
     expect(root.querySelector('[data-book-id="book_time"] .library-kindle-check')?.getAttribute("aria-label")).toBe("Already on this Kindle");
-    expect(root.querySelector('[data-book-id="book_dorian"] .library-kindle-check')?.getAttribute("aria-label")).toBe("Possible Kindle match");
+    expect(root.querySelector('[data-book-id="book_dorian"] .library-kindle-check')?.getAttribute("aria-label")).toBe("Review possible Kindle match for The Picture of Dorian Gray");
   });
 
   it("includes only proven-absent IDs in the Not on Kindle query", async () => {
@@ -1443,6 +1497,7 @@ describe("real catalog settings and device presentation", () => {
     const { root } = await loadedView(api);
     click(root, 'button[data-ui-view="settings"]');
     await vi.waitFor(() => expect(root.querySelector(".settings-health")?.textContent).toContain("source_errors:1"));
+    await vi.waitFor(() => expect(decodeLibraryRoute(window.location.hash)?.filters.view).toBe("settings"));
 
     const watcherApi = fakeApi();
     watcherApi.roots.prf_personal = [{

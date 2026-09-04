@@ -10,6 +10,8 @@ import type {
   CatalogProfile,
   CatalogRoot,
   CatalogServiceStatus,
+  CoverProvider,
+  CoverProviderCredentialState,
 } from "../../client/src/catalog-client";
 import { DebugLog } from "../../client/src/log";
 import { initialAppState } from "../../client/src/state";
@@ -110,10 +112,14 @@ function sourceMetadata(book: CatalogBook): CatalogBookMetadataState["sourceMeta
 }
 
 function testApi(book: CatalogBook = BOOK): CatalogApi & {
+  getBookDetails: ReturnType<typeof vi.fn>;
+  getMatchIndex: ReturnType<typeof vi.fn>;
   updateBookMetadata: ReturnType<typeof vi.fn>;
   resetBookMetadata: ReturnType<typeof vi.fn>;
   uploadBookCover: ReturnType<typeof vi.fn>;
   importBookCover: ReturnType<typeof vi.fn>;
+  listCoverProviderCredentials: ReturnType<typeof vi.fn>;
+  searchBookMetadata: ReturnType<typeof vi.fn>;
 } {
   let state: CatalogBookMetadataState = {
     book,
@@ -161,6 +167,24 @@ function testApi(book: CatalogBook = BOOK): CatalogApi & {
     };
     return state;
   });
+  let googleBooksCredential: CoverProviderCredentialState = {
+    provider: "google-books" as const,
+    configured: false,
+    maskedKey: null,
+    revision: 0,
+    status: "not-configured" as const,
+    lastTestedAt: null,
+    errorCode: null,
+  };
+  const searchBookMetadata = vi.fn(async (_profileId: string, _bookId: string, provider: CoverProvider) => ({
+    provider,
+    items: [{
+      provider,
+      candidateId: "provider-book-one",
+      confidence: "high" as const,
+      metadata: { title: "Provider title", authors: ["Provider Author"] },
+    }],
+  }));
   return {
     getStatus: vi.fn(async () => STATUS),
     listProfiles: vi.fn(async () => [PROFILE]),
@@ -176,6 +200,24 @@ function testApi(book: CatalogBook = BOOK): CatalogApi & {
     queryBooks: vi.fn(async (_profileId, query = {}) => ({ items: [state.book], total: 1, offset: query.offset ?? 0, limit: query.limit ?? 24 })),
     getFilters: vi.fn(async () => EMPTY_FILTERS),
     getBook: vi.fn(async () => state.book),
+    getBookDetails: vi.fn(async () => ({
+      ...state,
+      source: {
+        rootId: ROOT.id,
+        rootLabel: ROOT.label,
+        rootPath: ROOT.path,
+        rootStatus: ROOT.status,
+        rootLastScanAt: "2026-09-01T09:55:00Z",
+        relativePath: `nested/${state.book.sourceFilename}`,
+        available: true,
+      },
+      latestVerifiedDelivery: {
+        filename: "Source Title.azw3",
+        size: 2_048,
+        deliveredAt: "2026-09-01T11:00:00Z",
+        currentPresentation: true,
+      },
+    })),
     getBookMetadata: vi.fn(async () => state),
     updateBookMetadata,
     resetBookMetadata,
@@ -185,18 +227,42 @@ function testApi(book: CatalogBook = BOOK): CatalogApi & {
       provider,
       items: [{ candidateId: "OL1M", title: "Candidate title", authors: ["Candidate Author"], publishedAt: "2024", identifiers: ["isbn:123"], thumbnailUrl: `/api/profiles/${PROFILE.id}/books/${book.id}/cover-search/preview?candidate=OL1M` }],
     })),
+    searchBookMetadata,
     importBookCover,
     getBookCover: vi.fn(async () => new Blob(["cover"], { type: "image/jpeg" })),
-    getMatchIndex: vi.fn(async () => ({ profileId: PROFILE.id, generatedAt: "2026-09-01T10:00:00Z", entries: [] })),
+    listCoverProviderCredentials: vi.fn(async () => [googleBooksCredential]),
+    saveCoverProviderCredential: vi.fn(async (_provider, input) => {
+      googleBooksCredential = {
+        ...googleBooksCredential,
+        configured: true,
+        maskedKey: "••••••••",
+        revision: input.expectedRevision + 1,
+        status: "untested" as const,
+      };
+      return googleBooksCredential;
+    }),
+    testCoverProviderCredential: vi.fn(async () => {
+      googleBooksCredential = { ...googleBooksCredential, status: "working" as const };
+      return googleBooksCredential;
+    }),
+    removeCoverProviderCredential: vi.fn(async () => {
+      googleBooksCredential = { ...googleBooksCredential, configured: false, maskedKey: null, revision: googleBooksCredential.revision + 1, status: "not-configured" as const };
+      return googleBooksCredential;
+    }),
+    getMatchIndex: vi.fn(async () => ({ profileId: PROFILE.id, generatedAt: "2026-09-01T10:00:00Z", entries: [{ bookId: BOOK.id, sourceFilename: BOOK.sourceFilename, sourceFormat: BOOK.format, sourceSize: BOOK.size, contentHash: HASH, identifiers: BOOK.identifiers, title: BOOK.title, authors: BOOK.authors, deliveries: [{ deviceKey: "private-device", filename: "Source Title.azw3", artifactSize: 2_048, status: "verified", deliveredAt: "2026-09-01T11:00:00Z" }] }] })),
     getBookSource: vi.fn(async () => ({ blob: new Blob(["source"]) })),
     createDelivery: vi.fn(async () => ({})),
     saveConfiguration: vi.fn(async () => ({ profile: PROFILE, roots: [ROOT] })),
     subscribeEvents: vi.fn((_onEvent, _onError, onOpen) => { onOpen?.(); return () => undefined; }),
   } as CatalogApi & {
+    getBookDetails: ReturnType<typeof vi.fn>;
+    getMatchIndex: ReturnType<typeof vi.fn>;
     updateBookMetadata: ReturnType<typeof vi.fn>;
     resetBookMetadata: ReturnType<typeof vi.fn>;
     uploadBookCover: ReturnType<typeof vi.fn>;
     importBookCover: ReturnType<typeof vi.fn>;
+    listCoverProviderCredentials: ReturnType<typeof vi.fn>;
+    searchBookMetadata: ReturnType<typeof vi.fn>;
   };
 }
 
@@ -213,15 +279,223 @@ async function openEditor(api = testApi()): Promise<{ root: HTMLElement; api: Re
 afterEach(() => {
   document.body.innerHTML = "";
   window.localStorage.clear();
+  window.history.replaceState({}, "", "#library");
 });
 
 describe("non-destructive metadata and cover editor", () => {
+  it("keeps provider credentials out of UI state and clears the password field immediately", async () => {
+    const api = testApi();
+    const root = document.createElement("div");
+    document.body.append(root);
+    new AppView(root, initialAppState(), handlers(), new DebugLog(), { catalogApi: api });
+    await vi.waitFor(() => expect(root.querySelector('[data-book-id="book-one"]')).not.toBeNull());
+    root.querySelector<HTMLButtonElement>('[data-ui-view="settings"]')!.click();
+    await vi.waitFor(() => expect(root.querySelector(".settings-provider-card")?.textContent).toContain("Not configured"));
+    root.querySelector<HTMLButtonElement>('[data-ui-action="edit-google-books-key"]')!.click();
+    const input = root.querySelector<HTMLInputElement>("#settings-google-books-key")!;
+    expect(input.value).toBe("");
+    const secret = "development-key-must-not-render";
+    input.value = secret;
+    root.querySelector<HTMLButtonElement>('[data-ui-action="save-test-google-books-key"]')!.click();
+    expect(input.value).toBe("");
+    expect(root.textContent).not.toContain(secret);
+    expect(Object.values(window.localStorage)).not.toContain(secret);
+    await vi.waitFor(() => expect(root.querySelector(".settings-provider-card")?.textContent).toContain("Working"));
+    expect(api.saveCoverProviderCredential).toHaveBeenCalledWith("google-books", {
+      apiKey: secret,
+      expectedRevision: 0,
+    }, expect.any(AbortSignal));
+  });
+
+  it("defaults cover search to Open Library", async () => {
+    const { root } = await openEditor();
+    expect(root.querySelector<HTMLSelectElement>("#metadata-cover-provider")?.value).toBe("open-library");
+  });
+
+  it("uses a configured Google Books key after reload without opening Settings", async () => {
+    const api = testApi();
+    api.listCoverProviderCredentials.mockResolvedValue([{
+      provider: "google-books",
+      configured: true,
+      maskedKey: "••••••••",
+      revision: 3,
+      status: "working",
+      lastTestedAt: "2026-09-04T10:00:00Z",
+      errorCode: null,
+    }]);
+    const { root } = await openEditor(api);
+    expect(api.listCoverProviderCredentials).not.toHaveBeenCalled();
+
+    root.querySelector<HTMLSelectElement>("#metadata-candidate-provider")!.value = "google-books";
+    root.querySelector<HTMLButtonElement>('[data-ui-action="search-metadata-candidates"]')!.click();
+
+    await vi.waitFor(() => expect(api.searchBookMetadata).toHaveBeenCalledOnce());
+    expect(api.listCoverProviderCredentials).toHaveBeenCalledOnce();
+    expect(api.searchBookMetadata).toHaveBeenCalledWith(
+      PROFILE.id,
+      BOOK.id,
+      "google-books",
+      expect.objectContaining({ title: BOOK.title }),
+      expect.any(AbortSignal),
+    );
+    expect(root.querySelector(".metadata-candidate-list")?.textContent).toContain("Provider title");
+  });
+
+  it("shows exact possible-match evidence and routes explicit choices without treating Kindle-only files as hidden", async () => {
+    const api = testApi();
+    const appHandlers: AppViewHandlers = {
+      ...handlers(),
+      onCatalogManualMatchDecision: vi.fn(async () => undefined),
+    };
+    const root = document.createElement("div");
+    document.body.append(root);
+    const view = new AppView(root, initialAppState(), appHandlers, new DebugLog(), { catalogApi: api });
+    await vi.waitFor(() => expect(root.querySelector('[data-book-id="book-one"]')).not.toBeNull());
+    view.setCatalogKindleStatuses(new Map([[BOOK.id, "possible"]]));
+    view.setCatalogKindleInventory({
+      deviceLabel: "My Kindle",
+      scannedAt: "2026-09-03T20:00:00Z",
+      completeness: "complete",
+      total: 2,
+      truncated: false,
+      metadata: { status: "complete", eligible: 2, enriched: 1, failed: 0, skipped: 0, truncated: false },
+      matching: { status: "complete", matchedProfiles: 1, failedProfiles: 0 },
+      items: [{
+        id: "mtp-00000010",
+        filename: "Source Title.azw3",
+        title: "Source Title",
+        author: "Source Author",
+        format: "AZW3",
+        objectFormat: 0xb00a,
+        modificationDate: "20260903T200000",
+        size: 2_048,
+        path: "Books/Source Title.azw3",
+        managed: false,
+        bookId: BOOK.id,
+        match: "possible",
+        candidates: [{
+          profileId: PROFILE.id,
+          bookId: BOOK.id,
+          reason: "The filename resembles this book.",
+          evidence: {
+            tier: "filename-similarity",
+            inventoryCompleteness: "complete",
+            ambiguous: true,
+            candidateCount: 1,
+            comparisons: {
+              title: "unavailable",
+              authors: "unavailable",
+              identifiers: "unavailable",
+              filename: "match",
+              size: "unavailable",
+            },
+            strongerProofUnavailable: "No exact prior delivery identity was available.",
+          },
+        }],
+      }, {
+        id: "mtp-00000011",
+        filename: "Only on Kindle.azw3",
+        format: "AZW3",
+        objectFormat: 0xb00a,
+        size: 1_024,
+        path: "Only on Kindle.azw3",
+        managed: false,
+        match: "unmatched",
+      }],
+    });
+    await vi.waitFor(() => expect(root.querySelector('[data-ui-action="open-match-review"]')).not.toBeNull());
+    root.querySelector<HTMLButtonElement>('[data-ui-action="open-match-review"]')!.click();
+    await vi.waitFor(() => expect(root.querySelector(".library-match-review-sheet")?.textContent).toContain("The filename resembles this book."));
+    expect(root.querySelector(".library-match-review-sheet")?.textContent).toContain("Books/Source Title.azw3");
+    root.querySelector<HTMLButtonElement>('button[data-decision="same-book"]')!.click();
+    await vi.waitFor(() => expect(appHandlers.onCatalogManualMatchDecision).toHaveBeenCalledWith({
+      profileId: PROFILE.id,
+      bookId: BOOK.id,
+      itemId: "mtp-00000010",
+      decision: "same-book",
+    }));
+  });
+
+  it("explains a possible match even when an incomplete inventory has no device candidate", async () => {
+    const root = document.createElement("div");
+    document.body.append(root);
+    const view = new AppView(root, initialAppState(), handlers(), new DebugLog(), { catalogApi: testApi() });
+    await vi.waitFor(() => expect(root.querySelector('[data-book-id="book-one"]')).not.toBeNull());
+    view.setCatalogKindleStatuses(new Map([[BOOK.id, "possible"]]));
+    view.setCatalogKindleInventory({
+      deviceLabel: "My Kindle",
+      scannedAt: "2026-09-03T20:00:00Z",
+      completeness: "partial",
+      total: 0,
+      truncated: false,
+      matching: { status: "partial", matchedProfiles: 1, failedProfiles: 0 },
+      items: [],
+      possibleMatches: [{
+        profileId: PROFILE.id,
+        bookId: BOOK.id,
+        reason: "The Kindle scan was incomplete, so this possible match cannot be confirmed.",
+        evidence: {
+          tier: "inventory-partial",
+          inventoryCompleteness: "partial",
+          ambiguous: true,
+          candidateCount: 0,
+          comparisons: {
+            title: "not-compared",
+            authors: "not-compared",
+            identifiers: "not-compared",
+            filename: "not-compared",
+            size: "not-compared",
+          },
+          strongerProofUnavailable: "A complete current Kindle inventory is required before any match can be authoritative.",
+        },
+      }],
+    });
+
+    const badge = root.querySelector<HTMLButtonElement>('[data-book-id="book-one"] [data-ui-action="open-match-review"]');
+    expect(badge?.disabled).toBe(false);
+    badge?.click();
+    await vi.waitFor(() => expect(root.querySelector(".library-match-review-sheet")?.textContent).toContain("Incomplete inventory"));
+    const review = root.querySelector(".library-match-review-sheet");
+    expect(review?.textContent).toContain("Why is this a possible match?");
+    expect(review?.textContent).toContain("No exact Kindle file identified");
+    expect(review?.textContent).toContain("Incomplete inventory");
+    expect(review?.textContent).toContain("No exact device candidate");
+    expect(review?.querySelector('[data-decision="same-book"]')).toBeNull();
+  });
+
+  it("opens a keyboard-contained details drawer and browser back restores the catalog", async () => {
+    const root = document.createElement("div");
+    document.body.append(root);
+    const scrollTo = vi.fn();
+    Object.defineProperty(window, "scrollTo", { configurable: true, value: scrollTo });
+    const api = testApi();
+    new AppView(root, initialAppState(), handlers(), new DebugLog(), { catalogApi: api });
+    await vi.waitFor(() => expect(root.querySelector('[data-book-id="book-one"]')).not.toBeNull());
+    const initialMatchIndexCalls = api.getMatchIndex.mock.calls.length;
+
+    root.querySelector<HTMLButtonElement>('[data-ui-action="open-book-details"]')!.click();
+    await vi.waitFor(() => expect(root.querySelector('.library-book-details-sheet[role="dialog"]')?.textContent).toContain("Source Publisher"));
+    expect(root.querySelector('.library-book-details-sheet')?.textContent).toContain("Saved Publisher");
+    expect(root.querySelector('.library-book-details-sheet')?.textContent).toContain("Source Title.azw3");
+    expect(root.querySelector('.library-book-details-sheet')?.textContent).toContain("nested/immutable.epub");
+    expect(api.getBookDetails).toHaveBeenCalledWith(PROFILE.id, BOOK.id, expect.any(AbortSignal));
+    expect(api.getMatchIndex).toHaveBeenCalledTimes(initialMatchIndexCalls);
+    expect(document.activeElement?.getAttribute("data-ui-action")).toBe("close-book-details");
+
+    window.history.replaceState({}, "", "#library");
+    window.dispatchEvent(new PopStateEvent("popstate"));
+    await vi.waitFor(() => expect(root.querySelector(".library-book-details-sheet")).toBeNull());
+    expect(document.activeElement?.getAttribute("data-ui-action")).toBe("open-book-details");
+    expect(scrollTo).toHaveBeenCalled();
+  });
+
   it("shows source/effective fields and saves override/inherit changes with current-version fencing", async () => {
     const { root, api } = await openEditor();
     expect(root.querySelector('.library-metadata-sheet[role="dialog"]')?.textContent).toContain("torrent/source files stay untouched");
     expect(root.querySelector('[data-metadata-field-row="publisher"] small')?.textContent).toContain("Source Publisher");
     expect(root.querySelector(".metadata-format-note")?.textContent).toContain("temporary browser-created derivative");
-    expect(root.querySelector(".metadata-existing-copy-note")?.textContent).toContain("remove that Kindle copy");
+    expect(root.querySelector(".metadata-existing-copy-note")?.textContent).toContain("Kindle update unavailable");
+    expect(root.querySelector(".metadata-existing-copy-note")?.textContent).toContain("Kindle Bridge-managed presentation");
 
     const publisher = root.querySelector<HTMLInputElement>('input[data-metadata-override="publisher"]')!;
     publisher.checked = false;

@@ -23,20 +23,32 @@ Record the image digest, data-volume snapshot, date, operator, target host, brow
 ## Storage lifecycle
 
 - [ ] Graceful stop during an active scan/source response closes SSE and the listener first, drains work, and exits inside 30 seconds with no corrupted migration/database state.
-- [ ] Restart preserves installation identity, profiles, roots, Settings mode, delivery history, metadata overrides, and user-selected replacement covers.
+- [ ] A restored copy upgrades additively to schema version 17; two further restarts remain ready without duplicate migration effects, and recorded profile/root/book/delivery/overlay/provider/queue/shelf/annotation/issue/job counts are preserved as intended.
+- [ ] Restart preserves installation identity, profiles, roots, Settings mode, delivery history, metadata overrides, provider configuration, Send-later order, shelves/pins, annotations, issue dispositions/preferences, bulk lookup jobs/results, and user-selected replacement covers.
+- [ ] Restart and cold restore preserve only the masked public state and working behavior of a configured Google Books key; API responses, logs, and browser storage never contain the key.
+- [ ] The `/data` backup is treated as a secret-bearing archive because it contains provider credentials; restored ownership/mode remain restrictive.
 - [ ] Removing a source mount reports unavailable without mass deletion; restoring it reconciles normally.
 - [ ] Cold backup produces a checksum-valid archive.
 - [ ] Restore into a new volume preserves durable state, including `/data/metadata-covers`, and leaves the old volume untouched.
 - [ ] Upgrade is tested against a restored copy; rollback selects the previous image and data snapshot together.
-- [ ] Fresh cache plus reconciliation rebuilds covers, search, facets, and source serving.
+- [ ] Fresh cache plus a derived catalog rebuild reconstructs books/covers/search/facets/source serving without deleting queue entries, shelves, annotations, issue dispositions/preferences, provider configuration, or lookup jobs; restored stable IDs reattach that intent.
+- [ ] A lookup interrupted while running reopens paused with searching entries pending; resume, cancel, and completed-failure retry preserve review-ready results and never auto-apply an overlay.
+- [ ] Rollback uses the previous immutable image and its paired pre-upgrade `/data` snapshot. Additive queue/shelf/annotation/provider/issue/job rows remain inert when hidden and are not deleted as a rollback step.
 
 ## Load and privacy
 
 - [ ] A 10,000-book catalog remains paginated, its bounded book-set match query succeeds, and health stays responsive during reconciliation.
+- [ ] Queue/shelf/selection/annotation/issue/lookup limits reject overflow explicitly: 1,000 queue entries, 500 IDs per add, 5,000 selected IDs, 100 shelves/eight pins, 20,000 annotations/issues, 12 provider candidates, and 100 books/100 retained jobs for bulk lookup.
 - [ ] Source streaming, scans, and Settings changes honor configured rate/concurrency/body bounds.
 - [ ] Startup-root validation, Settings path validation, source responses, and cover reads honor their configured deadlines and release capacity after timeout/disconnect.
 - [ ] Logs contain no storage credentials, raw source bytes, conversion output, host paths where prohibited, or raw device serials.
-- [ ] No analytics, cloud conversion, or cloud book storage request occurs. When optional cover search is disabled, no provider request occurs; when enabled, egress is limited to the documented Google Books/Open Library hosts and selected bytes are copied into `/data`.
+- [ ] No analytics, cloud conversion, or cloud book storage request occurs. When optional lookup is disabled, no provider request occurs; when enabled, egress is limited to the documented Google Books/Open Library/validated Archive.org hosts. Only normalized title/author/identifier terms leave the service—never source bytes, container paths, or arbitrary URLs—and selected cover bytes are copied into `/data`.
+- [ ] Google Books add/replace/test/remove works through Settings, respects read-only mode and revision conflicts, and a missing key points back to Settings without attempting an upstream request.
+- [ ] A live Open Library preview/import follows the current validated Archive.org redirect chain; unrelated hosts, paths, IDs, schemes, ports, credentials, and excessive redirects remain rejected.
+- [ ] Provider metadata lookup remains explicit and review-before-apply; partial field/cover import is atomic under source-hash/revision checks and a failed import leaves no referenced or orphaned partial overlay.
+- [ ] Bulk lookup enforces two concurrent provider calls, four request starts per second, three bounded transient attempts, pause/cancel/explicit retry, per-book results, and coalesced event hints.
+- [ ] Catalog health covers missing covers, incomplete/parser failures, unavailable roots/sources, low-confidence provider results, and suspected duplicates. Accepted or superseded provider evidence retires low-confidence issues.
+- [ ] Duplicate review can choose/clear a preferred current group member or reject/undo rejection; the preference survives rebuild, changes no source file, and never implies Kindle presence for another edition.
 
 ## Physical secure-origin acceptance
 

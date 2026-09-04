@@ -18,7 +18,7 @@ This document locks the operating boundary for the first household release.
 | `/data` | Configuration, database, migration state, and delivery history | read-write | Durable; back up before upgrades |
 | `/cache` | Covers and temporary/rebuildable artifacts | read-write | Disposable; rebuild from `/libraries` |
 
-No other container filesystem path is writable. `TMPDIR` points to `/cache/tmp`. The host is responsible for mounting any local disk, NAS, SMB, or NFS storage before it is bound read-only into `/libraries`; storage credentials never enter Kindle Bridge.
+No other container filesystem path is writable. `TMPDIR` points directly to the rebuildable `/cache` mount so a fresh empty volume or bind mount is immediately usable. The host is responsible for mounting any local disk, NAS, SMB, or NFS storage before it is bound read-only into `/libraries`; storage credentials never enter Kindle Bridge.
 
 ## Network boundary
 

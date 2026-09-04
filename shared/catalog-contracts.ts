@@ -28,6 +28,32 @@ export const MAX_STALE_MANAGED_TOKENS_PER_BOOK = 16;
 /** Fixed bitmap width for cross-profile metadata-claim collisions. */
 export const METADATA_CLAIM_BITMAP_BYTES = Math.ceil(MAX_MATCH_INDEX_ENTRIES / 8);
 export const METADATA_CLAIM_BITMAP_BASE64_LENGTH = 4 * Math.ceil(METADATA_CLAIM_BITMAP_BYTES / 3);
+/** Maximum durable Send-later entries retained by one profile. */
+export const MAX_SEND_QUEUE_ENTRIES_PER_PROFILE = 1_000;
+/** Maximum opaque book IDs accepted by one queue mutation. */
+export const MAX_SEND_QUEUE_MUTATION_BOOK_IDS = 500;
+/** Maximum IDs materialized by the non-paginated filtered selection route. */
+export const MAX_BOOK_SELECTION_IDS = 5_000;
+/** Maximum user-created smart shelves retained by one profile. */
+export const MAX_SMART_SHELVES_PER_PROFILE = 100;
+/** Intentionally small sidebar pin budget. */
+export const MAX_PINNED_SMART_SHELVES_PER_PROFILE = 8;
+/** Durable favorite/want-to-read records retained by one profile. */
+export const MAX_PROFILE_BOOK_ANNOTATIONS_PER_PROFILE = 20_000;
+/** Exact UTF-8 ceiling for a canonical persisted shelf query. */
+export const MAX_SMART_SHELF_QUERY_BYTES = 8 * 1024;
+/** Maximum smart-shelf display-name length. */
+export const MAX_SMART_SHELF_NAME_LENGTH = 80;
+/** Hard ceiling for one series' all-volume quality analysis. */
+export const MAX_SERIES_DETAIL_BOOKS = 20_000;
+/** Provider suggestions returned by one explicit metadata search. */
+export const MAX_METADATA_CANDIDATES = 12;
+/** Explicit fields accepted by one provider metadata import. */
+export const MAX_METADATA_IMPORT_FIELDS = 12;
+/** Explicit upper bound for one review-only bulk provider lookup. */
+export const MAX_METADATA_LOOKUP_JOB_BOOKS = 100;
+/** Durable bulk lookup history retained per profile. */
+export const MAX_METADATA_LOOKUP_JOBS_PER_PROFILE = 100;
 
 export type BookFormat = "epub" | "azw3";
 export type RootStatus =
@@ -40,8 +66,18 @@ export type RootStatus =
   | "paused"
   | "error";
 export type DeliveryStatus = "queued" | "converting" | "sending" | "delivered" | "failed";
-export type CatalogSort = "recent" | "title" | "author" | "published" | "size" | "added" | "updated";
+export type CatalogSort =
+  | "recent"
+  | "title"
+  | "author"
+  | "published"
+  | "size"
+  | "added"
+  | "updated"
+  | "series"
+  | "series-index";
 export type SortOrder = "asc" | "desc";
+export type SmartShelfKindleStatus = "confirmed" | "possible" | "not-on-kindle" | "unknown";
 
 export interface ApiErrorBody {
   error: {
@@ -158,6 +194,32 @@ export interface BookMetadataState {
   coverOverride: BookCoverOverride | null;
 }
 
+/** Server-owned provenance for the immutable source behind one catalog book. */
+export interface BookDetailsSource {
+  rootId: string;
+  rootLabel: string;
+  rootPath: string;
+  rootStatus: RootStatus;
+  rootLastScanAt: string | null;
+  rootLastErrorCode: string | null;
+  relativePath: string;
+  available: boolean;
+}
+
+/** A deliberately device-anonymous summary of the newest verified transfer. */
+export interface BookVerifiedDeliverySummary {
+  filename: string | null;
+  size: number | null;
+  deliveredAt: string;
+  currentPresentation: boolean;
+}
+
+/** Dedicated read-only DTO for the Book details drawer. */
+export interface BookDetailsState extends BookMetadataState {
+  source: BookDetailsSource;
+  latestVerifiedDelivery: BookVerifiedDeliverySummary | null;
+}
+
 export interface BookMetadataPatchInput {
   expectedRevision: number;
   expectedContentHash: string;
@@ -172,6 +234,38 @@ export interface BookMetadataResetInput {
 }
 
 export type CoverProvider = "google-books" | "open-library";
+
+/** Online cover providers whose credentials can be managed by the service. */
+export type ConfigurableCoverProvider = "google-books";
+
+export type CoverProviderCredentialStatus = "not-configured" | "untested" | "working" | "error";
+
+export type CoverProviderCredentialErrorCode =
+  | "invalid-or-restricted-key"
+  | "quota-exhausted"
+  | "timeout"
+  | "provider-unavailable";
+
+/** Public Settings state. The saved credential is deliberately never exposed. */
+export interface CoverProviderCredentialState {
+  provider: ConfigurableCoverProvider;
+  configured: boolean;
+  /** Fixed display mask; it reveals neither key contents nor key length. */
+  maskedKey: string | null;
+  revision: number;
+  status: CoverProviderCredentialStatus;
+  lastTestedAt: string | null;
+  errorCode: CoverProviderCredentialErrorCode | null;
+}
+
+export interface CoverProviderCredentialInput {
+  apiKey: string;
+  expectedRevision: number;
+}
+
+export interface CoverProviderCredentialTestInput {
+  expectedRevision: number;
+}
 
 export interface CoverSearchCandidate {
   candidateId: string;
@@ -193,6 +287,97 @@ export interface CoverImportInput {
   expectedContentHash: string;
   provider: CoverProvider;
   candidateId: string;
+}
+
+export type MetadataCandidateConfidence = "high" | "medium" | "low";
+
+/** A normalized provider suggestion. Provider URLs and source paths are never
+ * part of this contract; a later import resolves this bounded server-side
+ * candidate by provider and candidateId. */
+export interface CatalogMetadataCandidate {
+  provider: CoverProvider;
+  candidateId: string;
+  confidence: MetadataCandidateConfidence;
+  metadata: Partial<EditableBookMetadata>;
+  coverCandidateId?: string;
+}
+
+export interface MetadataCandidateSearchTerms {
+  title?: string;
+  author?: string;
+  identifier?: string;
+}
+
+export interface MetadataCandidateSearchResult {
+  provider: CoverProvider;
+  items: CatalogMetadataCandidate[];
+}
+
+export interface MetadataCandidateImportInput {
+  provider: CoverProvider;
+  candidateId: string;
+  /** Present when the reviewed candidate came from a durable bulk lookup. */
+  lookupJobId?: string;
+  selectedFields: EditableMetadataField[];
+  includeCover: boolean;
+  expectedRevision: number;
+  expectedContentHash: string;
+}
+
+export type MetadataLookupJobStatus = "queued" | "running" | "paused" | "completed" | "cancelled";
+export type MetadataLookupEntryStatus = "pending" | "searching" | "ready" | "no-results" | "failed" | "cancelled";
+export type MetadataLookupErrorCode =
+  | "book-unavailable"
+  | "provider-unavailable"
+  | "provider-not-configured"
+  | "provider-response-too-large"
+  | "invalid-provider-response";
+
+export interface MetadataLookupJobInput {
+  provider: CoverProvider;
+  bookIds: string[];
+}
+
+export interface MetadataLookupJobControlInput {
+  expectedRevision: number;
+}
+
+export interface MetadataLookupJobEntry {
+  jobId: string;
+  bookId: string;
+  rank: number;
+  status: MetadataLookupEntryStatus;
+  attempts: number;
+  candidates: CatalogMetadataCandidate[];
+  errorCode: MetadataLookupErrorCode | null;
+  acceptedAt: string | null;
+  updatedAt: string;
+}
+
+export interface MetadataLookupJob {
+  id: string;
+  profileId: string;
+  provider: CoverProvider;
+  status: MetadataLookupJobStatus;
+  revision: number;
+  /** Collection listings carry counts only; fetch the individual job for its bounded entries. */
+  entriesIncluded: boolean;
+  entries: MetadataLookupJobEntry[];
+  total: number;
+  pending: number;
+  ready: number;
+  noResults: number;
+  failed: number;
+  cancelled: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface MetadataLookupJobPage {
+  items: MetadataLookupJob[];
+  total: number;
+  limit: number;
+  offset: number;
 }
 
 export interface BookPage {
@@ -267,7 +452,12 @@ export type CatalogEventType =
   | "book.added"
   | "book.updated"
   | "book.removed"
-  | "delivery.updated";
+  | "delivery.updated"
+  | "queue.updated"
+  | "shelf.updated"
+  | "annotation.updated"
+  | "issues.updated"
+  | "metadata-lookup.updated";
 
 export interface CatalogEvent {
   id: string;
@@ -276,6 +466,8 @@ export interface CatalogEvent {
   profileId?: string;
   rootId?: string;
   bookId?: string;
+  shelfId?: string;
+  jobId?: string;
   data?: Record<string, unknown>;
 }
 
@@ -303,15 +495,138 @@ export interface BookQuery {
   subject?: string;
   publisher?: string;
   series?: string;
+  /** Canonical NFKD/case/punctuation-insensitive series identity. */
+  seriesKey?: string;
   year?: string;
   format?: BookFormat;
   rootId?: string;
   metadata?: "complete" | "partial";
   available?: boolean;
+  coverAvailable?: boolean;
+  /** Profile-owned manual state, kept distinct from Kindle evidence. */
+  favorite?: boolean;
+  /** Profile-owned manual state, kept distinct from Kindle evidence. */
+  wantToRead?: boolean;
   sort?: CatalogSort;
   order?: SortOrder;
   limit?: number;
   offset?: number;
+}
+
+/** The sole durable smart-shelf query format. Pagination and device identity
+ * are deliberately absent; Kindle status is evaluated in the browser against
+ * a fresh reconciliation. */
+export interface SmartShelfQueryV1 {
+  version: 1;
+  catalog?: {
+    q?: string;
+    author?: string;
+    language?: string;
+    subject?: string;
+    publisher?: string;
+    series?: string;
+    seriesKey?: string;
+    year?: string;
+    format?: BookFormat;
+    rootId?: string;
+    metadata?: "complete" | "partial";
+    available?: boolean;
+    coverAvailable?: boolean;
+    sort?: CatalogSort;
+    order?: SortOrder;
+  };
+  personal?: {
+    favorite?: boolean;
+    wantToRead?: boolean;
+  };
+  kindleStatus?: SmartShelfKindleStatus;
+}
+
+export type SmartShelfQuery = SmartShelfQueryV1;
+
+export interface SendQueueEntry {
+  profileId: string;
+  bookId: string;
+  rank: number;
+  queuedContentHash: string;
+  queuedPresentationVersion: string;
+  createdAt: string;
+  updatedAt: string;
+  book: CatalogBook | null;
+  sourceState:
+    | "ready"
+    | "source-unavailable"
+    | "source-changed"
+    | "presentation-changed"
+    | "unsupported"
+    | "missing-or-retired";
+}
+
+export interface SendQueue {
+  profileId: string;
+  revision: number;
+  entries: SendQueueEntry[];
+  total: number;
+  totalSourceBytes: number;
+}
+
+export interface SendQueueAddInput {
+  expectedRevision: number;
+  bookIds: string[];
+}
+
+export interface SendQueueReplaceInput extends SendQueueAddInput {}
+
+export interface BookSelectionResult {
+  profileId: string;
+  bookIds: string[];
+  total: number;
+  ceiling: number;
+}
+
+export interface SmartShelf {
+  id: string;
+  profileId: string;
+  name: string;
+  query: SmartShelfQuery;
+  pinnedRank: number | null;
+  revision: number;
+  serverCount: number | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface SmartShelfCreateInput {
+  name: string;
+  query: SmartShelfQuery;
+  pinned?: boolean;
+}
+
+export interface SmartShelfPatchInput {
+  expectedRevision: number;
+  name?: string;
+  query?: SmartShelfQuery;
+  pinned?: boolean;
+}
+
+export interface SmartShelfPinnedOrderInput {
+  shelves: Array<{ id: string; expectedRevision: number }>;
+}
+
+export interface ProfileBookAnnotation {
+  profileId: string;
+  bookId: string;
+  favorite: boolean;
+  wantToRead: boolean;
+  revision: number;
+  createdAt: string | null;
+  updatedAt: string | null;
+}
+
+export interface ProfileBookAnnotationPatchInput {
+  expectedRevision: number;
+  favorite?: boolean;
+  wantToRead?: boolean;
 }
 
 export interface BookSetQuery extends BookQuery {
@@ -319,8 +634,34 @@ export interface BookSetQuery extends BookQuery {
   excludeBookIds?: string[];
 }
 
+export interface CatalogSeriesSummary {
+  key: string;
+  name: string;
+  bookCount: number;
+  numberedCount: number;
+  unnumberedCount: number;
+}
+
+export interface CatalogSeriesSummaryPage {
+  items: CatalogSeriesSummary[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface CatalogSeriesDetail {
+  key: string;
+  name: string;
+  books: BookPage;
+  duplicateIndices: number[];
+  missingIntegerIndices: number[];
+  unnumberedCount: number;
+}
+
 export interface MatchIndexEntry {
   bookId: string;
+  /** Optional catalog-presentation preference; never Kindle deletion authority. */
+  preferredPresentation?: true;
   title: string;
   authors: string[];
   authorSort: string | null;

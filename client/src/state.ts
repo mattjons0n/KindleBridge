@@ -1,5 +1,9 @@
 import type { AppError } from "./app-error";
 import type { ConversionResult } from "./api/convert";
+import {
+  readReplacementCleanupRecords,
+  type ReplacementCleanupRecord,
+} from "./replacement-cleanup-journal";
 
 export type GateStatus = "pending" | "active" | "passed" | "failed";
 
@@ -108,6 +112,8 @@ export interface AppState {
   readonly catalogInventoryState: CatalogInventoryState;
   readonly integratedTransfer: TransferState;
   readonly pendingObjectCleanup?: PendingObjectCleanup;
+  /** Durable, non-authoritative reminders for verified replacement duplicates. */
+  readonly pendingReplacementCleanups?: readonly ReplacementCleanupRecord[];
   readonly activeError?: AppError;
 }
 
@@ -304,6 +310,7 @@ export function initialAppState(): AppState {
     catalogInventoryState: "idle",
     integratedTransfer: { kind: "idle" },
     pendingObjectCleanup: readPendingObjectCleanup(),
+    pendingReplacementCleanups: readReplacementCleanupRecords(),
   };
 }
 

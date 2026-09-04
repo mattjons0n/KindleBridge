@@ -87,6 +87,59 @@ describe("bounded match-index serialization", () => {
     );
   });
 
+  it("emits one bounded profile presentation preference in object and wire indexes", async () => {
+    const { database, profileId, rootId } = await fixture();
+    const original = database.listBooks(profileId).items[0]!;
+    const preferred = database.upsertCatalogFile({
+      rootId,
+      relativePath: "preferred.epub",
+      format: "epub",
+      size: 42,
+      mtimeMs: 2,
+      contentHash: "a".repeat(64),
+      scanToken: "bounded-preference",
+      retainedRelativePaths: new Set(["nested/quoted.epub", "preferred.epub"]),
+      metadata: {
+        title: "Preferred presentation",
+        authors: ["Ada Author"],
+        authorSort: "Author, Ada",
+        language: "en",
+        publisher: null,
+        publishedAt: null,
+        series: null,
+        subjects: [],
+        identifiers: [],
+        metadataComplete: true,
+        coverKey: null,
+        coverMediaType: null,
+      },
+    });
+    const duplicate = database.listCatalogIssues(profileId, { type: "suspected-duplicate" }).items[0]!;
+    database.setCatalogDuplicatePreference(profileId, duplicate.signature, {
+      expectedRevision: duplicate.disposition.revision,
+      preferredBookId: preferred.bookId,
+    });
+
+    const objectIndex = database.getMatchIndex(profileId);
+    expect(objectIndex.entries.find(({ bookId }) => bookId === preferred.bookId)).toMatchObject({
+      preferredPresentation: true,
+    });
+    expect(objectIndex.entries.find(({ bookId }) => bookId === original.id)?.preferredPresentation).toBeUndefined();
+
+    const body = database.serializeMatchIndex(profileId);
+    const wire = JSON.parse(body.toString("utf8")) as {
+      entries: Array<{ bookId: string; preferredPresentation?: true }>;
+    };
+    expect(wire.entries.find(({ bookId }) => bookId === preferred.bookId)).toMatchObject({
+      preferredPresentation: true,
+    });
+    expect(wire.entries.find(({ bookId }) => bookId === original.id)?.preferredPresentation).toBeUndefined();
+    expect(database.serializeMatchIndex(profileId, { maxResponseBytes: body.length })).toHaveLength(body.length);
+    expect(() => database.serializeMatchIndex(profileId, { maxResponseBytes: body.length - 1 })).toThrow(
+      expect.objectContaining({ code: "match_index_too_large" }),
+    );
+  });
+
   it("marks only distinct enabled and available cross-profile metadata claimants", async () => {
     const { database, profileId, rootId } = await fixture();
     database.upsertCatalogFile({

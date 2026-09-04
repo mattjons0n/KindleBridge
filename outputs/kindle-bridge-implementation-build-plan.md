@@ -478,6 +478,7 @@ Mocks can prove behavior, not Kindle acceptance. Any release that changes conver
 - public internet exposure without authentication;
 - private user accounts before an authentication milestone is approved;
 - automatic deletion, overwrite, rename, or bidirectional Kindle sync;
+- browser-local Kindle reading progress, Read/Unread state, dashboard progress bars/status icons, and reading-status filtering, as specified in [`BACKLOG.md`](../BACKLOG.md#read-kindle-progress-and-reading-state-from-sidecars);
 - mobile Safari, Firefox, iOS, or other browsers without the required WebUSB support.
 
 ## 10. Completion and next gate

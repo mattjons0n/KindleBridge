@@ -7,33 +7,66 @@ import { pipeline } from "node:stream/promises";
 
 import {
   MAX_CATALOG_JSON_RESPONSE_BYTES,
+  MAX_BOOK_SELECTION_IDS,
   MAX_CATALOG_ROOTS_PER_PROFILE,
   MAX_MATCH_INDEX_DELIVERIES,
   MAX_MATCH_INDEX_ENTRIES,
   MAX_MATCH_INDEX_RESPONSE_BYTES,
+  MAX_METADATA_CANDIDATES,
+  MAX_METADATA_IMPORT_FIELDS,
+  MAX_METADATA_LOOKUP_JOB_BOOKS,
+  MAX_PINNED_SMART_SHELVES_PER_PROFILE,
+  MAX_SEND_QUEUE_MUTATION_BOOK_IDS,
+  MAX_SEND_QUEUE_ENTRIES_PER_PROFILE,
   type BookMetadataPatchInput,
   type BookMetadataResetInput,
+  type CatalogMetadataCandidate,
   type BookSetQuery,
   type CatalogSort,
   type CatalogStatus,
+  type ConfigurableCoverProvider,
   type CoverImportInput,
   type CoverProvider,
   type DeliveryInput,
   type DeliveryStatus,
+  type EditableMetadataField,
+  type MetadataCandidateImportInput,
+  type MetadataCandidateSearchTerms,
+  type MetadataLookupJobControlInput,
+  type MetadataLookupJobInput,
   type ProfileConfigurationInput,
   type ProfileInput,
   type RootInput,
+  type ProfileBookAnnotationPatchInput,
+  type SendQueueAddInput,
+  type SmartShelfCreateInput,
+  type SmartShelfPatchInput,
+  type SmartShelfPinnedOrderInput,
 } from "../shared/catalog-contracts.js";
-import { DEFAULT_METADATA_LIMITS } from "./book-metadata.js";
+import {
+  CATALOG_ISSUE_MODEL_VERSION,
+  type CatalogHealthQuery,
+  type CatalogDuplicatePreferenceInput,
+  type CatalogIssueDispositionInput,
+  type CatalogIssueRetryInput,
+  type CatalogIssueSeverity,
+  type CatalogIssueType,
+} from "../shared/catalog-issues.js";
+import { normalizeSmartShelfQuery, SmartShelfQueryError } from "../shared/shelf-query.js";
+import { canonicalSeriesKey } from "../shared/series.js";
+import { DEFAULT_METADATA_LIMITS, inspectRasterImage } from "./book-metadata.js";
 import { CatalogDatabase, CatalogDatabaseError } from "./catalog-database.js";
 import { CatalogIndexer } from "./catalog-indexer.js";
 import { CoverCache, CoverCacheError } from "./cover-cache.js";
 import { CoverProviderClient, CoverProviderError } from "./cover-providers.js";
 import { CatalogEventHub } from "./event-hub.js";
+import { MetadataLookupWorker } from "./metadata-lookup-worker.js";
 import { AllowedRootPolicy, RootPolicyError } from "./root-policy.js";
 import { isFatalSqliteError } from "./sqlite-health.js";
 import {
   MAX_METADATA_COVER_BYTES,
+  MAX_METADATA_COVER_DIMENSION,
+  MAX_METADATA_COVER_PIXELS,
   MetadataCoverStore,
   MetadataCoverStoreError,
 } from "./metadata-cover-store.js";
@@ -61,6 +94,8 @@ export interface CatalogHttpOptions {
   settingsMode: "read-write" | "read-only";
   googleBooksApiKey?: string;
   coverProviderTimeoutMs: number;
+  /** Test seam; production always uses the platform fetch implementation. */
+  coverProviderFetch?: typeof fetch;
   staticDirectory?: string;
 }
 
@@ -146,6 +181,16 @@ interface BufferedResponseWaiter {
   cleanup: () => void;
 }
 
+interface CachedMetadataCandidate {
+  readonly profileId: string;
+  readonly bookId: string;
+  readonly candidate: CatalogMetadataCandidate;
+  readonly expiresAt: number;
+}
+
+const METADATA_CANDIDATE_CACHE_TTL_MS = 15 * 60_000;
+const MAX_CACHED_METADATA_CANDIDATES = 1_000;
+
 export class CatalogHttpServer {
   private readonly options: CatalogHttpOptions;
   private readonly server: Server;
@@ -166,6 +211,8 @@ export class CatalogHttpServer {
   private readonly activeRequestWaiters = new Set<() => void>();
   private readonly rateWindows = new Map<string, { startedAt: number; count: number }>();
   private readonly coverProviders: CoverProviderClient;
+  private readonly metadataLookupWorker: MetadataLookupWorker;
+  private readonly metadataCandidates = new Map<string, CachedMetadataCandidate>();
 
   constructor(
     private readonly database: CatalogDatabase,
@@ -189,11 +236,13 @@ export class CatalogHttpServer {
     if (!Number.isSafeInteger(this.options.coverProviderTimeoutMs) || this.options.coverProviderTimeoutMs <= 0) {
       throw new RangeError("Cover provider timeout must be a positive integer.");
     }
+    this.database.initializeCoverProviderCredentials(this.options.googleBooksApiKey);
     this.coverProviders = new CoverProviderClient(
-      fetch,
-      this.options.googleBooksApiKey,
+      this.options.coverProviderFetch ?? fetch,
+      () => this.database.getCoverProviderCredential("google-books")?.apiKey,
       this.options.coverProviderTimeoutMs,
     );
+    this.metadataLookupWorker = new MetadataLookupWorker(this.database, this.coverProviders);
     this.server = createServer((request, response) => void this.handle(request, response));
     this.server.requestTimeout = 30_000;
     this.server.headersTimeout = 10_000;
@@ -367,6 +416,10 @@ export class CatalogHttpServer {
       }
       return;
     }
+    if (segments[0] === "settings" && segments[1] === "cover-providers") {
+      await this.routeCoverProviderSettings(request, response, url, segments.slice(2));
+      return;
+    }
     if (segments[0] === "profiles") {
       await this.routeProfiles(request, response, url, segments);
       return;
@@ -394,6 +447,71 @@ export class CatalogHttpServer {
         });
       }
       sendJson(response, result.created ? 201 : 200, result.record);
+      return;
+    }
+    throw new HttpError(404, "not_found", "Route not found.");
+  }
+
+  private async routeCoverProviderSettings(
+    request: IncomingMessage,
+    response: ServerResponse,
+    url: URL,
+    segments: string[],
+  ): Promise<void> {
+    const method = request.method ?? "GET";
+    if (segments.length === 0 && method === "GET") {
+      sendJson(response, 200, { items: this.database.listCoverProviderCredentialStates() });
+      return;
+    }
+    if (segments.length < 1) throw new HttpError(404, "not_found", "Route not found.");
+    const provider = configurableCoverProvider(segments[0]);
+    if (segments.length === 1 && method === "GET") {
+      sendJson(response, 200, this.database.getCoverProviderCredentialState(provider));
+      return;
+    }
+    if (segments.length === 1 && method === "PUT") {
+      this.assertSettingsWritable();
+      const input = validateCoverProviderCredential(await readJson(request, this.options.maxJsonBodyBytes));
+      const idempotencyKey = requiredIdempotencyKey(request);
+      sendJson(
+        response,
+        200,
+        this.database.setCoverProviderCredential(provider, input.apiKey, input.expectedRevision, idempotencyKey),
+      );
+      return;
+    }
+    if (segments.length === 1 && method === "DELETE") {
+      this.assertSettingsWritable();
+      const idempotencyKey = requiredIdempotencyKey(request);
+      const expectedRevision = boundedInteger(
+        requiredString(url.searchParams.get("expectedRevision"), "expectedRevision", 20),
+        "expectedRevision",
+        0,
+        Number.MAX_SAFE_INTEGER,
+      );
+      sendJson(response, 200, this.database.removeCoverProviderCredential(provider, expectedRevision, idempotencyKey));
+      return;
+    }
+    if (segments.length === 2 && segments[1] === "test" && method === "POST") {
+      this.assertSettingsWritable();
+      const input = validateCoverProviderCredentialTest(await readJson(request, this.options.maxJsonBodyBytes));
+      const credential = this.database.getCoverProviderCredential(provider);
+      if (!credential) {
+        throw new HttpError(409, "provider_not_configured", "Add a Google Books API key in Settings before testing this provider.");
+      }
+      if (credential.revision !== input.expectedRevision) {
+        throw new HttpError(409, "conflict", "Cover-provider settings changed in another browser.");
+      }
+      const errorCode = await this.withProviderRequest(
+        request,
+        response,
+        (signal) => this.coverProviders.testGoogleBooksCredential(credential.apiKey, signal),
+      );
+      sendJson(
+        response,
+        200,
+        this.database.recordCoverProviderCredentialTest(provider, credential.revision, errorCode),
+      );
       return;
     }
     throw new HttpError(404, "not_found", "Route not found.");
@@ -516,6 +634,26 @@ export class CatalogHttpServer {
       await this.routeBooks(request, response, url, profileId, segments.slice(3));
       return;
     }
+    if (segments[2] === "series") {
+      this.routeSeries(response, url, profileId, segments.slice(3), method);
+      return;
+    }
+    if (segments[2] === "send-queue") {
+      await this.routeSendQueue(request, response, url, profileId, segments.slice(3));
+      return;
+    }
+    if (segments[2] === "shelves") {
+      await this.routeSmartShelves(request, response, url, profileId, segments.slice(3));
+      return;
+    }
+    if (segments[2] === "issues") {
+      await this.routeCatalogIssues(request, response, url, profileId, segments.slice(3));
+      return;
+    }
+    if (segments[2] === "metadata-lookup-jobs") {
+      await this.routeMetadataLookupJobs(request, response, url, profileId, segments.slice(3));
+      return;
+    }
     if (segments.length === 3 && segments[2] === "filters" && method === "GET") {
       this.requireProfile(profileId);
       const releaseLargeResponse = await this.acquireBufferedResponse(response);
@@ -546,6 +684,308 @@ export class CatalogHttpServer {
         throw error;
       }
       return;
+    }
+    throw new HttpError(404, "not_found", "Route not found.");
+  }
+
+  private async routeCatalogIssues(
+    request: IncomingMessage,
+    response: ServerResponse,
+    url: URL,
+    profileId: string,
+    segments: string[],
+  ): Promise<void> {
+    const method = request.method ?? "GET";
+    this.requireProfile(profileId);
+    if (segments.length === 0 && method === "GET") {
+      const query = catalogHealthQuery(url.searchParams);
+      sendJson(response, 200, this.database.listCatalogIssues(profileId, query), this.options.maxCatalogJsonResponseBytes);
+      return;
+    }
+    if (segments.length >= 1) {
+      const signature = catalogIssueSignature(segments[0]);
+      if (segments.length === 1 && method === "PATCH") {
+        const input = validateCatalogIssueDisposition(await readJson(request, this.options.maxJsonBodyBytes));
+        const result = this.database.setCatalogIssueIgnored(
+          profileId,
+          signature,
+          input.expectedRevision,
+          input.ignored,
+        );
+        if (result.applied) {
+          this.events.publish({
+            type: "issues.updated",
+            profileId,
+            data: { modelVersion: CATALOG_ISSUE_MODEL_VERSION, revision: result.issue.disposition.revision },
+          });
+        }
+        sendJson(response, 200, result.issue, this.options.maxCatalogJsonResponseBytes);
+        return;
+      }
+      if (segments.length === 2 && segments[1] === "preferred-book" && method === "PATCH") {
+        const input = validateCatalogDuplicatePreference(await readJson(request, this.options.maxJsonBodyBytes));
+        const result = this.database.setCatalogDuplicatePreference(profileId, signature, input);
+        if (result.applied) {
+          this.events.publish({
+            type: "issues.updated",
+            profileId,
+            data: { modelVersion: CATALOG_ISSUE_MODEL_VERSION, revision: result.issue.disposition.revision },
+          });
+        }
+        sendJson(response, 200, result.issue, this.options.maxCatalogJsonResponseBytes);
+        return;
+      }
+      if (segments.length === 2 && (segments[1] === "retry" || segments[1] === "rescan") && method === "POST") {
+        const input = validateCatalogIssueRetry(await readJson(request, this.options.maxJsonBodyBytes));
+        const result = this.database.recordCatalogIssueRetry(profileId, signature, input.expectedRevision);
+        const acceptedRootIds: string[] = [];
+        const blockedRootIds: string[] = [];
+        for (const rootId of result.issue.rootIds) {
+          (this.indexer.requestRescan(rootId) ? acceptedRootIds : blockedRootIds).push(rootId);
+        }
+        this.events.publish({
+          type: "issues.updated",
+          profileId,
+          data: {
+            modelVersion: CATALOG_ISSUE_MODEL_VERSION,
+            revision: result.issue.disposition.revision,
+            retryAcceptedRoots: acceptedRootIds.length,
+          },
+        });
+        sendJson(response, 202, { issue: result.issue, acceptedRootIds, blockedRootIds }, this.options.maxCatalogJsonResponseBytes);
+        return;
+      }
+    }
+    throw new HttpError(404, "not_found", "Route not found.");
+  }
+
+  private async routeMetadataLookupJobs(
+    request: IncomingMessage,
+    response: ServerResponse,
+    url: URL,
+    profileId: string,
+    segments: string[],
+  ): Promise<void> {
+    const method = request.method ?? "GET";
+    this.requireProfile(profileId);
+    if (segments.length === 0 && method === "GET") {
+      const allowed = new Set(["limit", "offset"]);
+      for (const key of url.searchParams.keys()) {
+        if (!allowed.has(key) || url.searchParams.getAll(key).length !== 1) {
+          throw new HttpError(400, "invalid_query", `Unsupported or repeated metadata lookup field: ${key}.`);
+        }
+      }
+      const limit = url.searchParams.has("limit")
+        ? boundedInteger(url.searchParams.get("limit"), "limit", 1, 20)
+        : 20;
+      const offset = url.searchParams.has("offset")
+        ? boundedInteger(url.searchParams.get("offset"), "offset", 0, 10_000_000)
+        : 0;
+      sendJson(
+        response,
+        200,
+        this.database.listMetadataLookupJobs(profileId, limit, offset),
+        this.options.maxCatalogJsonResponseBytes,
+      );
+      return;
+    }
+    if (segments.length === 0 && method === "POST") {
+      const input = validateMetadataLookupJob(await readJson(request, this.options.maxJsonBodyBytes));
+      const result = this.database.createMetadataLookupJob(profileId, input, requiredIdempotencyKey(request));
+      if (result.applied) {
+        this.events.publish({ type: "metadata-lookup.updated", profileId, jobId: result.job.id, data: { status: "queued" } });
+      }
+      sendJson(response, result.applied ? 201 : 200, result.job, this.options.maxCatalogJsonResponseBytes);
+      return;
+    }
+    if (segments.length >= 1) {
+      const jobId = metadataLookupJobId(segments[0]);
+      if (segments.length === 1 && method === "GET") {
+        const job = this.database.getMetadataLookupJob(profileId, jobId);
+        if (!job) throw new HttpError(404, "not_found", "Metadata lookup job not found.");
+        sendJson(response, 200, job, this.options.maxCatalogJsonResponseBytes);
+        return;
+      }
+      if (segments.length === 2 && ["resume", "pause", "cancel", "retry"].includes(segments[1]) && method === "POST") {
+        const input = validateMetadataLookupJobControl(await readJson(request, this.options.maxJsonBodyBytes));
+        const action = segments[1] as "resume" | "pause" | "cancel" | "retry";
+        const result = this.database.controlMetadataLookupJob(profileId, jobId, action, input.expectedRevision);
+        if (result.applied) {
+          this.events.publish({
+            type: "metadata-lookup.updated",
+            profileId,
+            jobId,
+            data: { status: result.job.status, revision: result.job.revision },
+          });
+        }
+        sendJson(response, 200, result.job, this.options.maxCatalogJsonResponseBytes);
+        return;
+      }
+      if (segments.length === 2 && segments[1] === "run" && method === "POST") {
+        requireEmptyJson(await readJson(request, this.options.maxJsonBodyBytes));
+        const job = await this.metadataLookupWorker.runStep(profileId, jobId);
+        this.events.publish({
+          type: "metadata-lookup.updated",
+          profileId,
+          jobId,
+          data: { status: job.status, revision: job.revision, pending: job.pending, ready: job.ready, failed: job.failed },
+        });
+        sendJson(response, 200, job, this.options.maxCatalogJsonResponseBytes);
+        return;
+      }
+    }
+    throw new HttpError(404, "not_found", "Route not found.");
+  }
+
+  private async routeSendQueue(
+    request: IncomingMessage,
+    response: ServerResponse,
+    url: URL,
+    profileId: string,
+    segments: string[],
+  ): Promise<void> {
+    const method = request.method ?? "GET";
+    this.requireProfile(profileId);
+    if (segments.length === 0 && method === "GET") {
+      sendJson(response, 200, this.database.getSendQueue(profileId), this.options.maxCatalogJsonResponseBytes);
+      return;
+    }
+    if (segments.length === 0 && method === "POST") {
+      const input = validateSendQueueInput(await readJson(request, this.options.maxJsonBodyBytes));
+      const result = this.database.addSendQueueEntries(
+        profileId,
+        input.bookIds,
+        input.expectedRevision,
+        requiredIdempotencyKey(request),
+      );
+      if (result.applied) {
+        this.events.publish({ type: "queue.updated", profileId, data: { revision: result.queue.revision } });
+      }
+      sendJson(response, result.applied ? 201 : 200, result.queue, this.options.maxCatalogJsonResponseBytes);
+      return;
+    }
+    if (segments.length === 0 && method === "PATCH") {
+      const input = validateSendQueueInput(
+        await readJson(request, this.options.maxJsonBodyBytes),
+        true,
+        MAX_SEND_QUEUE_ENTRIES_PER_PROFILE,
+      );
+      const result = this.database.replaceSendQueue(profileId, input.bookIds, input.expectedRevision);
+      if (result.applied) {
+        this.events.publish({ type: "queue.updated", profileId, data: { revision: result.queue.revision } });
+      }
+      sendJson(response, 200, result.queue, this.options.maxCatalogJsonResponseBytes);
+      return;
+    }
+    if (segments.length === 0 && method === "DELETE") {
+      const expectedRevision = expectedRevisionFromSearch(url.searchParams);
+      const result = this.database.clearSendQueue(profileId, expectedRevision);
+      if (result.applied) {
+        this.events.publish({ type: "queue.updated", profileId, data: { revision: result.queue.revision } });
+      }
+      sendJson(response, 200, result.queue, this.options.maxCatalogJsonResponseBytes);
+      return;
+    }
+    if (segments.length === 1 && method === "DELETE") {
+      const bookId = opaqueSegment(segments[0], "book");
+      const result = this.database.removeSendQueueEntry(profileId, bookId, expectedRevisionFromSearch(url.searchParams));
+      if (result.applied) {
+        this.events.publish({ type: "queue.updated", profileId, bookId, data: { revision: result.queue.revision } });
+      }
+      sendJson(response, 200, result.queue, this.options.maxCatalogJsonResponseBytes);
+      return;
+    }
+    throw new HttpError(404, "not_found", "Route not found.");
+  }
+
+  private routeSeries(
+    response: ServerResponse,
+    url: URL,
+    profileId: string,
+    segments: string[],
+    method: string,
+  ): void {
+    this.requireProfile(profileId);
+    if (method !== "GET") throw new HttpError(404, "not_found", "Route not found.");
+    const unknown = [...url.searchParams.keys()].find((key) => !["q", "limit", "offset"].includes(key));
+    if (unknown) throw new HttpError(400, "invalid_query", `Unsupported series query field: ${unknown}.`);
+    const limit = url.searchParams.has("limit")
+      ? boundedInteger(url.searchParams.get("limit"), "limit", 1, 200)
+      : undefined;
+    const offset = url.searchParams.has("offset")
+      ? boundedInteger(url.searchParams.get("offset"), "offset", 0, 10_000_000)
+      : undefined;
+    if (segments.length === 0) {
+      const q = url.searchParams.has("q") ? requiredString(url.searchParams.get("q"), "q", 500) : undefined;
+      sendJson(
+        response,
+        200,
+        this.database.listSeries(profileId, { q, limit, offset }),
+        this.options.maxCatalogJsonResponseBytes,
+      );
+      return;
+    }
+    if (segments.length === 1) {
+      const key = requiredString(segments[0], "seriesKey", 500);
+      if (canonicalSeriesKey(key) !== key) throw new HttpError(400, "invalid_identifier", "Series key is invalid.");
+      const series = this.database.getSeries(profileId, key, { limit, offset });
+      if (!series) throw new HttpError(404, "not_found", "Series not found.");
+      sendJson(response, 200, series, this.options.maxCatalogJsonResponseBytes);
+      return;
+    }
+    throw new HttpError(404, "not_found", "Route not found.");
+  }
+
+  private async routeSmartShelves(
+    request: IncomingMessage,
+    response: ServerResponse,
+    url: URL,
+    profileId: string,
+    segments: string[],
+  ): Promise<void> {
+    const method = request.method ?? "GET";
+    this.requireProfile(profileId);
+    if (segments.length === 0 && method === "GET") {
+      sendJson(response, 200, { items: this.database.listSmartShelves(profileId) }, this.options.maxCatalogJsonResponseBytes);
+      return;
+    }
+    if (segments.length === 0 && method === "POST") {
+      const input = validateSmartShelfCreate(await readJson(request, this.options.maxJsonBodyBytes));
+      const result = this.database.createSmartShelf(profileId, input, requiredIdempotencyKey(request));
+      if (result.applied) this.events.publish({ type: "shelf.updated", profileId, shelfId: result.shelf.id });
+      sendJson(response, result.applied ? 201 : 200, result.shelf, this.options.maxCatalogJsonResponseBytes);
+      return;
+    }
+    if (segments.length === 1 && segments[0] === "pinned-order" && method === "PATCH") {
+      const input = validateSmartShelfPinnedOrder(await readJson(request, this.options.maxJsonBodyBytes));
+      const result = this.database.reorderPinnedSmartShelves(profileId, input);
+      if (result.applied) {
+        this.events.publish({ type: "shelf.updated", profileId, data: { reordered: result.affectedShelfIds.length } });
+      }
+      sendJson(response, 200, { items: result.shelves }, this.options.maxCatalogJsonResponseBytes);
+      return;
+    }
+    if (segments.length === 1) {
+      const shelfId = opaqueSegment(segments[0], "shelf");
+      if (method === "GET") {
+        const shelf = this.database.getSmartShelf(profileId, shelfId);
+        if (!shelf) throw new HttpError(404, "not_found", "Smart shelf not found.");
+        sendJson(response, 200, shelf, this.options.maxCatalogJsonResponseBytes);
+        return;
+      }
+      if (method === "PATCH") {
+        const input = validateSmartShelfPatch(await readJson(request, this.options.maxJsonBodyBytes));
+        const result = this.database.updateSmartShelf(profileId, shelfId, input);
+        if (result.applied) this.events.publish({ type: "shelf.updated", profileId, shelfId });
+        sendJson(response, 200, result.shelf, this.options.maxCatalogJsonResponseBytes);
+        return;
+      }
+      if (method === "DELETE") {
+        this.database.deleteSmartShelf(profileId, shelfId, expectedRevisionFromSearch(url.searchParams));
+        this.events.publish({ type: "shelf.updated", profileId, shelfId });
+        response.writeHead(204).end();
+        return;
+      }
     }
     throw new HttpError(404, "not_found", "Route not found.");
   }
@@ -654,6 +1094,21 @@ export class CatalogHttpServer {
       }
       return;
     }
+    if (segments.length === 1 && segments[0] === "selection" && method === "POST") {
+      const raw = await readJson(request, this.options.maxJsonBodyBytes);
+      const object = objectValue(raw);
+      if (Object.hasOwn(object, "limit") || Object.hasOwn(object, "offset")) {
+        throw new HttpError(400, "invalid_query", "Filtered selection does not accept pagination.");
+      }
+      const query = queryFromObject(raw, false, true);
+      sendJson(
+        response,
+        200,
+        this.database.resolveBookSelection(profileId, query, MAX_BOOK_SELECTION_IDS),
+        this.options.maxCatalogJsonResponseBytes,
+      );
+      return;
+    }
     if (segments.length >= 1) {
       const bookId = opaqueSegment(segments[0], "book");
       if (segments.length === 1 && method === "GET") {
@@ -674,6 +1129,28 @@ export class CatalogHttpServer {
         sendJson(response, 200, state, this.options.maxCatalogJsonResponseBytes);
         return;
       }
+      if (segments.length === 2 && segments[1] === "details" && method === "GET") {
+        const state = this.database.getBookDetailsState(profileId, bookId);
+        if (!state) throw new HttpError(404, "not_found", "Book not found.");
+        sendJson(response, 200, state, this.options.maxCatalogJsonResponseBytes);
+        return;
+      }
+      if (segments.length === 2 && segments[1] === "annotation" && method === "GET") {
+        sendJson(
+          response,
+          200,
+          this.database.getProfileBookAnnotation(profileId, bookId),
+          this.options.maxCatalogJsonResponseBytes,
+        );
+        return;
+      }
+      if (segments.length === 2 && segments[1] === "annotation" && method === "PATCH") {
+        const input = validateProfileBookAnnotation(await readJson(request, this.options.maxJsonBodyBytes));
+        const result = this.database.updateProfileBookAnnotation(profileId, bookId, input);
+        if (result.applied) this.events.publish({ type: "annotation.updated", profileId, bookId });
+        sendJson(response, 200, result.annotation, this.options.maxCatalogJsonResponseBytes);
+        return;
+      }
       if (segments.length === 2 && segments[1] === "metadata" && method === "PATCH") {
         const input = validateBookMetadataPatch(await readJson(request, this.options.maxJsonBodyBytes));
         const state = this.database.patchBookMetadata(profileId, bookId, input);
@@ -686,6 +1163,14 @@ export class CatalogHttpServer {
         const state = this.database.resetBookMetadata(profileId, bookId, input);
         this.events.publish({ type: "book.updated", profileId, bookId, data: { metadataEdited: state.book.metadataEdited } });
         sendJson(response, 200, state, this.options.maxCatalogJsonResponseBytes);
+        return;
+      }
+      if (segments.length === 2 && segments[1] === "metadata-search" && method === "GET") {
+        await this.searchBookMetadata(request, response, url, profileId, bookId);
+        return;
+      }
+      if (segments.length === 2 && segments[1] === "metadata-import" && method === "POST") {
+        await this.importBookMetadata(request, response, profileId, bookId);
         return;
       }
       if (segments.length === 2 && segments[1] === "cover" && method === "GET") {
@@ -701,11 +1186,11 @@ export class CatalogHttpServer {
         return;
       }
       if (segments.length === 2 && segments[1] === "cover-search" && method === "GET") {
-        await this.searchBookCovers(response, url, profileId, bookId);
+        await this.searchBookCovers(request, response, url, profileId, bookId);
         return;
       }
       if (segments.length === 2 && segments[1] === "cover-preview" && method === "GET") {
-        await this.serveProviderCoverPreview(response, url, profileId, bookId);
+        await this.serveProviderCoverPreview(request, response, url, profileId, bookId);
         return;
       }
       if (segments.length === 2 && segments[1] === "cover-import" && method === "POST") {
@@ -844,6 +1329,7 @@ export class CatalogHttpServer {
   }
 
   private async searchBookCovers(
+    request: IncomingMessage,
     response: ServerResponse,
     url: URL,
     profileId: string,
@@ -854,7 +1340,11 @@ export class CatalogHttpServer {
     const query = requiredString(url.searchParams.get("q"), "q", 500);
     const rawLimit = url.searchParams.get("limit");
     const limit = rawLimit === null ? 12 : boundedInteger(rawLimit, "limit", 1, 20);
-    const candidates = await this.coverProviders.search(provider, query, limit);
+    const candidates = await this.withProviderRequest(
+      request,
+      response,
+      (signal) => this.coverProviders.search(provider, query, limit, signal),
+    );
     const prefix = `/api/profiles/${encodeURIComponent(profileId)}/books/${encodeURIComponent(bookId)}/cover-preview`;
     sendJson(response, 200, {
       provider,
@@ -865,7 +1355,207 @@ export class CatalogHttpServer {
     }, this.options.maxCatalogJsonResponseBytes);
   }
 
+  private async searchBookMetadata(
+    request: IncomingMessage,
+    response: ServerResponse,
+    url: URL,
+    profileId: string,
+    bookId: string,
+  ): Promise<void> {
+    if (!this.database.getBook(profileId, bookId)) throw new HttpError(404, "not_found", "Book not found.");
+    const allowed = new Set(["provider", "title", "author", "identifier", "limit"]);
+    for (const key of url.searchParams.keys()) {
+      if (!allowed.has(key) || url.searchParams.getAll(key).length !== 1) {
+        throw new HttpError(400, "invalid_query", `Unsupported or repeated metadata search field: ${key}.`);
+      }
+    }
+    const provider = coverProvider(url.searchParams.get("provider"));
+    const terms: MetadataCandidateSearchTerms = {};
+    if (url.searchParams.has("title")) terms.title = normalizedMetadataSearchTerm(url.searchParams.get("title"), "title", 500);
+    if (url.searchParams.has("author")) terms.author = normalizedMetadataSearchTerm(url.searchParams.get("author"), "author", 500);
+    if (url.searchParams.has("identifier")) {
+      terms.identifier = normalizedMetadataSearchTerm(url.searchParams.get("identifier"), "identifier", 128);
+    }
+    if (!terms.title && !terms.author && !terms.identifier) {
+      throw new HttpError(400, "invalid_query", "At least one normalized metadata search term is required.");
+    }
+    const limit = url.searchParams.has("limit")
+      ? boundedInteger(url.searchParams.get("limit"), "limit", 1, MAX_METADATA_CANDIDATES)
+      : MAX_METADATA_CANDIDATES;
+    const candidates = await this.withProviderRequest(
+      request,
+      response,
+      (signal) => this.coverProviders.searchMetadata(provider, terms, limit, signal),
+    );
+    this.cacheMetadataCandidates(profileId, bookId, candidates);
+    sendJson(response, 200, { provider, items: candidates }, this.options.maxCatalogJsonResponseBytes);
+  }
+
+  private async importBookMetadata(
+    request: IncomingMessage,
+    response: ServerResponse,
+    profileId: string,
+    bookId: string,
+  ): Promise<void> {
+    if (!this.database.getBook(profileId, bookId)) throw new HttpError(404, "not_found", "Book not found.");
+    const input = validateMetadataCandidateImport(await readJson(request, this.options.maxJsonBodyBytes));
+    this.pruneMetadataCandidateCache();
+    const cacheKey = this.metadataCandidateCacheKey(profileId, bookId, input.provider, input.candidateId);
+    const cached = this.metadataCandidates.get(cacheKey);
+    let candidate = cached && cached.expiresAt > Date.now() ? cached.candidate : undefined;
+    if (input.lookupJobId) {
+      const job = this.database.getMetadataLookupJob(profileId, input.lookupJobId);
+      const entry = job?.entries.find((item) => item.bookId === bookId && item.status === "ready");
+      candidate = entry?.candidates.find((item) => item.provider === input.provider && item.candidateId === input.candidateId);
+    }
+    if (!candidate) {
+      this.metadataCandidates.delete(cacheKey);
+      throw new HttpError(409, "metadata_candidate_expired", "Search again before importing this metadata candidate.");
+    }
+    const changes: BookMetadataPatchInput["changes"] = {};
+    for (const field of input.selectedFields) {
+      if (!Object.hasOwn(candidate.metadata, field)) {
+        throw new HttpError(400, "invalid_request", `The selected candidate does not provide ${field}.`);
+      }
+      (changes as Record<string, unknown>)[field] = candidate.metadata[field];
+    }
+    if (input.selectedFields.length === 0 && !input.includeCover) {
+      throw new HttpError(400, "invalid_request", "Select at least one metadata field or the candidate cover.");
+    }
+    let stored: Awaited<ReturnType<MetadataCoverStore["store"]>> | null = null;
+    let sourceUrl: string | null = null;
+    if (input.includeCover) {
+      const coverCandidateId = candidate.coverCandidateId;
+      if (!coverCandidateId) throw new HttpError(400, "invalid_request", "This metadata candidate has no cover.");
+      const remote = await this.withProviderRequest(
+        request,
+        response,
+        (signal) => this.coverProviders.fetchCover(input.provider, coverCandidateId, signal),
+      );
+      stored = await this.requireMetadataCoverStore().store(remote.data, remote.mediaType);
+      sourceUrl = remote.sourceUrl;
+    }
+    try {
+      const result = this.database.importBookMetadata(
+        profileId,
+        bookId,
+        {
+          expectedRevision: input.expectedRevision,
+          expectedContentHash: input.expectedContentHash,
+          changes,
+        },
+        stored ? {
+          ...stored,
+          sourceKind: "provider",
+          provider: input.provider,
+          providerReference: candidate.coverCandidateId ?? null,
+          sourceUrl,
+        } : null,
+        input.lookupJobId ? {
+          jobId: input.lookupJobId,
+          provider: input.provider,
+          candidateId: input.candidateId,
+        } : null,
+      );
+      if (result.unreferencedAssetKey) await this.retireMetadataCoverAssetBestEffort(result.unreferencedAssetKey);
+      if (!input.lookupJobId) this.metadataCandidates.delete(cacheKey);
+      this.events.publish({
+        type: "book.updated",
+        profileId,
+        bookId,
+        data: { metadataEdited: input.selectedFields.length > 0, coverEdited: input.includeCover },
+      });
+      if (input.lookupJobId) {
+        this.events.publish({ type: "metadata-lookup.updated", profileId, jobId: input.lookupJobId });
+      }
+      this.events.publish({
+        type: "issues.updated",
+        profileId,
+        data: { modelVersion: CATALOG_ISSUE_MODEL_VERSION },
+      });
+      sendJson(response, 200, result.state, this.options.maxCatalogJsonResponseBytes);
+    } catch (error) {
+      if (stored) {
+        await this.requireMetadataCoverStore()
+          .removeIfUnreferenced(stored.assetKey, this.database.isMetadataCoverReferenced(stored.assetKey))
+          .catch(() => undefined);
+      }
+      throw error;
+    }
+  }
+
+  private cacheMetadataCandidates(
+    profileId: string,
+    bookId: string,
+    candidates: readonly CatalogMetadataCandidate[],
+  ): void {
+    this.pruneMetadataCandidateCache();
+    for (const candidate of candidates) {
+      while (this.metadataCandidates.size >= MAX_CACHED_METADATA_CANDIDATES) {
+        const oldest = this.metadataCandidates.keys().next().value as string | undefined;
+        if (oldest === undefined) break;
+        this.metadataCandidates.delete(oldest);
+      }
+      const key = this.metadataCandidateCacheKey(profileId, bookId, candidate.provider, candidate.candidateId);
+      this.metadataCandidates.delete(key);
+      this.metadataCandidates.set(key, {
+        profileId,
+        bookId,
+        candidate,
+        expiresAt: Date.now() + METADATA_CANDIDATE_CACHE_TTL_MS,
+      });
+    }
+  }
+
+  private pruneMetadataCandidateCache(): void {
+    const timestamp = Date.now();
+    for (const [key, value] of this.metadataCandidates) {
+      if (value.expiresAt <= timestamp) this.metadataCandidates.delete(key);
+    }
+  }
+
+  private metadataCandidateCacheKey(
+    profileId: string,
+    bookId: string,
+    provider: CoverProvider,
+    candidateId: string,
+  ): string {
+    return JSON.stringify([profileId, bookId, provider, candidateId]);
+  }
+
+  private async withProviderRequest<T>(
+    request: IncomingMessage,
+    response: ServerResponse,
+    operation: (signal: AbortSignal) => Promise<T>,
+  ): Promise<T> {
+    const clientAbort = new AbortController();
+    const clientDisconnected = (): void => {
+      if (!response.writableFinished && !clientAbort.signal.aborted) {
+        clientAbort.abort(new CoverResponseAbortError("client"));
+      }
+    };
+    request.once("aborted", clientDisconnected);
+    response.once("close", clientDisconnected);
+    request.socket.once("close", clientDisconnected);
+    if (
+      request.aborted
+      || request.socket.destroyed
+      || (response.destroyed && !response.writableFinished)
+    ) clientDisconnected();
+    try {
+      return await operation(AbortSignal.any([
+        this.immediateShutdownAbort.signal,
+        clientAbort.signal,
+      ]));
+    } finally {
+      request.off("aborted", clientDisconnected);
+      response.off("close", clientDisconnected);
+      request.socket.off("close", clientDisconnected);
+    }
+  }
+
   private async serveProviderCoverPreview(
+    request: IncomingMessage,
     response: ServerResponse,
     url: URL,
     profileId: string,
@@ -876,7 +1566,21 @@ export class CatalogHttpServer {
     const candidateId = requiredString(url.searchParams.get("candidateId"), "candidateId", 160);
     const releaseLargeResponse = await this.acquireBufferedResponse(response);
     try {
-      const cover = await this.coverProviders.fetchCover(provider, candidateId);
+      const cover = await this.withProviderRequest(
+        request,
+        response,
+        (signal) => this.coverProviders.fetchCover(provider, candidateId, signal),
+      );
+      const image = inspectRasterImage(cover.data);
+      if (
+        !image
+        || image.mediaType !== cover.mediaType
+        || image.width > MAX_METADATA_COVER_DIMENSION
+        || image.height > MAX_METADATA_COVER_DIMENSION
+        || image.width * image.height > MAX_METADATA_COVER_PIXELS
+      ) {
+        throw new CoverProviderError("provider_unavailable", "The cover provider returned an invalid image.");
+      }
       response.writeHead(200, {
         "Content-Type": cover.mediaType,
         "Content-Length": cover.data.length,
@@ -897,7 +1601,11 @@ export class CatalogHttpServer {
     bookId: string,
   ): Promise<void> {
     const input = validateCoverImport(await readJson(request, this.options.maxJsonBodyBytes));
-    const remote = await this.coverProviders.fetchCover(input.provider, input.candidateId);
+    const remote = await this.withProviderRequest(
+      request,
+      response,
+      (signal) => this.coverProviders.fetchCover(input.provider, input.candidateId, signal),
+    );
     const store = this.requireMetadataCoverStore();
     const stored = await store.store(remote.data, remote.mediaType);
     try {
@@ -1722,6 +2430,169 @@ function validateCoverImport(value: unknown): CoverImportInput {
   };
 }
 
+function validateMetadataCandidateImport(value: unknown): MetadataCandidateImportInput {
+  const object = objectValue(value);
+  requireOnlyFields(object, [
+    "provider",
+    "candidateId",
+    "lookupJobId",
+    "selectedFields",
+    "includeCover",
+    "expectedRevision",
+    "expectedContentHash",
+  ]);
+  if (!Array.isArray(object.selectedFields) || object.selectedFields.length > MAX_METADATA_IMPORT_FIELDS) {
+    throw new HttpError(400, "invalid_request", "selectedFields must be a bounded array.");
+  }
+  const allowed = new Set<string>(EDITABLE_METADATA_FIELDS);
+  const selectedFields = object.selectedFields.map((field) => {
+    if (typeof field !== "string" || !allowed.has(field)) {
+      throw new HttpError(400, "invalid_request", "A selected metadata field is invalid.");
+    }
+    return field as EditableMetadataField;
+  });
+  if (new Set(selectedFields).size !== selectedFields.length) {
+    throw new HttpError(400, "invalid_request", "selectedFields contains duplicates.");
+  }
+  return {
+    provider: coverProvider(object.provider),
+    candidateId: requiredString(object.candidateId, "candidateId", 160),
+    ...(object.lookupJobId === undefined ? {} : { lookupJobId: metadataLookupJobId(requiredString(object.lookupJobId, "lookupJobId", 100)) }),
+    selectedFields,
+    includeCover: optionalBoolean(object.includeCover, "includeCover") ?? false,
+    expectedRevision: boundedInteger(object.expectedRevision, "expectedRevision", 0, Number.MAX_SAFE_INTEGER),
+    expectedContentHash: contentHash(object.expectedContentHash),
+  };
+}
+
+function validateMetadataLookupJob(value: unknown): MetadataLookupJobInput {
+  const object = objectValue(value);
+  requireOnlyFields(object, ["provider", "bookIds"]);
+  if (
+    !Array.isArray(object.bookIds)
+    || object.bookIds.length === 0
+    || object.bookIds.length > MAX_METADATA_LOOKUP_JOB_BOOKS
+  ) {
+    throw new HttpError(400, "invalid_request", `bookIds must contain 1-${MAX_METADATA_LOOKUP_JOB_BOOKS} books.`);
+  }
+  const bookIds = object.bookIds.map((value) => opaqueSegment(requiredString(value, "bookId", 100), "book"));
+  if (new Set(bookIds).size !== bookIds.length) {
+    throw new HttpError(400, "invalid_request", "bookIds must contain unique books.");
+  }
+  return { provider: coverProvider(object.provider), bookIds };
+}
+
+function validateMetadataLookupJobControl(value: unknown): MetadataLookupJobControlInput {
+  const object = objectValue(value);
+  requireOnlyFields(object, ["expectedRevision"]);
+  return {
+    expectedRevision: boundedInteger(object.expectedRevision, "expectedRevision", 1, Number.MAX_SAFE_INTEGER),
+  };
+}
+
+function metadataLookupJobId(value: string): string {
+  if (!/^lookup_[A-Za-z0-9_-]{8,80}$/u.test(value)) {
+    throw new HttpError(400, "invalid_identifier", "Metadata lookup job identifier is invalid.");
+  }
+  return value;
+}
+
+function requireEmptyJson(value: unknown): void {
+  const object = objectValue(value);
+  requireOnlyFields(object, []);
+}
+
+function normalizedMetadataSearchTerm(value: unknown, field: string, maximum: number): string {
+  const term = requiredString(value, field, maximum).normalize("NFKC").replace(/\s+/gu, " ");
+  if (/\p{Cc}/u.test(term)) throw new HttpError(400, "invalid_query", `${field} is invalid.`);
+  return term;
+}
+
+const CATALOG_ISSUE_TYPES: readonly CatalogIssueType[] = [
+  "missing-cover",
+  "incomplete-metadata",
+  "metadata-parser-failure",
+  "low-confidence-provider-data",
+  "unavailable-source",
+  "suspected-duplicate",
+];
+const CATALOG_ISSUE_SEVERITIES: readonly CatalogIssueSeverity[] = ["info", "warning", "error"];
+
+function catalogHealthQuery(params: URLSearchParams): CatalogHealthQuery {
+  const allowed = new Set(["type", "severity", "ignored", "limit", "offset"]);
+  for (const key of params.keys()) {
+    if (!allowed.has(key) || params.getAll(key).length !== 1) {
+      throw new HttpError(400, "invalid_query", `Unsupported or repeated catalog health field: ${key}.`);
+    }
+  }
+  const query: CatalogHealthQuery = {};
+  const type = params.get("type");
+  if (type !== null) {
+    if (!CATALOG_ISSUE_TYPES.includes(type as CatalogIssueType)) {
+      throw new HttpError(400, "invalid_query", "Catalog issue type is invalid.");
+    }
+    (query as { type?: CatalogIssueType }).type = type as CatalogIssueType;
+  }
+  const severity = params.get("severity");
+  if (severity !== null) {
+    if (!CATALOG_ISSUE_SEVERITIES.includes(severity as CatalogIssueSeverity)) {
+      throw new HttpError(400, "invalid_query", "Catalog issue severity is invalid.");
+    }
+    (query as { severity?: CatalogIssueSeverity }).severity = severity as CatalogIssueSeverity;
+  }
+  const ignored = params.get("ignored");
+  if (ignored !== null) {
+    if (ignored !== "true" && ignored !== "false") throw new HttpError(400, "invalid_query", "ignored must be true or false.");
+    (query as { ignored?: boolean }).ignored = ignored === "true";
+  }
+  if (params.has("limit")) {
+    (query as { limit?: number }).limit = boundedInteger(params.get("limit"), "limit", 1, 200);
+  }
+  if (params.has("offset")) {
+    (query as { offset?: number }).offset = boundedInteger(params.get("offset"), "offset", 0, 10_000_000);
+  }
+  return query;
+}
+
+function catalogIssueSignature(value: string): string {
+  if (!/^issue-[a-f0-9]{16}$/u.test(value)) {
+    throw new HttpError(400, "invalid_identifier", "Catalog issue signature is invalid.");
+  }
+  return value;
+}
+
+function validateCatalogIssueDisposition(value: unknown): CatalogIssueDispositionInput {
+  const object = objectValue(value);
+  requireOnlyFields(object, ["expectedRevision", "ignored"]);
+  if (typeof object.ignored !== "boolean") {
+    throw new HttpError(400, "invalid_request", "ignored must be a boolean.");
+  }
+  return {
+    expectedRevision: boundedInteger(object.expectedRevision, "expectedRevision", 0, Number.MAX_SAFE_INTEGER),
+    ignored: object.ignored,
+  };
+}
+
+function validateCatalogIssueRetry(value: unknown): CatalogIssueRetryInput {
+  const object = objectValue(value);
+  requireOnlyFields(object, ["expectedRevision"]);
+  return {
+    expectedRevision: boundedInteger(object.expectedRevision, "expectedRevision", 0, Number.MAX_SAFE_INTEGER),
+  };
+}
+
+function validateCatalogDuplicatePreference(value: unknown): CatalogDuplicatePreferenceInput {
+  const object = objectValue(value);
+  requireOnlyFields(object, ["expectedRevision", "preferredBookId"]);
+  const preferredBookId = object.preferredBookId === null
+    ? null
+    : opaqueSegment(requiredString(object.preferredBookId, "preferredBookId", 100), "book");
+  return {
+    expectedRevision: boundedInteger(object.expectedRevision, "expectedRevision", 0, Number.MAX_SAFE_INTEGER),
+    preferredBookId,
+  };
+}
+
 function coverConcurrencyFromSearchParams(params: URLSearchParams): {
   expectedRevision: number;
   expectedContentHash: string;
@@ -1737,6 +2608,32 @@ function coverProvider(value: unknown): CoverProvider {
     throw new HttpError(400, "invalid_request", "Cover provider is invalid.");
   }
   return value;
+}
+
+function configurableCoverProvider(value: unknown): ConfigurableCoverProvider {
+  if (value !== "google-books") {
+    throw new HttpError(400, "invalid_request", "Configurable cover provider is invalid.");
+  }
+  return value;
+}
+
+function validateCoverProviderCredential(value: unknown): { apiKey: string; expectedRevision: number } {
+  const object = objectValue(value);
+  const apiKey = requiredString(object.apiKey, "apiKey", 512);
+  if (/[\u0000-\u0020\u007f]/u.test(apiKey)) {
+    throw new HttpError(400, "invalid_request", "apiKey is invalid.");
+  }
+  return {
+    apiKey,
+    expectedRevision: boundedInteger(object.expectedRevision, "expectedRevision", 0, Number.MAX_SAFE_INTEGER),
+  };
+}
+
+function validateCoverProviderCredentialTest(value: unknown): { expectedRevision: number } {
+  const object = objectValue(value);
+  return {
+    expectedRevision: boundedInteger(object.expectedRevision, "expectedRevision", 0, Number.MAX_SAFE_INTEGER),
+  };
 }
 
 function contentHash(value: unknown): string {
@@ -1799,11 +2696,15 @@ function queryFromSearchParams(params: URLSearchParams): BookSetQuery {
     "subject",
     "publisher",
     "series",
+    "seriesKey",
     "year",
     "format",
     "rootId",
     "metadata",
     "available",
+    "coverAvailable",
+    "favorite",
+    "wantToRead",
     "sort",
     "order",
     "limit",
@@ -1815,11 +2716,25 @@ function queryFromSearchParams(params: URLSearchParams): BookSetQuery {
   return queryFromObject(object, false);
 }
 
-function queryFromObject(value: unknown, allowSets: boolean): BookSetQuery {
+function queryFromObject(value: unknown, allowSets: boolean, strict = false): BookSetQuery {
   const object = objectValue(value);
+  if (strict) {
+    const allowed = new Set([
+      "q", "author", "language", "subject", "publisher", "series", "seriesKey", "year", "format", "rootId",
+      "metadata", "available", "coverAvailable", "favorite", "wantToRead", "sort", "order", "limit", "offset",
+      ...(allowSets ? ["includeBookIds", "excludeBookIds"] : []),
+    ]);
+    const unknown = Object.keys(object).find((key) => !allowed.has(key));
+    if (unknown) throw new HttpError(400, "invalid_query", `Unsupported catalog query field: ${unknown}.`);
+  }
   const query: BookSetQuery = {};
   for (const field of ["q", "author", "language", "subject", "publisher", "series"] as const) {
     if (object[field] !== undefined) query[field] = requiredString(object[field], field, 500);
+  }
+  if (object.seriesKey !== undefined) {
+    const key = requiredString(object.seriesKey, "seriesKey", 500);
+    if (canonicalSeriesKey(key) !== key) throw new HttpError(400, "invalid_query", "Series key is invalid.");
+    query.seriesKey = key;
   }
   if (object.year !== undefined) {
     const year = requiredString(object.year, "year", 4);
@@ -1842,8 +2757,25 @@ function queryFromObject(value: unknown, allowSets: boolean): BookSetQuery {
     else if (object.available === "false") query.available = false;
     else query.available = optionalBoolean(object.available, "available");
   }
+  if (object.coverAvailable !== undefined) {
+    if (object.coverAvailable === "true") query.coverAvailable = true;
+    else if (object.coverAvailable === "false") query.coverAvailable = false;
+    else query.coverAvailable = optionalBoolean(object.coverAvailable, "coverAvailable");
+  }
+  if (object.favorite !== undefined) {
+    if (object.favorite === "true") query.favorite = true;
+    else if (object.favorite === "false") query.favorite = false;
+    else query.favorite = optionalBoolean(object.favorite, "favorite");
+  }
+  if (object.wantToRead !== undefined) {
+    if (object.wantToRead === "true") query.wantToRead = true;
+    else if (object.wantToRead === "false") query.wantToRead = false;
+    else query.wantToRead = optionalBoolean(object.wantToRead, "wantToRead");
+  }
   if (object.sort !== undefined) {
-    const sorts: CatalogSort[] = ["recent", "title", "author", "published", "size", "added", "updated"];
+    const sorts: CatalogSort[] = [
+      "recent", "title", "author", "published", "size", "added", "updated", "series", "series-index",
+    ];
     if (!sorts.includes(object.sort as CatalogSort)) throw new HttpError(400, "invalid_query", "Sort is invalid.");
     query.sort = object.sort as CatalogSort;
   }
@@ -1858,6 +2790,106 @@ function queryFromObject(value: unknown, allowSets: boolean): BookSetQuery {
     if (object.excludeBookIds !== undefined) query.excludeBookIds = validateBookIds(object.excludeBookIds);
   }
   return query;
+}
+
+function requireOnlyFields(object: Record<string, unknown>, allowed: readonly string[]): void {
+  const unknown = Object.keys(object).find((key) => !allowed.includes(key));
+  if (unknown) throw new HttpError(400, "invalid_request", `Unsupported request field: ${unknown}.`);
+}
+
+function validateSendQueueInput(
+  value: unknown,
+  allowEmpty = false,
+  maximum = MAX_SEND_QUEUE_MUTATION_BOOK_IDS,
+): SendQueueAddInput {
+  const object = objectValue(value);
+  requireOnlyFields(object, ["expectedRevision", "bookIds"]);
+  const expectedRevision = boundedInteger(object.expectedRevision, "expectedRevision", 0, Number.MAX_SAFE_INTEGER);
+  if (!Array.isArray(object.bookIds) || object.bookIds.length > maximum) {
+    throw new HttpError(400, "invalid_request", "bookIds must be a bounded array.");
+  }
+  const bookIds = object.bookIds.map((value) => (
+    opaqueSegment(requiredString(value, "bookId", 100), "book")
+  ));
+  if ((!allowEmpty && bookIds.length === 0) || new Set(bookIds).size !== bookIds.length) {
+    throw new HttpError(400, "invalid_request", "bookIds must contain unique selected books.");
+  }
+  return { expectedRevision, bookIds };
+}
+
+function normalizeShelfQueryForRequest(value: unknown) {
+  try {
+    return normalizeSmartShelfQuery(value);
+  } catch (error) {
+    if (error instanceof SmartShelfQueryError) throw new HttpError(400, "invalid_shelf_query", error.message);
+    throw error;
+  }
+}
+
+function validateSmartShelfCreate(value: unknown): SmartShelfCreateInput {
+  const object = objectValue(value);
+  requireOnlyFields(object, ["name", "query", "pinned"]);
+  return {
+    name: requiredString(object.name, "name", 80),
+    query: normalizeShelfQueryForRequest(object.query),
+    ...(object.pinned === undefined ? {} : { pinned: optionalBoolean(object.pinned, "pinned") }),
+  };
+}
+
+function validateSmartShelfPatch(value: unknown): SmartShelfPatchInput {
+  const object = objectValue(value);
+  requireOnlyFields(object, ["expectedRevision", "name", "query", "pinned"]);
+  if (object.name === undefined && object.query === undefined && object.pinned === undefined) {
+    throw new HttpError(400, "invalid_request", "A smart-shelf change is required.");
+  }
+  return {
+    expectedRevision: boundedInteger(object.expectedRevision, "expectedRevision", 1, Number.MAX_SAFE_INTEGER),
+    ...(object.name === undefined ? {} : { name: requiredString(object.name, "name", 80) }),
+    ...(object.query === undefined ? {} : { query: normalizeShelfQueryForRequest(object.query) }),
+    ...(object.pinned === undefined ? {} : { pinned: optionalBoolean(object.pinned, "pinned") }),
+  };
+}
+
+function validateSmartShelfPinnedOrder(value: unknown): SmartShelfPinnedOrderInput {
+  const object = objectValue(value);
+  requireOnlyFields(object, ["shelves"]);
+  if (!Array.isArray(object.shelves) || object.shelves.length > MAX_PINNED_SMART_SHELVES_PER_PROFILE) {
+    throw new HttpError(400, "invalid_request", "shelves must be a bounded array.");
+  }
+  const shelves = object.shelves.map((value) => {
+    const item = objectValue(value);
+    requireOnlyFields(item, ["id", "expectedRevision"]);
+    return {
+      id: opaqueSegment(requiredString(item.id, "id", 100), "shelf"),
+      expectedRevision: boundedInteger(item.expectedRevision, "expectedRevision", 1, Number.MAX_SAFE_INTEGER),
+    };
+  });
+  if (new Set(shelves.map((shelf) => shelf.id)).size !== shelves.length) {
+    throw new HttpError(400, "invalid_request", "Pinned smart-shelf order contains duplicates.");
+  }
+  return { shelves };
+}
+
+function validateProfileBookAnnotation(value: unknown): ProfileBookAnnotationPatchInput {
+  const object = objectValue(value);
+  requireOnlyFields(object, ["expectedRevision", "favorite", "wantToRead"]);
+  if (object.favorite === undefined && object.wantToRead === undefined) {
+    throw new HttpError(400, "invalid_request", "An annotation change is required.");
+  }
+  return {
+    expectedRevision: boundedInteger(object.expectedRevision, "expectedRevision", 0, Number.MAX_SAFE_INTEGER),
+    ...(object.favorite === undefined ? {} : { favorite: optionalBoolean(object.favorite, "favorite") }),
+    ...(object.wantToRead === undefined ? {} : { wantToRead: optionalBoolean(object.wantToRead, "wantToRead") }),
+  };
+}
+
+function expectedRevisionFromSearch(params: URLSearchParams): number {
+  return boundedInteger(
+    requiredString(params.get("expectedRevision"), "expectedRevision", 20),
+    "expectedRevision",
+    0,
+    Number.MAX_SAFE_INTEGER,
+  );
 }
 
 async function readJson(request: IncomingMessage, limit: number): Promise<unknown> {
@@ -1958,6 +2990,7 @@ function mapError(error: unknown): HttpError {
         : error.code === "conflict"
           ? 409
           : error.code === "too_large"
+              || error.code === "selection_too_large"
               || error.code === "response_too_large"
               || error.code === "match_index_too_large"
             ? 413
@@ -1982,6 +3015,10 @@ function mapError(error: unknown): HttpError {
     return new HttpError(
       error.code === "invalid_provider" || error.code === "invalid_candidate"
         ? 400
+        : error.code === "provider_not_configured"
+          ? 409
+        : error.code === "provider_timeout"
+          ? 504
         : error.code === "provider_response_too_large"
           ? 413
           : 502,
@@ -2031,7 +3068,7 @@ function validateBookIds(value: unknown): string[] {
   return Array.from(new Set(value.map((item) => opaqueSegment(requiredString(item, "bookId", 100), "book"))));
 }
 
-function opaqueSegment(value: string, kind: "profile" | "root" | "book"): string {
+function opaqueSegment(value: string, kind: "profile" | "root" | "book" | "shelf"): string {
   const prefix = kind === "profile" ? "prf" : kind;
   if (!new RegExp(`^${prefix}_[A-Za-z0-9_-]{8,80}$`, "u").test(value)) {
     throw new HttpError(400, "invalid_identifier", `${kind} identifier is invalid.`);

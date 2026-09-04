@@ -721,6 +721,7 @@ describe("recursive Kindle Documents inventory", () => {
       title: "Cached behind KFX",
     });
     expect(store.readRequests).toEqual([]);
+    expect(store.rangeReadRequests).toEqual([]);
   });
 
   it("keeps bounded cache progress when a later live read loses the transport", async () => {

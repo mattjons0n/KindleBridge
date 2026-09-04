@@ -25,6 +25,7 @@ Maintain and complete the private, self-hosted Kindle Bridge household ebook lib
 - The PDOC preparation is an offset-preserving EXTH metadata edit from `EBOK` to `PDOC`. It also verifies embedded cover records before transfer.
 - PDOC files show their embedded cover in the Kindle library but are classified under Documents rather than Books.
 - WebUSB access must remain user initiated. Never overwrite or broadly delete existing Kindle content.
+- **Update Kindle copy** is upload-first and applies only to one freshly revalidated stale KindleBridge-managed presentation of an edited EPUB: prepare, upload, verify, durably record, revalidate the exact old object, delete that handle, verify absence, then reconcile. Never fall back to delete-first when temporary capacity is insufficient; a possible/manual/fuzzy match is not replacement authority.
 - Preserve the collision-resistant filename, bounded recovery journal, exact-handle cleanup, descriptor-derived MTP interface selection, and clean USB/session shutdown behavior.
 - Treat host-mounted originals as immutable. Format conversion and PDOC preparation may modify only a derived copy.
 - Keep no-login deployments private to a trusted LAN or VPN. Profiles are organizational views, not access-control boundaries.
@@ -35,6 +36,8 @@ Maintain and complete the private, self-hosted Kindle Bridge household ebook lib
 - Deploy the catalog service only as a standard, platform-agnostic Docker/OCI container. Host directories are supplied through ordinary read-only bind mounts or Docker volumes; the application does not mount or manage SMB/NFS storage. Do not create or maintain platform-specific packages.
 - Keep SQLite durable state under `/data`, rebuildable cover/index cache under `/cache`, and allowed source mounts beneath configured container parents such as `/libraries`.
 - Settings paths are container-visible paths, never host paths, share URLs, or storage credentials.
+- Optional provider credentials are configured through the compact Settings UI, stored only in durable server-side `/data`, and never returned unmasked, logged, or persisted in the browser. Provider results are reviewed overlays and must never rewrite mounted originals.
+- Profile queues, shelves, annotations, issue dispositions, duplicate preferences, and metadata lookup jobs are durable bounded intent. Revalidate queue/source/presentation/device evidence at execution time, reject ceiling overflow explicitly, and never let browser convenience state become Kindle deletion authority.
 - Preserve profile scoping, realpath containment, bounded source streams/scans/parser workers, strict host/origin handling, and no-login private-network guidance.
 
 ## Working expectations

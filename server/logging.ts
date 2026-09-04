@@ -7,7 +7,7 @@ export interface ServerLogRecord {
   readonly context?: Readonly<Record<string, unknown>>;
 }
 
-const SENSITIVE_KEY = /(?:path|directory|filename|serial|password|secret|credential|bookbytes|sourcebytes|converteroutput|rawoutput)$/iu;
+const SENSITIVE_KEY = /(?:path|directory|filename|serial|password|secret|credential|api[_-]?key|access[_-]?token|authorization|bookbytes|sourcebytes|converteroutput|rawoutput)$/iu;
 const MAX_DEPTH = 4;
 const MAX_ITEMS = 64;
 const MAX_STRING = 500;

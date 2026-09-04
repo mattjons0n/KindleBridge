@@ -65,7 +65,9 @@ docker compose --env-file /private/path/kindle-bridge.env ps
 
 Compose binds HTTP to `127.0.0.1:8080` by default. This keeps the unauthenticated origin off external interfaces. Configure initial libraries while `CATALOG_SETTINGS_MODE=read-write`; after setup, `read-only` prevents Settings mutations until the container is deliberately reconfigured.
 
-The runtime is UID/GID `1000:1000`, has a read-only root filesystem, no Linux capabilities, `no-new-privileges`, and a bounded process count. Only `/data` and `/cache` are writable. `/data` is durable and includes SQLite plus user-selected replacement covers under `/data/metadata-covers`; `/cache`, including `/cache/tmp`, is rebuildable. The browser owns WebUSB, so never pass a USB device into the container or run the service privileged.
+Optional Google Books access is configured after startup in **Settings → Online cover search**. It is not part of the normal deployment environment. The saved key is server-side durable state in `/data`; Open Library and local cover upload/paste continue to work without it.
+
+The runtime is UID/GID `1000:1000`, has a read-only root filesystem, no Linux capabilities, `no-new-privileges`, and a bounded process count. Only `/data` and `/cache` are writable. `/data` is durable and includes SQLite, optional provider credentials, queue/shelf/annotation intent, issue dispositions, metadata-lookup review jobs, and user-selected replacement covers under `/data/metadata-covers`; `/cache` is rebuildable and is also the runtime temporary directory, so a fresh empty volume or bind mount works without initialization. The browser owns WebUSB, so never pass a USB device into the container or run the service privileged.
 
 Before first start, the host source directories must grant UID/GID `1000:1000` read permission on book files and search (`x`) permission on every parent directory. Named `/data` and `/cache` volumes are initialized by the image and must remain writable by that identity. If host policy cannot grant those permissions, prepare equivalent ACLs on the host; do not make the container privileged or writable against source mounts.
 
@@ -105,11 +107,11 @@ The proxy must preserve the external Host and must not rewrite the browser to a 
 
 Trust Caddy's local root CA on every client before testing. Desktop Chromium is the supported browser. The first USB chooser remains user initiated, and permission is tied to the exact scheme/host/port. Changing the origin can also strand a browser-local recovery-journal entry, so inspect or finish interrupted transfers before changing it.
 
-For defense in depth, block container egress unless the operator enables online cover search. Catalog indexing, source-cover extraction, conversion, and Kindle transfer require no cloud service. Google Books/Open Library cover search is the sole optional product feature that needs outbound HTTPS; if it is enabled, restrict egress to the documented provider hosts (`www.googleapis.com`, `books.google.com`, `books.googleusercontent.com`/Google image redirects, `openlibrary.org`, and `covers.openlibrary.org`) and keep arbitrary destinations blocked. Uploaded, dragged, and clipboard-pasted covers remain fully local.
+For defense in depth, block container egress unless the operator enables online cover or metadata search. Catalog indexing, source-cover extraction, conversion, and Kindle transfer require no cloud service. Google Books/Open Library lookup is the sole optional product feature that needs outbound HTTPS; if it is enabled, restrict egress to the documented provider hosts (`www.googleapis.com`, `books.google.com`, `books.googleusercontent.com`/Google image redirects, `openlibrary.org`, `covers.openlibrary.org`, `archive.org`, and Archive.org data nodes matching `iaNNNNNN.us.archive.org`) and keep arbitrary destinations blocked. Lookup sends only normalized title/author/identifier query terms, never a mounted file, source bytes, a container path, or a browser-supplied fetch URL. Kindle Bridge accepts an Open Library image only through its exact HTTPS cover-ID-bound archive redirect chain; the broader Archive.org sites are not arbitrary fetch targets. Uploaded, dragged, and clipboard-pasted covers remain fully local.
 
 ## 6. Cold backup
 
-Back up all of `/data`; do not back up `/cache`. The archive must include both SQLite and `/data/metadata-covers`, otherwise restored metadata may reference missing user-selected images. A consistent cold backup avoids copying SQLite while a migration or write transaction is active.
+Back up all of `/data`; do not back up `/cache`. The archive must include both SQLite and `/data/metadata-covers`, otherwise restored metadata may reference missing user-selected images. SQLite contains the schema-v17 durable application state: profiles/roots, stable identities, deliveries, overlays, provider settings and mutation replays, queues, shelves, annotations, issue dispositions/preferences, and bulk lookup jobs/results. It also contains a configured Google Books key in plaintext appropriate to this private self-hosted threat model, so restrict backup ownership and mode just as carefully as the live volume. A consistent cold backup avoids copying SQLite while a migration or write transaction is active.
 
 1. Record the exact image digest and environment file in the backup log.
 2. Stop cleanly and wait for the container to exit.
@@ -123,7 +125,7 @@ KINDLE_BRIDGE_IMAGE=kindle-bridge:local \
 docker compose --env-file /private/path/kindle-bridge.env up -d
 ```
 
-Store the archive, checksum, image digest, and environment backup together. The environment file can disclose local paths and must remain private.
+Store the archive, checksum, image digest, and environment backup together. The `/data` archive contains any saved cover-provider API keys, and the environment file can disclose local paths; both must remain private.
 
 ## 7. Non-destructive restore and rollback
 
@@ -141,23 +143,26 @@ Then set `KINDLE_BRIDGE_DATA_VOLUME=kindle-bridge-data-restored-YYYYMMDD`, start
 - `/api/readyz` reports ready;
 - profiles, root assignments, and Settings mode are correct;
 - delivery history exists;
+- Send-later order, smart shelves/pins, annotations, issue ignore/duplicate preference, provider status, and metadata-lookup review jobs exist;
 - every source root is available and a reconciliation completes;
 - a sample cover and source download work within the correct profile.
 
-For an application rollback, stop the service, select the previous immutable image digest and its pre-upgrade data-volume snapshot together, then start. Do not run an older image against a database already migrated by a newer one unless that release explicitly documents backward compatibility.
+A lookup job that was `running` at shutdown is intentionally recovered as `paused` with any `searching` entry returned to `pending`; resume it explicitly after the restored service is ready. Candidate results are review material only and never apply themselves during recovery.
+
+For an application rollback, stop the service, select the previous immutable image digest and its pre-upgrade data-volume snapshot together, then start. Do not run an older image against a database already migrated by a newer one unless that release explicitly documents backward compatibility. The new queue, shelf, annotation, provider, issue, and lookup rows are additive/inert when their UI is disabled, but that does not by itself prove that an older binary accepts schema version 17; retain the paired snapshot and never delete this user intent merely to roll back a feature.
 
 ## 8. Cache and catalog rebuild
 
 To rebuild derived covers and temporary artifacts, stop the service and select a fresh empty cache volume through `KINDLE_BRIDGE_CACHE_VOLUME`. Keep `/data` and every source mount unchanged, restart, and request a reconciliation for each configured root. Confirm that book counts, FTS search, facets, covers, and source streaming recover before retiring the old cache.
 
-To rebuild the derived SQLite catalog while retaining profiles, root configuration, stable book identities, delivery evidence, metadata overrides, and user-selected covers, first make a cold backup and stop every container using the data volume. Then run:
+To rebuild the derived SQLite catalog while retaining profiles, root configuration, stable book identities, delivery evidence, metadata overrides, provider configuration, Send-later entries, shelves, annotations, issue dispositions/preferences, metadata-lookup jobs/results, and user-selected covers, first make a cold backup and stop every container using the data volume. Then run:
 
 ```sh
 KINDLE_BRIDGE_IMAGE=kindle-bridge:local \
   deploy/docker/rebuild-catalog.sh kindle-bridge-data
 ```
 
-The helper refuses a missing or in-use volume, verifies the existing database before mutation, and clears only rebuildable source/catalog rows. Restart with the identical `/libraries` mounts and fresh `/cache`, then request a deep rescan for every enabled root. Do not discard the pre-rebuild backup until profiles, root assignments, stable delivery matches, search/facets, cover serving, and source streaming have all been checked.
+The helper refuses a missing or in-use volume, verifies the existing database before mutation, and clears only rebuildable source/catalog rows. During that interval queue entries hydrate as missing/retired and derived issues disappear; neither condition deletes their durable intent. Restart with the identical `/libraries` mounts and fresh `/cache`, then request a deep rescan for every enabled root. Do not discard the pre-rebuild backup until stable IDs reattach and profiles, root assignments, delivery matches, overlays, queue status/order, shelf counts, annotations, issue dispositions/preferences, lookup review state, search/facets, cover serving, and source streaming have all been checked.
 
 For a complete disaster rebuild without `/data`, create fresh data/cache volumes, recreate profiles and container root assignments in Settings, and rescan all sources. Original books recover catalog metadata and covers, but delivery history and prior device evidence require the `/data` backup; they cannot be reconstructed reliably from filenames alone.
 
@@ -170,9 +175,11 @@ Before a household upgrade:
 1. Run `npm run check` and build the exact release image.
 2. Validate both OCI architectures and inspect SBOM/provenance attestations.
 3. Make a cold `/data` backup and keep the old image digest.
-4. Start the new image on a restored copy of the data volume first; wait for migration/readiness and reconcile roots.
-5. Exercise search, pagination, cover/source fetch, Settings lock, mount loss/recovery, and restart persistence.
-6. Promote the tested image/data pair. Keep the prior pair until the release is accepted.
+4. Start the new image on a restored copy of the data volume first; verify schema version 17, wait for readiness, and reconcile roots.
+5. Stop and start that restored copy twice more. Each restart must remain ready without reapplying migration side effects; compare profile/root/book/delivery/overlay/provider/queue/shelf/annotation/issue/job counts with the pre-upgrade record.
+6. Exercise search, series pagination/order, queue and shelf mutations, issue review, metadata candidate review/import, cover/source fetch, Settings lock, mount loss/recovery, and restart persistence.
+7. Rehearse a cache/catalog rebuild against a second restored copy and confirm the durable intent above survives while only derived catalog/cache data is reconstructed.
+8. Promote the tested image/data pair. Keep the prior immutable image and pre-upgrade volume snapshot paired until the release is accepted.
 
 Use [`RELEASE_CHECKLIST.md`](RELEASE_CHECKLIST.md) as the evidence record. Automated checks cannot prove WebUSB secure-context behavior or Kindle acceptance; those lines require a physical device at the real household HTTPS origin.
 

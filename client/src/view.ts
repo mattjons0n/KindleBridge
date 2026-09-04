@@ -1,4 +1,9 @@
 import type { DebugLog } from "./log";
+import type {
+  AdvancedPartialObjectProbeRunRequest,
+  AdvancedPartialObjectProbeViewState,
+} from "./advanced-partial-object-diagnostic";
+import { mountAdvancedPartialObjectProbe } from "./advanced-partial-object-diagnostic-view";
 import {
   CatalogBrowser,
   type CatalogSendBatchResult,
@@ -18,8 +23,14 @@ import {
   type CoverProvider,
 } from "./catalog-client";
 import { renderKindleDeviceContents, renderLibraryPrototype, renderLibraryResults } from "./library-prototype-view";
-import type { KindleFilter, LibrarySort, LibraryView, MetadataFilter } from "./library-prototype";
+import type { KindleFilter, LibraryFilters, LibrarySort, LibraryView, MetadataFilter } from "./library-prototype";
 import type { LibraryFolderDraft, LibrarySettingsDraft } from "./library-settings-prototype";
+import {
+  decodeLibraryRoute,
+  encodeLibraryRoute,
+  type LibraryRouteOverlays,
+  type LibraryRouteState,
+} from "./library-route";
 import {
   deriveGateStatuses,
   targetProfileComplete,
@@ -41,6 +52,7 @@ export interface AppViewHandlers {
   readonly onSendIntegrated: () => void;
   readonly onIntegratedOpenConfirmed: () => void;
   readonly onCleanupInspectionConfirmed: () => void;
+  readonly onReplacementCleanupRequested?: (operationId: string) => void | Promise<void>;
   readonly onCopyLog: () => void;
   /** Hardware integration for the Docker catalog. Kept separate from Gate 0 so a
    * Kindle can be connected before a catalog book has been converted. */
@@ -49,8 +61,15 @@ export interface AppViewHandlers {
   readonly onCatalogSendRequested?: (request: CatalogSendRequest) => void | Promise<void>;
   readonly onCatalogSendBatchFinished?: (result: CatalogSendBatchResult) => void | Promise<void>;
   readonly onCatalogRemoveRequested?: (request: CatalogRemoveRequest) => void | Promise<void>;
+  readonly onCatalogUpdateRequested?: CatalogHardwareHooks["onUpdateRequested"];
   readonly onCatalogChanged?: (event: CatalogEvent) => void | Promise<void>;
   readonly onCatalogProfileChanged?: (profileId: string) => void | Promise<void>;
+  readonly onCatalogManualMatchDecision?: CatalogHardwareHooks["onManualMatchDecision"];
+  readonly onAdvancedPartialObjectProbeArm?: () => void | Promise<void>;
+  readonly onAdvancedPartialObjectProbeRun?: (
+    request: AdvancedPartialObjectProbeRunRequest,
+  ) => void | Promise<void>;
+  readonly onAdvancedPartialObjectProbeExport?: () => void | Promise<void>;
 }
 
 export interface AppViewOptions {
@@ -60,6 +79,16 @@ export interface AppViewOptions {
 }
 
 const GATE_LABELS = ["Convert", "WebUSB", "MTP read", "Byte test", "Send", "Open"] as const;
+
+type CatalogRouteOverlayPatch = Partial<{
+  bookId: string | null;
+  matchItemId: string | null;
+  matchBookId: string | null;
+  seriesKey: string | null;
+  sendQueueOpen: boolean;
+  shelfManagerOpen: boolean;
+  activityOpen: boolean;
+}>;
 
 function escapeHtml(value: unknown): string {
   return String(value)
@@ -244,9 +273,22 @@ function renderError(state: AppState): string {
 
 function renderRecovery(state: AppState): string {
   const pending = state.pendingObjectCleanup;
-  if (!pending || state.device.kind === "transferring" || state.selfTest.kind === "running") return "";
-  const location = pending.purpose === "metadata-cache" ? "the Kindle storage root" : "Documents";
-  return `<section class="notice error recovery-notice" role="alert"><div class="grow"><strong>Interrupted Kindle write</strong>Inspect ${location} for exactly <code>${escapeHtml(pending.filename)}</code>. Remove only that exact managed filename if it is partial, then acknowledge the inspection.<div class="actions"><button type="button" data-action="confirm-cleanup-inspection">I inspected this filename</button></div></div></section>`;
+  const interrupted = !pending || state.device.kind === "transferring" || state.selfTest.kind === "running"
+    ? ""
+    : (() => {
+        const location = pending.purpose === "metadata-cache" ? "the Kindle storage root" : "Documents";
+        return `<section class="notice error recovery-notice" role="alert"><div class="grow"><strong>Interrupted Kindle write</strong>Inspect ${location} for exactly <code>${escapeHtml(pending.filename)}</code>. Remove only that exact managed filename if it is partial, then acknowledge the inspection.<div class="actions"><button type="button" data-action="confirm-cleanup-inspection">I inspected this filename</button></div></div></section>`;
+      })();
+  const replacements = state.pendingReplacementCleanups ?? [];
+  if (replacements.length === 0) return interrupted;
+  const canClean = state.device.kind === "ready"
+    && state.selfTest.kind === "passed"
+    && state.catalogInventoryState === "ready";
+  const replacementNotice = `<section class="notice error recovery-notice" role="alert"><div class="grow"><strong>Verified replacement needs exact cleanup</strong>${replacements.length === 1 ? "One replacement recovery task remains." : `${replacements.length} replacement recovery tasks remain.`} Connect the matching Kindle and use the explicit action below. Kindle Bridge will first rebuild a complete inventory and revalidate both exact objects; it will never delete from this reminder alone.<ul>${replacements.map((record) => {
+    const deliveryMissing = record.reason === "delivery-recording";
+    return `<li><span><code>${escapeHtml(record.oldCopy.filename)}</code><br><small>${deliveryMissing ? `Unrecorded replacement: ${escapeHtml(record.newCopy.filename)}. The safe recovery removes only that new copy and retains this prior copy.` : `Replacement kept: ${escapeHtml(record.newCopy.filename)}`}</small></span><button type="button" data-action="cleanup-managed-replacement" data-cleanup-operation-id="${escapeHtml(record.operationId)}"${canClean ? "" : " disabled"}>${canClean ? deliveryMissing ? "Remove unrecorded replacement" : "Remove exact older copy" : "Connect and finish checks"}</button></li>`;
+  }).join("")}</ul></div></section>`;
+  return `${interrupted}${replacementNotice}`;
 }
 
 function renderProfile(state: AppState, draft: TargetProfile): string {
@@ -267,8 +309,14 @@ export class AppView {
   #profileDraft: TargetProfile;
   #catalogDialogReturnBookId?: string;
   #catalogRemovalReturnBookId?: string;
+  #catalogUpdateReturnBookId?: string;
   #catalogMetadataReturnBookId?: string;
+  #catalogDetailsReturnBookId?: string;
+  #catalogDetailsScrollY = 0;
+  #catalogContextRestoreToken = -1;
+  #catalogScrollFrame?: number;
   #settingsDeleteReturnLibraryId?: string;
+  #advancedPartialObjectProbe: AdvancedPartialObjectProbeViewState = { phase: "off" };
 
   constructor(
     root: HTMLElement,
@@ -288,8 +336,10 @@ export class AppView {
       onSendRequested: handlers.onCatalogSendRequested,
       onSendBatchFinished: handlers.onCatalogSendBatchFinished,
       onRemoveRequested: handlers.onCatalogRemoveRequested,
+      onUpdateRequested: handlers.onCatalogUpdateRequested,
       onCatalogChanged: handlers.onCatalogChanged,
       onActiveProfileChanged: handlers.onCatalogProfileChanged,
+      onManualMatchDecision: handlers.onCatalogManualMatchDecision,
     };
     this.#catalog = new CatalogBrowser(
       options.catalogApi ?? createCatalogClient(),
@@ -306,7 +356,85 @@ export class AppView {
     );
     this.render(state);
     debugLog.subscribe(() => this.#renderLog());
-    if (options.autoStartCatalog !== false) void this.#catalog.start();
+    window.addEventListener("scroll", () => {
+      if (!this.#root.isConnected || this.#catalog.snapshot.bookDetails || this.#catalogScrollFrame !== undefined) return;
+      this.#catalogScrollFrame = window.requestAnimationFrame(() => {
+        this.#catalogScrollFrame = undefined;
+        this.#catalog.setScrollPosition(window.scrollY);
+      });
+    }, { passive: true });
+    window.addEventListener("popstate", () => {
+      if (this.#root.isConnected) void this.#restoreCatalogRoute(true);
+    });
+    if (options.autoStartCatalog !== false) {
+      void this.#catalog.start().then(() => this.#restoreCatalogRoute());
+    }
+  }
+
+  #currentCatalogRoute(overrides: CatalogRouteOverlayPatch = {}): LibraryRouteState {
+    const snapshot = this.#catalog.snapshot;
+    const bookId = overrides.bookId === undefined ? snapshot.bookDetails?.bookId : overrides.bookId ?? undefined;
+    const matchItemId = overrides.matchItemId === undefined ? snapshot.matchReview?.itemId : overrides.matchItemId ?? undefined;
+    const matchBookId = matchItemId
+      ? overrides.matchBookId === undefined ? snapshot.matchReview?.requestedBookId : overrides.matchBookId ?? undefined
+      : undefined;
+    const seriesKey = overrides.seriesKey === undefined ? snapshot.seriesDetail?.key : overrides.seriesKey ?? undefined;
+    const overlays: LibraryRouteOverlays = {
+      ...(bookId ? { bookId } : {}),
+      ...(matchItemId ? { matchItemId } : {}),
+      ...(matchBookId ? { matchBookId } : {}),
+      ...(seriesKey ? { seriesKey } : {}),
+      sendQueueOpen: overrides.sendQueueOpen ?? snapshot.sendQueueOpen,
+      shelfManagerOpen: overrides.shelfManagerOpen ?? snapshot.shelfManagerOpen,
+      activityOpen: overrides.activityOpen ?? snapshot.activityOpen,
+    };
+    return {
+      version: 1,
+      ...(snapshot.filters.profileId ? { profileId: snapshot.filters.profileId } : {}),
+      ...(snapshot.activeShelf ? { activeShelfId: snapshot.activeShelf.id } : {}),
+      filters: snapshot.filters,
+      layout: snapshot.layout,
+      density: snapshot.density ?? "comfortable",
+      overlays,
+    };
+  }
+
+  #writeCatalogRoute(
+    overrides: CatalogRouteOverlayPatch,
+    mode: "push" | "replace",
+    state: Record<string, unknown> = {},
+  ): void {
+    const url = encodeLibraryRoute(this.#currentCatalogRoute(overrides));
+    if (mode === "push") window.history.pushState(state, "", url);
+    else window.history.replaceState(state, "", url);
+  }
+
+  async #restoreCatalogRoute(fromHistory = false): Promise<void> {
+    const route = decodeLibraryRoute(window.location.hash);
+    if (!route) {
+      if (fromHistory && this.#catalog.snapshot.bookDetails) this.#closeBookDetails(false);
+      else if (fromHistory && this.#catalog.snapshot.matchReview) this.#closeMatchReview(false);
+      return;
+    }
+    const closingBookDetails = this.#catalog.snapshot.bookDetails !== undefined
+      && route.overlays.bookId !== this.#catalog.snapshot.bookDetails.bookId;
+    const closingMatchReview = this.#catalog.snapshot.matchReview !== undefined
+      && route.overlays.matchItemId !== this.#catalog.snapshot.matchReview.itemId;
+    const returnBookId = this.#catalogDetailsReturnBookId ?? this.#catalog.snapshot.bookDetails?.bookId;
+    const returnMatchItemId = this.#catalog.snapshot.matchReview?.itemId;
+    const returnScrollY = this.#catalogDetailsScrollY;
+    if (!await this.#catalog.applyLibraryRoute(route)) {
+      // A device mutation intentionally blocks navigation. Keep the address
+      // bar truthful instead of leaving a popped URL that the busy UI did not
+      // apply; the user can navigate again once the operation settles.
+      if (fromHistory) this.#writeCatalogRoute({}, "replace");
+      return;
+    }
+    if (route.overlays.bookId) await this.#catalog.openBookDetails(route.overlays.bookId);
+    else if (route.overlays.matchItemId) await this.#catalog.openMatchReview(route.overlays.matchItemId, route.overlays.matchBookId);
+    else if (route.overlays.seriesKey) await this.#catalog.openSeries(route.overlays.seriesKey);
+    if (closingBookDetails) this.#restoreBookDetailsOrigin(returnBookId, returnScrollY);
+    if (closingMatchReview && returnMatchItemId) this.#restoreMatchReviewOrigin(returnMatchItemId);
   }
 
   render(state: AppState): void {
@@ -346,6 +474,7 @@ export class AppView {
       </section>
       <footer class="footer"><span>Private self-hosted catalog · browser-local conversion</span><span>boko WASM (GPL-3.0-or-later) · no overwrite support</span></footer>
     </div>`;
+    this.#renderAdvancedPartialObjectProbe();
     this.#bindEvents();
     this.#renderLog();
     const moreFilters = this.#root.querySelector<HTMLDetailsElement>(".library-more-filters");
@@ -367,11 +496,29 @@ export class AppView {
         }
       }
     }
+    const restoreToken = this.#catalog.snapshot.contextRestoreToken ?? 0;
+    if (this.#catalog.snapshot.booksState === "ready" && restoreToken !== this.#catalogContextRestoreToken) {
+      this.#catalogContextRestoreToken = restoreToken;
+      const scrollY = this.#catalog.snapshot.contextScrollY ?? 0;
+      window.queueMicrotask(() => {
+        try { window.scrollTo({ top: scrollY, behavior: "auto" }); } catch { /* jsdom and older browsers */ }
+      });
+    }
   }
 
   #renderLog(): void {
     const element = this.#root.querySelector<HTMLPreElement>("#debug-log");
     if (element) element.textContent = this.#debugLog.format() || "Application ready";
+  }
+
+  #renderAdvancedPartialObjectProbe(): void {
+    const mount = this.#root.querySelector<HTMLElement>("[data-ui-partial-object-probe]");
+    if (!mount) return;
+    mountAdvancedPartialObjectProbe(mount, this.#advancedPartialObjectProbe, {
+      onArm: this.#handlers.onAdvancedPartialObjectProbeArm,
+      onRun: this.#handlers.onAdvancedPartialObjectProbeRun,
+      onExport: this.#handlers.onAdvancedPartialObjectProbeExport,
+    });
   }
 
   #bindEvents(): void {
@@ -396,12 +543,17 @@ export class AppView {
       "copy-log": this.#handlers.onCopyLog,
     };
     this.#root.querySelectorAll<HTMLButtonElement>("button[data-action]").forEach((button) => button.addEventListener("click", () => actions[button.dataset.action ?? ""]?.()));
+    this.#root.querySelectorAll<HTMLButtonElement>('button[data-action="cleanup-managed-replacement"]').forEach((button) => button.addEventListener("click", () => {
+      const operationId = button.dataset.cleanupOperationId;
+      if (operationId) void this.#handlers.onReplacementCleanupRequested?.(operationId);
+    }));
     this.#bindCatalogEvents();
   }
 
   #bindCatalogEvents(): void {
     this.#root.querySelector<HTMLInputElement>("#library-search")?.addEventListener("input", (event) => {
       this.#catalog.updateFilter("query", (event.currentTarget as HTMLInputElement).value);
+      this.#writeCatalogRoute({ bookId: null, seriesKey: null }, "replace");
     });
     const selects: ReadonlyArray<readonly [string, "language" | "format" | "rootId" | "year"]> = [
       ["#library-language", "language"], ["#library-format", "format"],
@@ -409,6 +561,7 @@ export class AppView {
     ];
     selects.forEach(([selector, key]) => this.#root.querySelector<HTMLSelectElement>(selector)?.addEventListener("change", (event) => {
       this.#catalog.updateFilter(key, (event.currentTarget as HTMLSelectElement).value);
+      this.#writeCatalogRoute({ bookId: null, seriesKey: null }, "replace");
     }));
     const typedFacets: ReadonlyArray<readonly [string, "author" | "subject" | "publisher" | "series"]> = [
       ["#library-author", "author"], ["#library-subject", "subject"],
@@ -417,24 +570,29 @@ export class AppView {
     typedFacets.forEach(([selector, key]) => this.#root.querySelector<HTMLInputElement>(selector)?.addEventListener("change", (event) => {
       const value = (event.currentTarget as HTMLInputElement).value.trim();
       this.#catalog.updateFilter(key, value || "all");
+      this.#writeCatalogRoute({ bookId: null, seriesKey: null }, "replace");
     }));
     this.#root.querySelector<HTMLSelectElement>("#library-metadata")?.addEventListener("change", (event) => {
       this.#catalog.updateFilter("metadata", (event.currentTarget as HTMLSelectElement).value as MetadataFilter);
+      this.#writeCatalogRoute({ bookId: null, seriesKey: null }, "replace");
     });
     this.#root.querySelector<HTMLSelectElement>("#library-kindle-filter")?.addEventListener("change", (event) => {
       this.#catalog.updateFilter("kindle", (event.currentTarget as HTMLSelectElement).value as KindleFilter);
+      this.#writeCatalogRoute({ bookId: null, seriesKey: null }, "replace");
     });
     this.#root.querySelector<HTMLSelectElement>("#library-sort")?.addEventListener("change", (event) => {
       this.#catalog.updateFilter("sort", (event.currentTarget as HTMLSelectElement).value as LibrarySort);
+      this.#writeCatalogRoute({ bookId: null, seriesKey: null }, "replace");
     });
     this.#root.querySelectorAll<HTMLButtonElement>("button[data-ui-profile]").forEach((button) => button.addEventListener("click", () => {
       this.#captureSettingsForm();
       const profileId = button.dataset.uiProfile;
-      if (profileId) void this.#catalog.selectProfile(profileId);
+      if (profileId) void this.#catalog.selectProfile(profileId).then(() => this.#writeCatalogRoute({}, "replace"));
     }));
     this.#root.querySelectorAll<HTMLButtonElement>("button[data-ui-view]").forEach((button) => button.addEventListener("click", () => {
       this.#captureSettingsForm();
-      void this.#catalog.setView(button.dataset.uiView as LibraryView);
+      if (this.#catalog.snapshot.activityOpen) this.#closeActivityCenter(false);
+      void this.#catalog.setView(button.dataset.uiView as LibraryView).then(() => this.#writeCatalogRoute({ bookId: null, seriesKey: null }, "replace"));
     }));
     this.#root.querySelectorAll<HTMLButtonElement>('button[data-ui-action="connect-catalog-device"]').forEach((button) => button.addEventListener("click", () => {
       void this.#catalog.requestConnect();
@@ -443,8 +601,169 @@ export class AppView {
       void this.#catalog.requestDisconnect();
     }));
     this.#root.querySelector<HTMLButtonElement>('button[data-ui-action="show-kindle"]')?.addEventListener("click", () => {
-      void this.#catalog.setView("on-kindle");
+      void this.#catalog.setView("on-kindle").then(() => this.#writeCatalogRoute({ bookId: null, seriesKey: null }, "replace"));
     });
+    this.#root.querySelector<HTMLInputElement>("#series-search")?.addEventListener("change", (event) => {
+      void this.#catalog.loadSeries((event.currentTarget as HTMLInputElement).value);
+    });
+    this.#root.querySelector<HTMLSelectElement>("#series-sort")?.addEventListener("change", (event) => {
+      const sort = (event.currentTarget as HTMLSelectElement).value;
+      if (sort === "name" || sort === "count") this.#catalog.setSeriesSort(sort);
+    });
+    this.#root.querySelectorAll<HTMLButtonElement>('button[data-ui-action="open-series"]').forEach((button) => button.addEventListener("click", () => {
+      const key = button.dataset.seriesKey;
+      if (!key) return;
+      if (button.closest(".library-book-details-sheet")) this.#closeBookDetails(true, false);
+      void this.#catalog.setView("series").then(async () => {
+        this.#writeCatalogRoute({ bookId: null, seriesKey: key }, "push", { kindleBridgeSeries: key });
+        await this.#catalog.openSeries(key);
+      });
+    }));
+    this.#root.querySelector<HTMLButtonElement>('button[data-ui-action="close-series"]')?.addEventListener("click", () => {
+      this.#catalog.closeSeries();
+      this.#writeCatalogRoute({ seriesKey: null }, "replace");
+    });
+    this.#root.querySelectorAll<HTMLButtonElement>('button[data-ui-action="queue-series"]').forEach((button) => button.addEventListener("click", () => {
+      const mode = button.dataset.mode;
+      if (mode === "next" || mode === "all") void this.#catalog.queueSeriesBooks(mode);
+    }));
+    this.#root.querySelectorAll<HTMLButtonElement>('button[data-ui-action="open-send-queue"]').forEach((button) => button.addEventListener("click", () => {
+      if (button.closest(".library-activity-sheet")) {
+        this.#catalog.toggleActivityCenter(false);
+        this.#catalog.toggleSendQueue(true);
+        this.#writeCatalogRoute({ activityOpen: false, sendQueueOpen: true }, "replace");
+      } else {
+        this.#writeCatalogRoute({ sendQueueOpen: true }, "push", { kindleBridgeQueue: true });
+        this.#catalog.toggleSendQueue(true);
+      }
+    }));
+    this.#root.querySelectorAll<HTMLButtonElement>('button[data-ui-action="open-activity-center"]').forEach((button) => button.addEventListener("click", () => {
+      this.#writeCatalogRoute({ activityOpen: true }, "push", { kindleBridgeActivity: true });
+      this.#catalog.toggleActivityCenter(true);
+    }));
+    this.#root.querySelectorAll<HTMLElement>('[data-ui-action="close-activity-center"]').forEach((element) => element.addEventListener("click", () => this.#closeActivityCenter()));
+    this.#root.querySelector<HTMLButtonElement>('[data-ui-action="clear-activity-history"]')?.addEventListener("click", () => this.#catalog.clearActivityHistory());
+    this.#root.querySelectorAll<HTMLButtonElement>('[data-ui-action="acknowledge-activity"]').forEach((button) => button.addEventListener("click", () => {
+      if (button.dataset.eventId) this.#catalog.acknowledgeActivity(button.dataset.eventId);
+    }));
+    this.#root.querySelector<HTMLButtonElement>('[data-ui-action="open-activity-metadata-job"]')?.addEventListener("click", () => {
+      const jobId = this.#root.querySelector<HTMLButtonElement>('[data-ui-action="open-activity-metadata-job"]')?.dataset.jobId;
+      if (!jobId) return;
+      this.#closeActivityCenter(false);
+      void this.#catalog.setView("attention").then(async () => {
+        this.#writeCatalogRoute({ activityOpen: false, sendQueueOpen: false, shelfManagerOpen: false }, "replace");
+        await this.#catalog.openMetadataLookupJob(jobId);
+      });
+    });
+    this.#root.querySelectorAll<HTMLButtonElement>('[data-ui-action="activity-event-action"]').forEach((button) => button.addEventListener("click", () => {
+      const action = button.dataset.eventAction;
+      if (button.dataset.eventId) this.#catalog.acknowledgeActivity(button.dataset.eventId);
+      this.#closeActivityCenter(false);
+      if (action === "open-queue") {
+        this.#catalog.toggleSendQueue(true);
+        this.#writeCatalogRoute({ activityOpen: false, sendQueueOpen: true }, "replace");
+      } else if (action === "reconnect") {
+        this.#writeCatalogRoute({ activityOpen: false }, "replace");
+        void this.#catalog.requestConnect();
+      } else if (action === "rescan" || action === "open-attention" || action === "open-settings") {
+        void this.#catalog.setView(action === "open-settings" ? "settings" : "attention").then(() => {
+          this.#writeCatalogRoute({ activityOpen: false, sendQueueOpen: false, shelfManagerOpen: false }, "replace");
+        });
+      } else if (action === "retry") {
+        this.#writeCatalogRoute({ activityOpen: false }, "replace");
+        void this.#catalog.retry();
+      } else if (action === "retry-transfer") {
+        this.#writeCatalogRoute({ activityOpen: false }, "replace");
+        void this.#catalog.sendSelectedBooks();
+      }
+    }));
+    this.#root.querySelector<HTMLButtonElement>('[data-ui-action="export-activity-report"]')?.addEventListener("click", () => this.#downloadActivityReport());
+    this.#root.querySelector<HTMLSelectElement>("#catalog-health-type")?.addEventListener("change", (event) => {
+      this.#catalog.setCatalogHealthFilter("type", (event.currentTarget as HTMLSelectElement).value as never);
+    });
+    this.#root.querySelector<HTMLSelectElement>("#catalog-health-severity")?.addEventListener("change", (event) => {
+      this.#catalog.setCatalogHealthFilter("severity", (event.currentTarget as HTMLSelectElement).value as never);
+    });
+    this.#root.querySelector<HTMLInputElement>("#catalog-health-ignored")?.addEventListener("change", (event) => {
+      this.#catalog.setCatalogHealthFilter("ignored", (event.currentTarget as HTMLInputElement).checked);
+    });
+    this.#root.querySelectorAll<HTMLButtonElement>('[data-ui-action="reload-catalog-health"]').forEach((button) => button.addEventListener("click", () => { void this.#catalog.loadCatalogHealth(); }));
+    this.#root.querySelectorAll<HTMLButtonElement>('[data-ui-action="catalog-health-page"]').forEach((button) => button.addEventListener("click", () => {
+      const offset = Number(button.dataset.pageOffset);
+      if (Number.isSafeInteger(offset) && offset >= 0) this.#catalog.goToCatalogHealthPage(offset);
+    }));
+    this.#root.querySelectorAll<HTMLButtonElement>('[data-ui-action="set-catalog-issue-ignored"]').forEach((button) => button.addEventListener("click", () => {
+      if (button.dataset.issueSignature) void this.#catalog.setCatalogIssueIgnored(button.dataset.issueSignature, button.dataset.ignored === "true");
+    }));
+    this.#root.querySelectorAll<HTMLButtonElement>('[data-ui-action="retry-catalog-issue"]').forEach((button) => button.addEventListener("click", () => {
+      if (button.dataset.issueSignature) void this.#catalog.retryCatalogIssue(button.dataset.issueSignature);
+    }));
+    this.#root.querySelectorAll<HTMLButtonElement>('[data-ui-action="set-duplicate-preference"]').forEach((button) => button.addEventListener("click", () => {
+      if (button.dataset.issueSignature) void this.#catalog.setDuplicatePreference(button.dataset.issueSignature, button.dataset.bookId || null);
+    }));
+    this.#root.querySelectorAll<HTMLButtonElement>('[data-ui-action="review-issue-metadata"]').forEach((button) => button.addEventListener("click", () => {
+      if (button.dataset.bookId) void this.#catalog.openMetadataEditor(button.dataset.bookId);
+    }));
+    this.#root.querySelectorAll<HTMLButtonElement>('[data-ui-action="lookup-issue-metadata"]').forEach((button) => button.addEventListener("click", () => {
+      const provider = button.dataset.provider;
+      if (button.dataset.issueSignature && (provider === "open-library" || provider === "google-books")) {
+        void this.#catalog.createMetadataLookupForIssue(button.dataset.issueSignature, provider);
+      }
+    }));
+    this.#root.querySelector<HTMLButtonElement>('[data-ui-action="reload-metadata-jobs"]')?.addEventListener("click", () => { void this.#catalog.loadMetadataLookupJobs(); });
+    this.#root.querySelectorAll<HTMLButtonElement>('[data-ui-action="open-metadata-job"]').forEach((button) => button.addEventListener("click", () => {
+      if (button.dataset.jobId) void this.#catalog.openMetadataLookupJob(button.dataset.jobId);
+    }));
+    this.#root.querySelector<HTMLButtonElement>('[data-ui-action="close-metadata-job"]')?.addEventListener("click", () => this.#catalog.closeMetadataLookupJob());
+    this.#root.querySelectorAll<HTMLButtonElement>('[data-ui-action="control-metadata-job"]').forEach((button) => button.addEventListener("click", () => {
+      const action = button.dataset.jobAction;
+      if (action === "resume" || action === "pause" || action === "cancel" || action === "retry") void this.#catalog.controlMetadataLookupJob(action);
+    }));
+    this.#root.querySelector<HTMLButtonElement>('[data-ui-action="run-metadata-job"]')?.addEventListener("click", () => { void this.#catalog.runMetadataLookupJobStep(); });
+    this.#root.querySelectorAll<HTMLButtonElement>('[data-ui-action="review-metadata-job-candidate"]').forEach((button) => button.addEventListener("click", () => {
+      const { jobId, bookId, candidateId } = button.dataset;
+      if (jobId && bookId && candidateId) void this.#catalog.reviewMetadataLookupCandidate(jobId, bookId, candidateId);
+    }));
+    this.#root.querySelectorAll<HTMLButtonElement>('button[data-ui-action="apply-smart-shelf"]').forEach((button) => button.addEventListener("click", () => {
+      const shelfId = button.dataset.shelfId;
+      if (!shelfId) return;
+      void this.#catalog.applySmartShelf(shelfId).then(() => this.#writeCatalogRoute({ bookId: null, seriesKey: null }, "replace"));
+    }));
+    this.#root.querySelector<HTMLButtonElement>('button[data-ui-action="clear-smart-shelf"]')?.addEventListener("click", () => {
+      this.#catalog.clearSmartShelf();
+      this.#writeCatalogRoute({ bookId: null, seriesKey: null }, "replace");
+    });
+    this.#root.querySelector<HTMLButtonElement>('button[data-ui-action="manage-smart-shelves"]')?.addEventListener("click", () => {
+      this.#writeCatalogRoute({ shelfManagerOpen: true }, "push", { kindleBridgeShelves: true });
+      this.#catalog.toggleShelfManager(true);
+    });
+    this.#root.querySelectorAll<HTMLElement>('[data-ui-action="close-smart-shelves"]').forEach((element) => element.addEventListener("click", () => this.#closeSmartShelfDialog()));
+    this.#root.querySelector<HTMLFormElement>("form.smart-shelf-save-form")?.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const input = this.#root.querySelector<HTMLInputElement>("#smart-shelf-name");
+      if (input?.value.trim()) void this.#catalog.saveCurrentQueryAsShelf(input.value).then(() => { input.value = ""; });
+    });
+    this.#root.querySelectorAll<HTMLButtonElement>('button[data-ui-action="toggle-smart-shelf-pin"]').forEach((button) => button.addEventListener("click", () => {
+      if (button.dataset.shelfId) void this.#catalog.toggleSmartShelfPinned(button.dataset.shelfId);
+    }));
+    this.#root.querySelectorAll<HTMLButtonElement>('button[data-ui-action="move-smart-shelf"]').forEach((button) => button.addEventListener("click", () => {
+      const direction = Number(button.dataset.direction);
+      if (button.dataset.shelfId && (direction === -1 || direction === 1)) {
+        void this.#catalog.movePinnedSmartShelf(button.dataset.shelfId, direction);
+      }
+    }));
+    this.#root.querySelectorAll<HTMLFormElement>("form[data-smart-shelf-rename]").forEach((form) => form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const shelfId = form.dataset.smartShelfRename;
+      const name = form.querySelector<HTMLInputElement>("input")?.value;
+      if (shelfId && name?.trim()) void this.#catalog.renameSmartShelf(shelfId, name);
+    }));
+    this.#root.querySelectorAll<HTMLButtonElement>('button[data-ui-action="update-smart-shelf-query"]').forEach((button) => button.addEventListener("click", () => {
+      if (button.dataset.shelfId) void this.#catalog.updateSmartShelfToCurrentView(button.dataset.shelfId);
+    }));
+    this.#root.querySelectorAll<HTMLButtonElement>('button[data-ui-action="delete-smart-shelf"]').forEach((button) => button.addEventListener("click", () => {
+      if (button.dataset.shelfId) void this.#catalog.deleteSmartShelf(button.dataset.shelfId);
+    }));
     this.#bindSettingsEvents();
     this.#bindCatalogResultActions();
   }
@@ -538,6 +857,30 @@ export class AppView {
           ?? this.#root.querySelector<HTMLElement>("#settings-heading"))?.focus();
       }));
     });
+    this.#root.querySelector<HTMLButtonElement>('button[data-ui-action="retry-cover-provider-settings"]')?.addEventListener("click", () => {
+      void this.#catalog.loadCoverProviderSettings(true);
+    });
+    this.#root.querySelector<HTMLButtonElement>('button[data-ui-action="edit-google-books-key"]')?.addEventListener("click", () => {
+      this.#catalog.editGoogleBooksCredential();
+      window.queueMicrotask(() => this.#root.querySelector<HTMLInputElement>("#settings-google-books-key")?.focus());
+    });
+    this.#root.querySelector<HTMLButtonElement>('button[data-ui-action="cancel-google-books-key"]')?.addEventListener("click", () => {
+      const input = this.#root.querySelector<HTMLInputElement>("#settings-google-books-key");
+      if (input) input.value = "";
+      this.#catalog.cancelGoogleBooksCredentialEdit();
+    });
+    this.#root.querySelector<HTMLButtonElement>('button[data-ui-action="save-test-google-books-key"]')?.addEventListener("click", () => {
+      const input = this.#root.querySelector<HTMLInputElement>("#settings-google-books-key");
+      const key = input?.value ?? "";
+      if (input) input.value = "";
+      void this.#catalog.saveAndTestGoogleBooksCredential(key);
+    });
+    this.#root.querySelector<HTMLButtonElement>('button[data-ui-action="remove-google-books-key"]')?.addEventListener("click", () => {
+      const input = this.#root.querySelector<HTMLInputElement>("#settings-google-books-key");
+      if (input) input.value = "";
+      if (typeof window.confirm === "function" && !window.confirm("Remove the saved Google Books API key?")) return;
+      void this.#catalog.removeGoogleBooksCredential();
+    });
     this.#activateDeleteDialog();
   }
 
@@ -591,7 +934,16 @@ export class AppView {
   #bindCatalogResultActions(scope: ParentNode = this.#root): void {
     if (scope !== this.#root) {
       scope.querySelectorAll<HTMLButtonElement>("button[data-ui-view]").forEach((button) => button.addEventListener("click", () => {
-        void this.#catalog.setView(button.dataset.uiView as LibraryView);
+        void this.#catalog.setView(button.dataset.uiView as LibraryView).then(() => this.#writeCatalogRoute({ bookId: null, seriesKey: null }, "replace"));
+      }));
+      scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="open-series"]').forEach((button) => button.addEventListener("click", () => {
+        const key = button.dataset.seriesKey;
+        if (!key) return;
+        if (button.closest(".library-book-details-sheet")) this.#closeBookDetails(true, false);
+        void this.#catalog.setView("series").then(async () => {
+          this.#writeCatalogRoute({ bookId: null, seriesKey: key }, "push", { kindleBridgeSeries: key });
+          await this.#catalog.openSeries(key);
+        });
       }));
     }
     scope.querySelectorAll<HTMLImageElement>("img[data-library-cover-image]").forEach((image) => image.addEventListener("error", () => {
@@ -606,30 +958,82 @@ export class AppView {
     scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="send-book"]').forEach((button) => button.addEventListener("click", () => {
       const bookId = button.dataset.bookId;
       if (bookId) {
+        if (button.closest(".library-book-details-sheet")) this.#closeBookDetails(true, false);
         this.#catalogDialogReturnBookId = bookId;
         this.#catalog.openSend(bookId);
       }
     }));
+    scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="update-book-on-kindle"]').forEach((button) => button.addEventListener("click", () => {
+      const bookId = button.dataset.bookId;
+      if (!bookId) return;
+      if (button.closest(".library-book-details-sheet")) this.#closeBookDetails(true, false);
+      if (button.closest(".library-metadata-sheet")) {
+        this.#closeMetadataEditorDialog();
+        if (this.#catalog.snapshot.metadataEditor) return;
+      }
+      this.#catalogUpdateReturnBookId = bookId;
+      this.#catalog.requestBookUpdate(bookId);
+    }));
     scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="edit-book-metadata"]').forEach((button) => button.addEventListener("click", () => {
       const bookId = button.dataset.bookId;
       if (!bookId) return;
+      if (button.closest(".library-book-details-sheet")) this.#closeBookDetails(true, false);
       this.#catalogMetadataReturnBookId = bookId;
       void this.#catalog.openMetadataEditor(bookId);
     }));
+    scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="open-book-details"]').forEach((button) => button.addEventListener("click", () => {
+      const bookId = button.dataset.bookId;
+      if (!bookId) return;
+      this.#catalogDetailsReturnBookId = bookId;
+      this.#catalogDetailsScrollY = window.scrollY;
+      this.#catalog.setScrollPosition(window.scrollY);
+      this.#writeCatalogRoute({ bookId, seriesKey: null }, "push", { kindleBridgeBook: bookId });
+      void this.#catalog.openBookDetails(bookId);
+    }));
     scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="set-library-layout"]').forEach((button) => button.addEventListener("click", () => {
       const layout = button.dataset.layout;
-      if (layout === "grid" || layout === "list") this.#catalog.setLayout(layout);
+      if (layout === "grid" || layout === "list") {
+        this.#catalog.setLayout(layout);
+        this.#writeCatalogRoute({}, "replace");
+      }
+    }));
+    scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="set-library-density"]').forEach((button) => button.addEventListener("click", () => {
+      const density = button.dataset.density;
+      if (density === "comfortable" || density === "compact") {
+        this.#catalog.setDensity(density);
+        this.#writeCatalogRoute({}, "replace");
+      }
     }));
     scope.querySelectorAll<HTMLInputElement>('input[data-ui-action="toggle-book-selection"]').forEach((input) => input.addEventListener("change", () => {
       const bookId = input.dataset.bookId;
       if (bookId) this.#catalog.toggleBookSelection(bookId, input.checked);
     }));
     scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="select-visible-books"]').forEach((button) => button.addEventListener("click", () => this.#catalog.toggleVisibleBookSelection()));
+    scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="select-all-filtered"]').forEach((button) => button.addEventListener("click", () => { void this.#catalog.selectAllFiltered(false); }));
+    scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="select-all-filtered-missing"]').forEach((button) => button.addEventListener("click", () => { void this.#catalog.selectAllFiltered(true); }));
     scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="clear-book-selection"]').forEach((button) => button.addEventListener("click", () => this.#catalog.clearBookSelection()));
+    scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="add-book-to-queue"]').forEach((button) => button.addEventListener("click", () => {
+      if (button.dataset.bookId) void this.#catalog.addBookToSendQueue(button.dataset.bookId);
+    }));
+    scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="bulk-add-to-queue"]').forEach((button) => button.addEventListener("click", () => { void this.#catalog.addSelectedBooksToSendQueue(); }));
+    scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="bulk-find-metadata"]').forEach((button) => button.addEventListener("click", () => {
+      const provider = scope.querySelector<HTMLSelectElement>("#bulk-metadata-provider")?.value;
+      if (provider !== "open-library" && provider !== "google-books") return;
+      void this.#catalog.createMetadataLookupJob(provider).then(() => this.#catalog.setView("attention"))
+        .then(() => this.#writeCatalogRoute({ bookId: null, matchItemId: null, matchBookId: null, seriesKey: null }, "replace"));
+    }));
+    scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="toggle-book-favorite"]').forEach((button) => button.addEventListener("click", () => {
+      if (button.dataset.bookId) void this.#catalog.toggleBookAnnotation(button.dataset.bookId, "favorite");
+    }));
+    scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="toggle-book-want-to-read"]').forEach((button) => button.addEventListener("click", () => {
+      if (button.dataset.bookId) void this.#catalog.toggleBookAnnotation(button.dataset.bookId, "wantToRead");
+    }));
     scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="bulk-send-to-kindle"]').forEach((button) => button.addEventListener("click", () => { void this.#catalog.sendSelectedBooks(); }));
     scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="remove-book-from-kindle"]').forEach((button) => button.addEventListener("click", () => {
       const bookId = button.dataset.bookId;
       if (!bookId) return;
+      if (button.closest(".library-book-details-sheet")) this.#closeBookDetails(true, false);
+      if (button.closest(".library-match-review-sheet")) this.#closeMatchReview();
       this.#catalogRemovalReturnBookId = bookId;
       this.#catalog.requestBookRemoval(bookId);
     }));
@@ -644,24 +1048,82 @@ export class AppView {
         this.#restoreCatalogRemovalFocus();
       });
     });
-    scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="clear-filters"]').forEach((button) => button.addEventListener("click", () => this.#catalog.clearFilters()));
+    scope.querySelectorAll<HTMLElement>('[data-ui-action="cancel-kindle-update"]').forEach((element) => element.addEventListener("click", () => this.#closeCatalogUpdateDialog()));
+    scope.querySelector<HTMLButtonElement>('button[data-ui-action="confirm-kindle-update"]')?.addEventListener("click", () => {
+      void this.#catalog.confirmBookUpdate();
+    });
+    scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="clear-filters"]').forEach((button) => button.addEventListener("click", () => {
+      this.#catalog.clearFilters();
+      this.#writeCatalogRoute({ bookId: null, seriesKey: null }, "replace");
+    }));
     scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="retry-catalog"]').forEach((button) => button.addEventListener("click", () => { void this.#catalog.retry(); }));
     scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="catalog-page"]').forEach((button) => button.addEventListener("click", () => {
       const offset = Number(button.dataset.pageOffset);
-      if (Number.isFinite(offset)) this.#catalog.goToPage(offset);
+      if (Number.isFinite(offset)) {
+        this.#catalog.goToPage(offset);
+        this.#writeCatalogRoute({ bookId: null, seriesKey: null }, "replace");
+      }
     }));
     scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="kindle-page"]').forEach((button) => button.addEventListener("click", () => {
       const offset = Number(button.dataset.pageOffset);
       if (Number.isFinite(offset)) this.#catalog.goToKindleInventoryPage(offset);
     }));
+    scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="open-match-review"]').forEach((button) => button.addEventListener("click", () => {
+      const itemId = button.dataset.itemId;
+      if (!itemId) return;
+      const bookId = button.dataset.bookId;
+      if (button.closest(".library-book-details-sheet")) this.#closeBookDetails(true, false);
+      this.#writeCatalogRoute({
+        bookId: null,
+        matchItemId: itemId,
+        matchBookId: bookId ?? null,
+        seriesKey: null,
+      }, "push", { kindleBridgeMatch: itemId });
+      void this.#catalog.openMatchReview(itemId, bookId);
+    }));
+    scope.querySelectorAll<HTMLElement>('[data-ui-action="close-match-review"]').forEach((element) => element.addEventListener("click", () => this.#closeMatchReview()));
+    scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="manual-match-decision"]').forEach((button) => button.addEventListener("click", () => {
+      const { profileId, bookId, decision } = button.dataset;
+      if (!profileId || !bookId || (decision !== "same-book" && decision !== "not-this-book" && decision !== "undo")) return;
+      void this.#catalog.decideManualMatch(profileId, bookId, decision);
+    }));
+    scope.querySelectorAll<HTMLElement>('[data-ui-action="close-send-queue"]').forEach((element) => element.addEventListener("click", () => this.#closeSendQueueDialog()));
+    scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="remove-queue-book"]').forEach((button) => button.addEventListener("click", () => {
+      if (button.dataset.bookId) void this.#catalog.removeBookFromSendQueue(button.dataset.bookId);
+    }));
+    scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="move-queue-book"]').forEach((button) => button.addEventListener("click", () => {
+      const direction = Number(button.dataset.direction);
+      if (button.dataset.bookId && (direction === -1 || direction === 1)) void this.#catalog.moveSendQueueBook(button.dataset.bookId, direction);
+    }));
+    scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="clear-send-queue"]').forEach((button) => button.addEventListener("click", () => { void this.#catalog.clearSendQueue(); }));
+    scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="send-queued-books"]').forEach((button) => button.addEventListener("click", () => {
+      this.#writeCatalogRoute({ sendQueueOpen: false }, "replace");
+      void this.#catalog.sendQueuedBooks();
+    }));
     scope.querySelectorAll<HTMLElement>('[data-ui-action="close-send"]').forEach((element) => element.addEventListener("click", () => this.#closeCatalogDialog()));
     scope.querySelector<HTMLButtonElement>('button[data-ui-action="confirm-catalog-send"]')?.addEventListener("click", () => { void this.#catalog.confirmSend(); });
     scope.querySelector<HTMLButtonElement>('button[data-ui-action="dismiss-announcement"]')?.addEventListener("click", () => this.#catalog.dismissAnnouncement());
+    scope.querySelectorAll<HTMLElement>('[data-ui-action="close-book-details"]').forEach((element) => element.addEventListener("click", () => this.#closeBookDetails()));
+    scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="book-details-filter"]').forEach((button) => button.addEventListener("click", () => {
+      const key = button.dataset.filterKey as keyof LibraryFilters | undefined;
+      const value = button.dataset.filterValue;
+      if (!key || !value || !["author", "series", "publisher", "language", "subject"].includes(key)) return;
+      this.#closeBookDetails(true, false);
+      this.#catalog.updateFilter(key, value);
+      this.#writeCatalogRoute({ bookId: null, seriesKey: null }, "replace");
+      window.queueMicrotask(() => this.#root.querySelector<HTMLElement>("#library-search")?.focus({ preventScroll: true }));
+    }));
     this.#bindMetadataEditorEvents(scope);
     if (scope === this.#root) {
       this.#activateCatalogDialog();
       this.#activateCatalogRemovalDialog();
+      this.#activateCatalogUpdateDialog();
       this.#activateMetadataEditorDialog();
+      this.#activateMatchReviewDialog();
+      this.#activateSendQueueDialog();
+      this.#activateSmartShelfDialog();
+      this.#activateBookDetailsDialog();
+      this.#activateActivityCenterDialog();
     }
   }
 
@@ -742,6 +1204,37 @@ export class AppView {
     scope.querySelector<HTMLButtonElement>('[data-ui-action="reset-book-cover"]')?.addEventListener("click", () => {
       if (this.#captureMetadataEditorForm()) void this.#catalog.resetBookCover();
     });
+    const searchMetadata = (): void => {
+      if (!this.#captureMetadataEditorForm()) return;
+      const provider = scope.querySelector<HTMLSelectElement>("#metadata-candidate-provider")?.value;
+      if (provider !== "google-books" && provider !== "open-library") return;
+      void this.#catalog.searchBookMetadata(provider, {
+        title: scope.querySelector<HTMLInputElement>("#metadata-candidate-title")?.value.trim() || undefined,
+        author: scope.querySelector<HTMLInputElement>("#metadata-candidate-author")?.value.trim() || undefined,
+        identifier: scope.querySelector<HTMLInputElement>("#metadata-candidate-identifier")?.value.trim() || undefined,
+      });
+    };
+    scope.querySelector<HTMLButtonElement>('[data-ui-action="search-metadata-candidates"]')?.addEventListener("click", searchMetadata);
+    scope.querySelectorAll<HTMLInputElement>("#metadata-candidate-title, #metadata-candidate-author, #metadata-candidate-identifier")
+      .forEach((input) => input.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          searchMetadata();
+        }
+      }));
+    scope.querySelectorAll<HTMLButtonElement>('[data-ui-action="select-metadata-candidate"]').forEach((button) => button.addEventListener("click", () => {
+      if (button.dataset.candidateId && this.#captureMetadataEditorForm()) this.#catalog.selectMetadataCandidate(button.dataset.candidateId);
+    }));
+    scope.querySelectorAll<HTMLInputElement>('[data-ui-action="toggle-metadata-candidate-field"]').forEach((input) => input.addEventListener("change", () => {
+      const field = input.dataset.field;
+      if (field) this.#catalog.setMetadataCandidateField(field as never, input.checked);
+    }));
+    scope.querySelector<HTMLInputElement>('[data-ui-action="toggle-metadata-candidate-cover"]')?.addEventListener("change", (event) => {
+      this.#catalog.setMetadataCandidateCover((event.currentTarget as HTMLInputElement).checked);
+    });
+    scope.querySelector<HTMLButtonElement>('[data-ui-action="import-metadata-candidate"]')?.addEventListener("click", () => {
+      if (this.#captureMetadataEditorForm()) void this.#catalog.importSelectedMetadataCandidate();
+    });
     const search = (): void => {
       if (!this.#captureMetadataEditorForm()) return;
       const provider = scope.querySelector<HTMLSelectElement>("#metadata-cover-provider")?.value as CoverProvider | undefined;
@@ -749,6 +1242,13 @@ export class AppView {
       if (provider === "google-books" || provider === "open-library") void this.#catalog.searchBookCovers(provider, query);
     };
     scope.querySelector<HTMLButtonElement>('[data-ui-action="search-metadata-covers"]')?.addEventListener("click", search);
+    scope.querySelector<HTMLButtonElement>('[data-ui-action="open-cover-provider-settings"]')?.addEventListener("click", () => {
+      this.#closeMetadataEditorDialog();
+      if (!this.#catalog.snapshot.metadataEditor) {
+        void this.#catalog.setView("settings")
+          .then(() => this.#writeCatalogRoute({ bookId: null, matchItemId: null, matchBookId: null, seriesKey: null }, "replace"));
+      }
+    });
     scope.querySelector<HTMLInputElement>("#metadata-cover-query")?.addEventListener("keydown", (event) => {
       if (event.key === "Enter") {
         event.preventDefault();
@@ -820,6 +1320,87 @@ export class AppView {
     });
   }
 
+  #closeBookDetails(updateHistory = true, restoreFocus = true): void {
+    if (!this.#catalog.snapshot.bookDetails) return;
+    const returnBookId = this.#catalogDetailsReturnBookId ?? this.#catalog.snapshot.bookDetails.bookId;
+    const scrollY = this.#catalogDetailsScrollY;
+    this.#catalogDetailsReturnBookId = undefined;
+    this.#catalog.closeBookDetails();
+    if (updateHistory && decodeLibraryRoute(window.location.hash)?.overlays.bookId) {
+      this.#writeCatalogRoute({ bookId: null }, "replace");
+    }
+    if (restoreFocus) this.#restoreBookDetailsOrigin(returnBookId, scrollY);
+  }
+
+  #restoreBookDetailsOrigin(returnBookId: string | undefined, scrollY: number): void {
+    window.queueMicrotask(() => {
+      try { window.scrollTo({ top: scrollY, behavior: "auto" }); } catch { /* jsdom and older browsers */ }
+      const trigger = returnBookId
+        ? [...this.#root.querySelectorAll<HTMLElement>('[data-ui-action="open-book-details"]')]
+            .find((candidate) => candidate.dataset.bookId === returnBookId)
+        : undefined;
+      (trigger
+        ?? this.#root.querySelector<HTMLElement>('.library-nav-item[aria-current="page"]')
+        ?? this.#root.querySelector<HTMLElement>(".library-brand"))?.focus({ preventScroll: true });
+    });
+  }
+
+  #closeMatchReview(updateHistory = true): void {
+    const itemId = this.#catalog.snapshot.matchReview?.itemId;
+    if (!itemId) return;
+    this.#catalog.closeMatchReview();
+    if (updateHistory) this.#writeCatalogRoute({ matchItemId: null, matchBookId: null }, "replace");
+    this.#restoreMatchReviewOrigin(itemId);
+  }
+
+  #restoreMatchReviewOrigin(itemId: string): void {
+    window.queueMicrotask(() => {
+      ([...this.#root.querySelectorAll<HTMLElement>('[data-ui-action="open-match-review"]')]
+        .find((candidate) => candidate.dataset.itemId === itemId)
+        ?? this.#root.querySelector<HTMLElement>('.library-nav-item[aria-current="page"]')
+        ?? this.#root.querySelector<HTMLElement>(".library-brand"))?.focus({ preventScroll: true });
+    });
+  }
+
+  #activateBookDetailsDialog(): void {
+    const dialog = this.#root.querySelector<HTMLElement>('.library-book-details-sheet[role="dialog"]');
+    if (!dialog) return;
+    [
+      this.#root.querySelector<HTMLElement>(".library-topbar"),
+      this.#root.querySelector<HTMLElement>(".library-sidebar"),
+      ...this.#root.querySelectorAll<HTMLElement>(".library-main > :not(.library-book-details-sheet):not(.library-modal-backdrop)"),
+      this.#root.querySelector<HTMLElement>(".library-global-alerts"),
+      this.#root.querySelector<HTMLElement>(".poc-lab"),
+      this.#root.querySelector<HTMLElement>(".footer"),
+    ].filter((element): element is HTMLElement => element !== null)
+      .forEach((element) => element.setAttribute("inert", ""));
+    dialog.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        this.#closeBookDetails();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = [...dialog.querySelectorAll<HTMLElement>('button:not([disabled]), [href], [tabindex]:not([tabindex="-1"])')]
+        .filter((element) => !element.hasAttribute("hidden"));
+      if (focusable.length === 0) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+      const first = focusable[0]!;
+      const last = focusable.at(-1)!;
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    });
+    (dialog.querySelector<HTMLElement>('button[data-ui-action="close-book-details"]') ?? dialog).focus({ preventScroll: true });
+  }
+
   #activateMetadataEditorDialog(): void {
     const dialog = this.#root.querySelector<HTMLElement>('.library-metadata-sheet[role="dialog"]');
     if (!dialog) return;
@@ -860,6 +1441,181 @@ export class AppView {
       ?? dialog).focus();
   }
 
+  #activateMatchReviewDialog(): void {
+    const dialog = this.#root.querySelector<HTMLElement>('.library-match-review-sheet[role="dialog"]');
+    if (!dialog) return;
+    [
+      this.#root.querySelector<HTMLElement>(".library-topbar"),
+      this.#root.querySelector<HTMLElement>(".library-sidebar"),
+      ...this.#root.querySelectorAll<HTMLElement>(".library-main > :not(.library-match-review-sheet):not(.library-modal-backdrop)"),
+      this.#root.querySelector<HTMLElement>(".library-global-alerts"),
+      this.#root.querySelector<HTMLElement>(".poc-lab"),
+      this.#root.querySelector<HTMLElement>(".footer"),
+    ].filter((element): element is HTMLElement => element !== null)
+      .forEach((element) => element.setAttribute("inert", ""));
+    dialog.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        this.#closeMatchReview();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = [...dialog.querySelectorAll<HTMLElement>('button:not([disabled]), [tabindex]:not([tabindex="-1"])')];
+      if (focusable.length === 0) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+      const first = focusable[0]!;
+      const last = focusable.at(-1)!;
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    });
+    (dialog.querySelector<HTMLElement>('button[data-ui-action="close-match-review"]:not([disabled])') ?? dialog).focus();
+  }
+
+  #activateSendQueueDialog(): void {
+    const dialog = this.#root.querySelector<HTMLElement>('.library-queue-sheet[role="dialog"]');
+    if (!dialog) return;
+    [
+      this.#root.querySelector<HTMLElement>(".library-topbar"),
+      this.#root.querySelector<HTMLElement>(".library-sidebar"),
+      ...this.#root.querySelectorAll<HTMLElement>(".library-main > :not(.library-queue-sheet):not(.library-modal-backdrop)"),
+      this.#root.querySelector<HTMLElement>(".poc-lab"),
+      this.#root.querySelector<HTMLElement>(".footer"),
+    ].filter((element): element is HTMLElement => element !== null)
+      .forEach((element) => element.setAttribute("inert", ""));
+    dialog.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && !this.#catalog.snapshot.sendQueueBusy) {
+        event.preventDefault();
+        this.#closeSendQueueDialog();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = [...dialog.querySelectorAll<HTMLElement>('button:not([disabled]), [tabindex]:not([tabindex="-1"])')];
+      const first = focusable[0];
+      const last = focusable.at(-1);
+      if (!first || !last) return;
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    });
+    (dialog.querySelector<HTMLElement>('button[data-ui-action="close-send-queue"]:not([disabled])') ?? dialog).focus();
+  }
+
+  #activateSmartShelfDialog(): void {
+    const dialog = this.#root.querySelector<HTMLElement>('.library-shelf-sheet[role="dialog"]');
+    if (!dialog) return;
+    [
+      this.#root.querySelector<HTMLElement>(".library-topbar"),
+      this.#root.querySelector<HTMLElement>(".library-sidebar"),
+      ...this.#root.querySelectorAll<HTMLElement>(".library-main > :not(.library-shelf-sheet):not(.library-modal-backdrop)"),
+      this.#root.querySelector<HTMLElement>(".poc-lab"),
+      this.#root.querySelector<HTMLElement>(".footer"),
+    ].filter((element): element is HTMLElement => element !== null)
+      .forEach((element) => element.setAttribute("inert", ""));
+    dialog.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        this.#closeSmartShelfDialog();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = [...dialog.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])')];
+      const first = focusable[0];
+      const last = focusable.at(-1);
+      if (!first || !last) return;
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    });
+    (dialog.querySelector<HTMLElement>("#smart-shelf-name") ?? dialog).focus();
+  }
+
+  #closeSendQueueDialog(): void {
+    if (this.#catalog.snapshot.sendQueueBusy) return;
+    if (decodeLibraryRoute(window.location.hash)?.overlays.sendQueueOpen && window.history.length > 1) window.history.back();
+    else {
+      this.#catalog.toggleSendQueue(false);
+      this.#writeCatalogRoute({ sendQueueOpen: false }, "replace");
+    }
+  }
+
+  #closeSmartShelfDialog(): void {
+    if (decodeLibraryRoute(window.location.hash)?.overlays.shelfManagerOpen && window.history.length > 1) window.history.back();
+    else {
+      this.#catalog.toggleShelfManager(false);
+      this.#writeCatalogRoute({ shelfManagerOpen: false }, "replace");
+    }
+  }
+
+  #closeActivityCenter(updateHistory = true): void {
+    if (!this.#catalog.snapshot.activityOpen) return;
+    if (updateHistory && decodeLibraryRoute(window.location.hash)?.overlays.activityOpen && window.history.length > 1) {
+      window.history.back();
+      return;
+    }
+    if (updateHistory) this.#writeCatalogRoute({ activityOpen: false }, "replace");
+    this.#catalog.toggleActivityCenter(false);
+    window.queueMicrotask(() => this.#root.querySelector<HTMLElement>('[data-ui-action="open-activity-center"]')?.focus());
+  }
+
+  #downloadActivityReport(): void {
+    const report = JSON.stringify({
+      exportedAt: new Date().toISOString(),
+      profileId: this.#catalog.snapshot.filters.profileId ?? null,
+      service: this.#catalog.snapshot.serviceStatus ?? null,
+      issues: this.#catalog.snapshot.healthPage?.counts ?? null,
+      events: this.#catalog.snapshot.activityEvents,
+    }, null, 2);
+    if (typeof URL.createObjectURL !== "function") return;
+    const url = URL.createObjectURL(new Blob([report], { type: "application/json" }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `kindle-bridge-activity-${new Date().toISOString().replaceAll(":", "-")}.json`;
+    link.click();
+    URL.revokeObjectURL(url);
+  }
+
+  #activateActivityCenterDialog(): void {
+    const dialog = this.#root.querySelector<HTMLElement>('.library-activity-sheet[role="dialog"]');
+    if (!dialog) return;
+    [
+      this.#root.querySelector<HTMLElement>(".library-topbar"),
+      this.#root.querySelector<HTMLElement>(".library-sidebar"),
+      ...this.#root.querySelectorAll<HTMLElement>(".library-main > :not(.library-activity-sheet):not(.library-modal-backdrop)"),
+      this.#root.querySelector<HTMLElement>(".library-global-alerts"),
+      this.#root.querySelector<HTMLElement>(".poc-lab"),
+      this.#root.querySelector<HTMLElement>(".footer"),
+    ].filter((element): element is HTMLElement => element !== null)
+      .forEach((element) => element.setAttribute("inert", ""));
+    dialog.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        this.#closeActivityCenter();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = [...dialog.querySelectorAll<HTMLElement>('button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), details > summary, [tabindex]:not([tabindex="-1"])')];
+      const first = focusable[0];
+      const last = focusable.at(-1);
+      if (!first || !last) {
+        event.preventDefault();
+        dialog.focus();
+      } else if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    });
+    (dialog.querySelector<HTMLElement>('[data-ui-action="close-activity-center"]') ?? dialog).focus();
+  }
+
   #closeCatalogDialog(): void {
     if (this.#catalog.snapshot.sendBusy) return;
     const returnBookId = this.#catalogDialogReturnBookId;
@@ -878,6 +1634,59 @@ export class AppView {
     if (this.#catalog.snapshot.bulkActionBusy) return;
     this.#catalog.cancelBookRemoval();
     this.#restoreCatalogRemovalFocus();
+  }
+
+  #closeCatalogUpdateDialog(): void {
+    if (this.#catalog.snapshot.sendBusy) return;
+    const returnBookId = this.#catalogUpdateReturnBookId;
+    this.#catalogUpdateReturnBookId = undefined;
+    this.#catalog.cancelBookUpdate();
+    window.queueMicrotask(() => {
+      const trigger = returnBookId
+        ? [...this.#root.querySelectorAll<HTMLElement>('[data-ui-action="update-book-on-kindle"]')]
+            .find((candidate) => candidate.dataset.bookId === returnBookId)
+        : undefined;
+      (trigger
+        ?? this.#root.querySelector<HTMLElement>('.library-nav-item[aria-current="page"]')
+        ?? this.#root.querySelector<HTMLElement>(".library-brand"))?.focus();
+    });
+  }
+
+  #activateCatalogUpdateDialog(): void {
+    const dialog = this.#root.querySelector<HTMLElement>('.library-update-sheet[role="alertdialog"]');
+    if (!dialog) return;
+    [
+      this.#root.querySelector<HTMLElement>(".library-topbar"),
+      this.#root.querySelector<HTMLElement>(".library-sidebar"),
+      ...this.#root.querySelectorAll<HTMLElement>(".library-main > :not(.library-update-sheet):not(.library-modal-backdrop)"),
+      this.#root.querySelector<HTMLElement>(".library-global-alerts"),
+      this.#root.querySelector<HTMLElement>(".poc-lab"),
+      this.#root.querySelector<HTMLElement>(".footer"),
+    ].filter((element): element is HTMLElement => element !== null)
+      .forEach((element) => element.setAttribute("inert", ""));
+    dialog.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        this.#closeCatalogUpdateDialog();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = [...dialog.querySelectorAll<HTMLElement>('button:not([disabled]), [tabindex]:not([tabindex="-1"])')];
+      const first = focusable[0];
+      const last = focusable.at(-1);
+      if (!first || !last) {
+        event.preventDefault();
+        dialog.focus();
+      } else if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    });
+    (dialog.querySelector<HTMLElement>('button[data-ui-action="cancel-kindle-update"]:not([disabled])')
+      ?? dialog).focus();
   }
 
   #restoreCatalogRemovalFocus(): void {
@@ -1045,6 +1854,11 @@ export class AppView {
 
   setCatalogTransferUpdate(update: CatalogTransferUpdate): void {
     this.#catalog.setTransferUpdate(update);
+  }
+
+  setAdvancedPartialObjectProbe(state: AdvancedPartialObjectProbeViewState): void {
+    this.#advancedPartialObjectProbe = state;
+    this.#renderAdvancedPartialObjectProbe();
   }
 
   get activeCatalogProfileId(): string | undefined {

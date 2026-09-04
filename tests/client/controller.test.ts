@@ -19,10 +19,18 @@ import {
 import type { UsbDeviceLike } from "../../client/src/usb";
 import {
   acquireKindleDeviceLease,
+  buildKindleInventory,
   createManagedFilenameToken,
   type KindleInventorySnapshot,
+  type KindleStoredObjectInfo,
+  type KindleTarget,
 } from "../../client/src/kindle";
 import { readPendingDeliveries } from "../../client/src/delivery-journal";
+import {
+  persistReplacementCleanupRecord,
+  readReplacementCleanupRecords,
+  type ReplacementCleanupRecord,
+} from "../../client/src/replacement-cleanup-journal";
 import { METADATA_CLAIM_BITMAP_BYTES } from "../../shared/catalog-contracts";
 
 function claimantSummary(collisions: readonly number[] = [], complete = true): {
@@ -48,6 +56,13 @@ function fakeDevice(): UsbDeviceLike {
     releaseInterface: vi.fn(), selectAlternateInterface: vi.fn(), transferIn: vi.fn(),
     transferOut: vi.fn(), clearHalt: vi.fn(),
   };
+}
+
+class ReplacementMemoryStorage {
+  readonly values = new Map<string, string>();
+  getItem(key: string): string | null { return this.values.get(key) ?? null; }
+  setItem(key: string, value: string): void { this.values.set(key, value); }
+  removeItem(key: string): void { this.values.delete(key); }
 }
 
 function completeKindleInventory(
@@ -77,6 +92,50 @@ function completeKindleInventory(
       truncationReasons: [],
     },
   };
+}
+
+async function exactPartialProbeInventory(): Promise<KindleInventorySnapshot> {
+  const file: KindleStoredObjectInfo = {
+    handle: 0x51,
+    storageId: 0x10001,
+    objectFormat: 0xb00a,
+    protectionStatus: 0,
+    compressedSize: 2_048,
+    parentHandle: 0x37,
+    associationType: 0,
+    filename: "Probe-book.azw3",
+    modificationDate: "20260904T000000",
+  };
+  const documents: KindleStoredObjectInfo = {
+    ...file,
+    handle: 0x37,
+    objectFormat: 0x3001,
+    compressedSize: 0,
+    parentHandle: 0xffff_ffff,
+    associationType: 1,
+    filename: "Documents",
+  };
+  const target: KindleTarget = {
+    storageId: 0x10001,
+    storage: {
+      storageType: 3,
+      filesystemType: 2,
+      accessCapability: 0,
+      maxCapacity: 10_000n,
+      freeSpaceInBytes: 5_000n,
+      freeSpaceInImages: 0,
+      storageDescription: "Kindle",
+      volumeLabel: "Kindle",
+    },
+    documentsHandle: documents.handle,
+    documents,
+  };
+  return buildKindleInventory({
+    listObjectHandles: vi.fn(async ({ associationHandle }: { associationHandle?: number }) => (
+      associationHandle === documents.handle ? [file.handle] : []
+    )),
+    getObjectInfo: vi.fn(async () => ({ ...file })),
+  } as never, target, { bookMetadata: false, deviceMetadataCache: false });
 }
 
 class FakeBrowserLifecycle implements BrowserLifecycleSource {
@@ -186,6 +245,9 @@ function harness(
       inventory,
       inventoryRefresh: "complete" as const,
     })),
+    updateManagedBook: vi.fn(async () => {
+      throw new Error("Managed update behavior must be supplied by the focused test");
+    }),
     removeBooksAndRefreshInventory: vi.fn(async (handles: readonly number[]) => ({
       removals: handles.map((removedHandle) => ({
         handle: removedHandle,
@@ -320,6 +382,205 @@ function harness(
     emitCatalogEvent(event: CatalogEvent) {
       if (!catalogEventListener) throw new Error("Catalog event stream is not connected");
       catalogEventListener(event);
+    },
+  };
+}
+
+async function managedUpdateHarness(
+  dependencyOverrides: Partial<AppControllerDependencies> = {},
+) {
+  const sourceBytes = Uint8Array.from([0x50, 0x4b, 0x03, 0x04, 1, 2, 3, 4]);
+  const contentHash = createHash("sha256").update(sourceBytes).digest("hex");
+  const presentationVersion = "e".repeat(64);
+  const previousPresentationVersion = "d".repeat(64);
+  const priorToken = await createManagedFilenameToken("book-1", previousPresentationVersion);
+  const currentToken = await createManagedFilenameToken("book-1", presentationVersion);
+  const cover = new Blob([Uint8Array.from([0xff, 0xd8, 0xff, 0xd9])], { type: "image/jpeg" });
+  const editedBook: CatalogBook = {
+    id: "book-1",
+    profileId: "profile-1",
+    rootId: "root-1",
+    title: "Edited Book",
+    authors: ["Edited Author"],
+    authorSort: "Author, Edited",
+    subjects: [],
+    identifiers: [],
+    format: "EPUB",
+    size: sourceBytes.byteLength,
+    contentHash,
+    presentationVersion,
+    sourceFilename: "book.epub",
+    addedAt: "2026-08-29T00:00:00.000Z",
+    updatedAt: "2026-09-03T00:00:00.000Z",
+    metadataComplete: true,
+    available: true,
+    metadataEdited: true,
+    coverEdited: true,
+    metadataRevision: 3,
+  };
+  const metadataState = {
+    book: editedBook,
+    sourceMetadata: {
+      title: "Book",
+      authors: ["Author"],
+      authorSort: "Author",
+      language: null,
+      publisher: null,
+      publishedAt: null,
+      series: null,
+      seriesIndex: null,
+      description: null,
+      subjects: [],
+      identifiers: [],
+    },
+    sourceCoverUrl: null,
+    overrides: { title: editedBook.title, authors: [...editedBook.authors] },
+    revision: 3,
+    basedOnContentHash: contentHash,
+    sourceChanged: false,
+    coverOverride: {
+      assetKey: "cover-asset",
+      mediaType: "image/jpeg" as const,
+      byteLength: cover.size,
+      width: 1,
+      height: 1,
+      sourceKind: "upload" as const,
+      provider: null,
+      providerReference: null,
+      sourceUrl: null,
+    },
+  };
+  const oldObject = {
+    handle: 41,
+    storageId: 0x10001,
+    parentHandle: 0x37,
+    objectFormat: 0xb00a,
+    protectionStatus: 0,
+    associationType: 0,
+    size: 512,
+    filename: `Book-${priorToken}.azw3`,
+    relativePath: `Book-${priorToken}.azw3`,
+    depth: 1,
+    kind: "file" as const,
+    managedToken: priorToken,
+    metadataAdjusted: false,
+    bookMetadataState: "managed-token" as const,
+  };
+  const newObject = {
+    ...oldObject,
+    handle: 42,
+    filename: `Edited Book-${currentToken}.azw3`,
+    relativePath: `Edited Book-${currentToken}.azw3`,
+    managedToken: currentToken,
+  };
+  const initialInventory = completeKindleInventory([oldObject]);
+  const finalInventory = completeKindleInventory([newObject]);
+  const duplicateInventory = completeKindleInventory([oldObject, newObject]);
+  const order: string[] = [];
+  const convert = vi.fn<AppControllerDependencies["convert"]>(async (_file, _signal, overrides) => {
+    order.push("convert");
+    expect(overrides).toMatchObject({
+      title: editedBook.title,
+      authors: editedBook.authors,
+      cover: { blob: cover, mediaType: "image/jpeg" },
+    });
+    return {
+      filename: "edited-book.azw3",
+      blob: new Blob([new Uint8Array(700)]),
+      metadata: { title: editedBook.title, authors: [...editedBook.authors], language: "en", chapters: 2, toc_entries: 2 },
+      diagnostics: {
+        engine: "boko-wasm" as const,
+        runsLocally: true as const,
+        inputBytes: sourceBytes.byteLength,
+        outputBytes: 700,
+        kindleDocumentType: "PDOC" as const,
+        embeddedCover: true,
+      },
+    };
+  });
+  let bookReads = 0;
+  let metadataReads = 0;
+  let coverReads = 0;
+  let sourceReads = 0;
+  const app = harness(true, { convert, ...dependencyOverrides }, (api) => {
+    vi.mocked(api.listBooks).mockResolvedValue({ items: [editedBook], total: 1, limit: 24, offset: 0 });
+    vi.mocked(api.getBook).mockImplementation(async () => {
+      bookReads += 1;
+      order.push(`book-${bookReads}`);
+      return editedBook;
+    });
+    api.getBookMetadata = vi.fn(async () => {
+      metadataReads += 1;
+      order.push(`metadata-${metadataReads}`);
+      return metadataState;
+    });
+    api.getBookCover = vi.fn(async () => {
+      coverReads += 1;
+      order.push(`cover-${coverReads}`);
+      return cover;
+    });
+    vi.mocked(api.getBookSource).mockImplementation(async () => {
+      sourceReads += 1;
+      order.push(`source-${sourceReads}`);
+      return {
+        blob: new Blob([Uint8Array.from(sourceBytes)], { type: "application/epub+zip" }),
+        contentLength: sourceBytes.byteLength,
+        etag: `"sha256-${contentHash}"`,
+        presentationVersion,
+      };
+    });
+    vi.mocked(api.getMatchIndex).mockImplementation(async () => {
+      order.push("match-index");
+      return {
+        profileId: "profile-1",
+        generatedAt: "2026-09-03T00:00:00.000Z",
+        metadataClaims: claimantSummary(),
+        entries: [{
+          bookId: editedBook.id,
+          sourceFilename: editedBook.sourceFilename,
+          sourceFormat: editedBook.format,
+          sourceSize: editedBook.size,
+          contentHash,
+          presentationVersion,
+          managedToken: currentToken,
+          staleManagedTokens: [priorToken],
+          identifiers: editedBook.identifiers,
+          title: editedBook.title,
+          authors: editedBook.authors,
+          authorSort: editedBook.authorSort,
+          deliveries: [],
+        }],
+      };
+    });
+    vi.mocked(api.createDelivery).mockImplementation(async () => {
+      order.push("delivery-record");
+      return {};
+    });
+  });
+  vi.mocked(app.connection.refreshInventory).mockResolvedValueOnce(initialInventory);
+  return {
+    ...app,
+    editedBook,
+    metadataState,
+    sourceBytes,
+    contentHash,
+    presentationVersion,
+    priorToken,
+    currentToken,
+    cover,
+    oldObject,
+    newObject,
+    initialInventory,
+    finalInventory,
+    duplicateInventory,
+    convert,
+    order,
+    request: {
+      profileId: editedBook.profileId,
+      bookId: editedBook.id,
+      expectedContentHash: contentHash,
+      expectedPresentationVersion: presentationVersion,
+      expectedMetadataRevision: editedBook.metadataRevision!,
     },
   };
 }
@@ -681,6 +942,159 @@ describe("AppController local conversion flow", () => {
     finishInventory();
     await connecting;
     expect(app.controller.state.postConnectStage).toBe("idle");
+  });
+
+  it("enables the development partial-object gate only for the explicitly armed next connection", async () => {
+    const app = harness();
+    vi.mocked(app.openDevice).mockRejectedValueOnce(new Error("chooser/open failed"));
+
+    app.controller.armAdvancedPartialObjectProbeForNextConnection();
+    await app.controller.connect();
+    await app.controller.connect();
+
+    expect(app.openDevice).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(app.openDevice).mock.calls[0]?.[3]).toEqual({
+      enableDevelopmentPartialObjectProbe: true,
+    });
+    expect(vi.mocked(app.openDevice).mock.calls[1]?.[3]).toEqual({
+      enableDevelopmentPartialObjectProbe: false,
+    });
+    expect(app.controller.log.format()).toContain(
+      "Development partial-object diagnostic armed for the next clean connection",
+    );
+  });
+
+  it("requires controller confirmation and explicit repeat consent for the selected live file", async () => {
+    const app = harness();
+    const inventory = await exactPartialProbeInventory();
+    const result = {
+      verdict: "advertised-and-consistent" as const,
+      operation: "GetPartialObject (0x101b)" as const,
+      objectSize: 2_048,
+      rangeCount: 7,
+      requestedRangeBytes: 640,
+      returnedRangeBytes: 512,
+      overlapBytesVerified: 64,
+      repeatBytesVerified: 64,
+      wholeObjectComparison: "not-run-object-too-large" as const,
+      referenceBytesRead: 0,
+      eofBehavior: "zero-byte-success" as const,
+      elapsedMs: 20,
+    };
+    const runAdvancedPartialObjectProbe = vi.fn<
+      NonNullable<ConnectedKindlePort["runAdvancedPartialObjectProbe"]>
+    >(async () => result);
+    const connection: ConnectedKindlePort = {
+      ...app.connection,
+      details: {
+        ...app.connection.details,
+        operationsSupported: [...(app.connection.details.operationsSupported ?? []), 0x101b],
+      },
+      get latestInventory() { return inventory; },
+      refreshInventory: vi.fn(async () => inventory),
+      runAdvancedPartialObjectProbe,
+    };
+    vi.mocked(app.openDevice).mockResolvedValueOnce(connection);
+
+    app.controller.armAdvancedPartialObjectProbeForNextConnection();
+    await app.controller.connect();
+    await app.controller.runAdvancedPartialObjectProbe({
+      handle: 0x51,
+      confirmed: false,
+      repeatConfirmed: false,
+    });
+    expect(runAdvancedPartialObjectProbe).not.toHaveBeenCalled();
+
+    await app.controller.runAdvancedPartialObjectProbe({
+      handle: 0x51,
+      confirmed: true,
+      repeatConfirmed: false,
+    });
+    expect(runAdvancedPartialObjectProbe).toHaveBeenCalledTimes(1);
+    expect(runAdvancedPartialObjectProbe.mock.calls[0]?.[1]).toMatchObject({ allowRepeat: false });
+
+    await app.controller.runAdvancedPartialObjectProbe({
+      handle: 0x51,
+      confirmed: true,
+      repeatConfirmed: false,
+    });
+    expect(runAdvancedPartialObjectProbe).toHaveBeenCalledTimes(1);
+
+    await app.controller.runAdvancedPartialObjectProbe({
+      handle: 0x51,
+      confirmed: true,
+      repeatConfirmed: true,
+    });
+    expect(runAdvancedPartialObjectProbe).toHaveBeenCalledTimes(2);
+    expect(runAdvancedPartialObjectProbe.mock.calls[1]?.[1]).toMatchObject({ allowRepeat: true });
+    expect(app.controller.log.format()).not.toContain("Probe-book.azw3");
+  });
+
+  it("retires the live Kindle session when the development partial-object probe hits a fatal transport fault", async () => {
+    const app = harness();
+    const inventory = await exactPartialProbeInventory();
+    const connection: ConnectedKindlePort = {
+      ...app.connection,
+      get closed() { return app.connection.closed; },
+      get readyForSend() { return app.connection.readyForSend; },
+      details: {
+        ...app.connection.details,
+        operationsSupported: [...(app.connection.details.operationsSupported ?? []), 0x101b],
+      },
+      get latestInventory() { return inventory; },
+      refreshInventory: vi.fn(async () => inventory),
+      runAdvancedPartialObjectProbe: vi.fn(async () => {
+        throw Object.assign(new Error("MTP transaction stream lost synchronization"), {
+          code: "MTP_TRANSPORT_ERROR",
+          fatal: true,
+        });
+      }),
+    };
+    vi.mocked(app.openDevice).mockResolvedValueOnce(connection);
+
+    app.controller.armAdvancedPartialObjectProbeForNextConnection();
+    await app.controller.connect();
+    await app.controller.runAdvancedPartialObjectProbe({ handle: 0x51, confirmed: true, repeatConfirmed: false });
+
+    expect(app.connection.disconnect).toHaveBeenCalledOnce();
+    expect(app.controller.state).toMatchObject({
+      device: { kind: "error", error: { code: "MTP_TRANSPORT_ERROR" } },
+      // Preserve the historical fact that this connection passed the byte
+      // test; the retired/error device state still prevents reuse.
+      selfTest: { kind: "passed" },
+      catalogInventoryState: "idle",
+    });
+  });
+
+  it("keeps the live session ready after a nonfatal partial-object consistency verdict", async () => {
+    const app = harness();
+    const inventory = await exactPartialProbeInventory();
+    const connection: ConnectedKindlePort = {
+      ...app.connection,
+      get closed() { return app.connection.closed; },
+      get readyForSend() { return app.connection.readyForSend; },
+      details: {
+        ...app.connection.details,
+        operationsSupported: [...(app.connection.details.operationsSupported ?? []), 0x101b],
+      },
+      get latestInventory() { return inventory; },
+      refreshInventory: vi.fn(async () => inventory),
+      runAdvancedPartialObjectProbe: vi.fn(async () => {
+        throw Object.assign(new Error("overlapping ranges differed"), {
+          code: "KINDLE_PARTIAL_OBJECT_PROBE_MISMATCH",
+        });
+      }),
+    };
+    vi.mocked(app.openDevice).mockResolvedValueOnce(connection);
+
+    app.controller.armAdvancedPartialObjectProbeForNextConnection();
+    await app.controller.connect();
+    await app.controller.runAdvancedPartialObjectProbe({ handle: 0x51, confirmed: true, repeatConfirmed: false });
+
+    expect(app.connection.disconnect).not.toHaveBeenCalled();
+    expect(app.controller.state.device.kind).toBe("ready");
+    expect(connection.readyForSend).toBe(true);
+    expect(app.controller.log.format()).toContain("KINDLE_PARTIAL_OBJECT_PROBE_MISMATCH");
   });
 
   it("bounds USB open and Documents discovery even when an adapter ignores abort", async () => {
@@ -3103,5 +3517,290 @@ describe("AppController local conversion flow", () => {
     await expect(
       app.controller.sendCatalogBook({ profileId: "profile-1", book: app.book }),
     ).rejects.toMatchObject({ code: "MTP_SELF_TEST_REQUIRED" });
+  });
+
+  it("reopens and acknowledges replacement cleanup only after the connected runtime verifies resolution", async () => {
+    const storage = new ReplacementMemoryStorage();
+    const app = await managedUpdateHarness({ replacementCleanupStorage: storage });
+    const record: ReplacementCleanupRecord = {
+      version: 1,
+      operationId: "update-recovery-one",
+      recordedAt: 123,
+      vendorId: app.connection.device.vendorId,
+      productId: app.connection.device.productId,
+      reason: "old-copy-cleanup",
+      deviceKey: app.connection.identityKey,
+      oldCopy: {
+        handle: app.oldObject.handle,
+        storageId: app.oldObject.storageId,
+        parentHandle: app.oldObject.parentHandle,
+        filename: app.oldObject.filename,
+        byteLength: app.oldObject.size,
+        managedToken: app.priorToken,
+        exactIdentity: "exact-old",
+      },
+      newCopy: {
+        handle: app.newObject.handle,
+        storageId: app.newObject.storageId,
+        parentHandle: app.newObject.parentHandle,
+        filename: app.newObject.filename,
+        byteLength: app.newObject.size,
+        managedToken: app.currentToken,
+        exactIdentity: "exact-new",
+      },
+    };
+    expect(persistReplacementCleanupRecord(record, storage)).toBe(true);
+    const cleanup = vi.fn(async () => ({
+      status: "cleaned" as const,
+      inventory: app.finalInventory,
+    }));
+    Object.assign(app.connection, { cleanupManagedReplacement: cleanup });
+
+    await vi.waitFor(() => expect(app.root.querySelector('[data-book-id="book-1"]')).not.toBeNull());
+    await app.controller.connect();
+    expect(app.controller.state.pendingReplacementCleanups).toEqual([record]);
+    expect(app.root.textContent).toContain("Verified replacement needs exact cleanup");
+
+    await app.controller.cleanupManagedReplacement(record.operationId);
+
+    expect(cleanup).toHaveBeenCalledWith(record, expect.objectContaining({
+      operation: expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      inventory: expect.objectContaining({ deviceMetadataCache: "read-only" }),
+    }));
+    expect(readReplacementCleanupRecords(storage)).toEqual([]);
+    expect(app.controller.state.pendingReplacementCleanups).toEqual([]);
+    expect(app.controller.state.device.kind).toBe("ready");
+  });
+
+  it("orchestrates an edited EPUB update only after both catalog binding passes and records before deletion", async () => {
+    const app = await managedUpdateHarness();
+    const update = vi.mocked(app.connection.updateManagedBook!);
+    update.mockImplementation(async (prepared, oldCopy, options) => {
+      app.order.push("device-start");
+      expect(prepared).toMatchObject({
+        originalFilename: "edited-book.azw3",
+        artifactHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
+        managedToken: app.currentToken,
+        sourceFormat: "epub",
+        hasPresentationEdits: true,
+      });
+      expect(oldCopy).toEqual({
+        handle: app.oldObject.handle,
+        filename: app.oldObject.filename,
+        byteLength: app.oldObject.size,
+        managedToken: app.priorToken,
+      });
+      options.onStage?.("uploading-new-copy");
+      const transfer = {
+        handle: app.newObject.handle,
+        storageId: app.newObject.storageId,
+        parentHandle: app.newObject.parentHandle,
+        filename: app.newObject.filename,
+        size: prepared.blob.size,
+        verified: true as const,
+      };
+      options.transfer?.onProgress?.({ bytesTransferred: prepared.blob.size, totalBytes: prepared.blob.size });
+      app.order.push("record-start");
+      await options.recordVerifiedDelivery({
+        operationId: options.operationId,
+        artifactHash: prepared.artifactHash,
+        managedToken: prepared.managedToken,
+        transfer,
+        exactIdentity: "exact-new-object",
+      });
+      app.order.push("delete-old");
+      app.order.push("reconcile-final");
+      await options.reconcile(app.finalInventory);
+      return {
+        status: "updated" as const,
+        newCopy: {
+          handle: transfer.handle,
+          filename: transfer.filename,
+          byteLength: transfer.size,
+          exactIdentity: "exact-new-object",
+        },
+        oldCopy: {
+          handle: oldCopy.handle,
+          filename: oldCopy.filename,
+          byteLength: oldCopy.byteLength,
+          exactIdentity: "exact-old-object",
+        },
+        inventory: app.finalInventory,
+      };
+    });
+
+    await vi.waitFor(() => expect(app.root.querySelector('[data-book-id="book-1"]')).not.toBeNull());
+    await app.controller.connect();
+    expect(app.controller.latestCatalogInventory?.items).toEqual([
+      expect.objectContaining({ managed: true, match: "possible", stalePresentation: true }),
+    ]);
+    app.order.length = 0;
+
+    const result = await app.controller.updateCatalogBook(app.request);
+
+    expect(result).toMatchObject({
+      status: "updated",
+      queueDisposition: "remove",
+      priorFilename: app.oldObject.filename,
+      replacementFilename: app.newObject.filename,
+      reconciliationRequired: false,
+    });
+    expect(app.catalogApi.getBook).toHaveBeenCalledTimes(2);
+    expect(app.catalogApi.getBookMetadata).toHaveBeenCalledTimes(2);
+    expect(app.catalogApi.getBookCover).toHaveBeenCalledTimes(2);
+    expect(app.catalogApi.getBookSource).toHaveBeenCalledTimes(2);
+    expect(app.order.indexOf("source-2")).toBeLessThan(app.order.indexOf("device-start"));
+    expect(app.order.indexOf("delivery-record")).toBeLessThan(app.order.indexOf("delete-old"));
+    expect(app.order.indexOf("delete-old")).toBeLessThan(app.order.indexOf("reconcile-final"));
+    expect(app.catalogApi.createDelivery).toHaveBeenCalledWith(
+      expect.objectContaining({
+        profileId: app.request.profileId,
+        bookId: app.request.bookId,
+        status: "delivered",
+        managedToken: app.currentToken,
+        objectIdentity: "exact-new-object",
+      }),
+      result.operationId,
+      expect.any(AbortSignal),
+    );
+    expect(readPendingDeliveries()).toHaveLength(0);
+    expect(app.controller.latestCatalogInventory).toMatchObject({
+      completeness: "complete",
+      matching: { status: "complete" },
+      items: [expect.objectContaining({ bookId: app.editedBook.id, match: "confirmed" })],
+    });
+    expect(app.controller.state.catalogInventoryState).toBe("ready");
+    expect(app.sourceBytes).toEqual(Uint8Array.from([0x50, 0x4b, 0x03, 0x04, 1, 2, 3, 4]));
+  });
+
+  it("rejects a non-managed or ambiguous match before fetching or preparing a replacement", async () => {
+    const app = await managedUpdateHarness();
+    const nonManagedObject = {
+      ...app.oldObject,
+      filename: "Edited Book.azw3",
+      relativePath: "Edited Book.azw3",
+      managedToken: undefined,
+      title: app.editedBook.title,
+      authors: app.editedBook.authors,
+      bookMetadataState: "enriched" as const,
+    };
+    vi.mocked(app.connection.refreshInventory).mockReset();
+    vi.mocked(app.connection.refreshInventory).mockResolvedValueOnce(completeKindleInventory([nonManagedObject]));
+    await vi.waitFor(() => expect(app.root.querySelector('[data-book-id="book-1"]')).not.toBeNull());
+    await app.controller.connect();
+    app.order.length = 0;
+
+    await expect(app.controller.updateCatalogBook(app.request)).rejects.toMatchObject({
+      code: "OLD_COPY_NOT_MANAGED",
+    });
+    expect(app.catalogApi.getBook).not.toHaveBeenCalled();
+    expect(app.convert).not.toHaveBeenCalled();
+    expect(app.connection.updateManagedBook).not.toHaveBeenCalled();
+  });
+
+  it("rechecks source ETag after conversion and stops before the device when it changes", async () => {
+    const app = await managedUpdateHarness();
+    await vi.waitFor(() => expect(app.root.querySelector('[data-book-id="book-1"]')).not.toBeNull());
+    await app.controller.connect();
+    app.order.length = 0;
+    vi.mocked(app.catalogApi.getBookSource)
+      .mockResolvedValueOnce({
+        blob: new Blob([Uint8Array.from(app.sourceBytes)], { type: "application/epub+zip" }),
+        contentLength: app.sourceBytes.byteLength,
+        etag: `"sha256-${app.contentHash}"`,
+        presentationVersion: app.presentationVersion,
+      })
+      .mockResolvedValueOnce({
+        blob: new Blob([Uint8Array.from(app.sourceBytes)], { type: "application/epub+zip" }),
+        contentLength: app.sourceBytes.byteLength,
+        etag: `"sha256-${"f".repeat(64)}"`,
+        presentationVersion: app.presentationVersion,
+      });
+
+    await expect(app.controller.updateCatalogBook(app.request)).rejects.toMatchObject({
+      code: "CATALOG_SOURCE_CHANGED",
+      message: expect.stringContaining("ETag"),
+    });
+    expect(app.convert).toHaveBeenCalledOnce();
+    expect(app.connection.updateManagedBook).not.toHaveBeenCalled();
+    expect(app.catalogApi.createDelivery).not.toHaveBeenCalled();
+  });
+
+  it("keeps both copies and queued intent when neither journal nor server can secure the delivery record", async () => {
+    const app = await managedUpdateHarness();
+    await vi.waitFor(() => expect(app.root.querySelector('[data-book-id="book-1"]')).not.toBeNull());
+    await app.controller.connect();
+    app.order.length = 0;
+    vi.mocked(app.catalogApi.createDelivery).mockRejectedValue(new Error("catalog offline"));
+    const update = vi.mocked(app.connection.updateManagedBook!);
+    update.mockImplementation(async (prepared, oldCopy, options) => {
+      const transfer = {
+        handle: app.newObject.handle,
+        storageId: app.newObject.storageId,
+        parentHandle: app.newObject.parentHandle,
+        filename: app.newObject.filename,
+        size: prepared.blob.size,
+        verified: true as const,
+      };
+      let deliveryRecordError: unknown;
+      try {
+        await options.recordVerifiedDelivery({
+          operationId: options.operationId,
+          artifactHash: prepared.artifactHash,
+          managedToken: prepared.managedToken,
+          transfer,
+          exactIdentity: "exact-new-object",
+        });
+      } catch (error) {
+        deliveryRecordError = error;
+      }
+      if (deliveryRecordError === undefined) throw new Error("The delivery record unexpectedly succeeded");
+      app.order.push("record-failed-old-retained");
+      await options.reconcile(app.duplicateInventory);
+      return {
+        status: "new-copy-kept-old-recording-required" as const,
+        newCopy: {
+          handle: transfer.handle,
+          filename: transfer.filename,
+          byteLength: transfer.size,
+          exactIdentity: "exact-new-object",
+        },
+        oldCopy: {
+          handle: oldCopy.handle,
+          filename: oldCopy.filename,
+          byteLength: oldCopy.byteLength,
+          exactIdentity: "exact-old-object",
+        },
+        deliveryRecordError,
+        inventory: app.duplicateInventory,
+      };
+    });
+    const originalLocks = Object.getOwnPropertyDescriptor(navigator, "locks");
+    Object.defineProperty(navigator, "locks", {
+      configurable: true,
+      value: { request: vi.fn(async () => { throw new Error("journal lock unavailable"); }) },
+    });
+    try {
+      const result = await app.controller.updateCatalogBook(app.request);
+      expect(result).toMatchObject({
+        status: "new-copy-kept-old-recording-required",
+        queueDisposition: "preserve",
+        deliveryRecordingRequired: true,
+        duplicateCleanupRequired: true,
+        reconciliationRequired: false,
+        replacementCleanupReminder: "not-stored",
+      });
+      expect(app.order).toContain("record-failed-old-retained");
+      expect(app.order).not.toContain("delete-old");
+      expect(app.controller.latestCatalogInventory?.items).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: "mtp-00000029", stalePresentation: true }),
+        expect.objectContaining({ id: "mtp-0000002a", match: "confirmed" }),
+      ]));
+      expect(app.controller.state.catalogInventoryState).toBe("failed");
+      expect(readPendingDeliveries()).toHaveLength(0);
+    } finally {
+      if (originalLocks) Object.defineProperty(navigator, "locks", originalLocks);
+      else Reflect.deleteProperty(navigator, "locks");
+    }
   });
 });

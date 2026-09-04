@@ -181,6 +181,90 @@ describe("MtpObjectStore read operations", () => {
       .rejects.toMatchObject({ code: "MTP_READ_LIMIT_EXCEEDED", fatal: true });
   });
 
+  it("issues one bounded GetPartialObject range and validates its reported byte count", async () => {
+    const payload = Uint8Array.of(0, 0xff, 1, 2, 0, 3);
+    const { store, transport } = await openStore([
+      data(MtpOperationCode.GetPartialObject, 1, payload),
+      ok(1, [payload.byteLength]),
+    ]);
+
+    await expect(store.readObjectRange({
+      handle: EXISTING_BOOK_HANDLE,
+      offset: 123,
+      length: payload.byteLength,
+    })).resolves.toEqual(payload);
+
+    const commands = writtenContainers(transport)
+      .filter(({ type }) => type === MtpContainerType.Command);
+    expect(commands.map(({ code }) => code)).toEqual([
+      MtpOperationCode.OpenSession,
+      MtpOperationCode.GetPartialObject,
+    ]);
+    expect(decodeContainerParameters(commands[1]!.payload)).toEqual([
+      EXISTING_BOOK_HANDLE,
+      123,
+      payload.byteLength,
+    ]);
+    expect(commands.some(({ code }) => code === 0x9805)).toBe(false);
+  });
+
+  it("rejects malformed partial-read byte counts and responses beyond the requested range", async () => {
+    const payload = Uint8Array.of(1, 2, 3);
+    const mismatched = await openStore([
+      data(MtpOperationCode.GetPartialObject, 1, payload),
+      ok(1, [payload.byteLength - 1]),
+    ]);
+    await expect(mismatched.store.readObjectRange({
+      handle: EXISTING_BOOK_HANDLE,
+      offset: 0,
+      length: payload.byteLength,
+    })).rejects.toMatchObject({ code: "MTP_PARTIAL_READ_LENGTH_MISMATCH" });
+
+    const missingCount = await openStore([
+      data(MtpOperationCode.GetPartialObject, 1, payload),
+      ok(1),
+    ]);
+    await expect(missingCount.store.readObjectRange({
+      handle: EXISTING_BOOK_HANDLE,
+      offset: 0,
+      length: payload.byteLength,
+    })).rejects.toMatchObject({ code: "MTP_INVALID_CONTAINER", fatal: true });
+
+    const excessive = await openStore([
+      data(MtpOperationCode.GetPartialObject, 1, payload),
+      ok(1, [payload.byteLength]),
+    ]);
+    await expect(excessive.store.readObjectRange({
+      handle: EXISTING_BOOK_HANDLE,
+      offset: 0,
+      length: payload.byteLength - 1,
+    })).rejects.toMatchObject({ code: "MTP_READ_LIMIT_EXCEEDED", fatal: true });
+  });
+
+  it("rejects invalid partial-object ranges before issuing a device command", async () => {
+    const { store, transport } = await openStore([]);
+
+    await expect(store.readObjectRange({
+      handle: EXISTING_BOOK_HANDLE,
+      offset: 0,
+      length: 0,
+    })).rejects.toBeInstanceOf(RangeError);
+    await expect(store.readObjectRange({
+      handle: EXISTING_BOOK_HANDLE,
+      offset: 0xffff_fffe,
+      length: 2,
+    })).rejects.toBeInstanceOf(RangeError);
+    await expect(store.readObjectRange({
+      handle: EXISTING_BOOK_HANDLE,
+      offset: 0,
+      length: 4 * 1024 * 1024 + 1,
+    })).rejects.toBeInstanceOf(RangeError);
+
+    expect(writtenContainers(transport)
+      .filter(({ type }) => type === MtpContainerType.Command)
+      .map(({ code }) => code)).toEqual([MtpOperationCode.OpenSession]);
+  });
+
   it("rejects an oversized object-handle dataset from its header before inventory allocation", async () => {
     const { store } = await openStore([
       data(

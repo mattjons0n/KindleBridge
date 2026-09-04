@@ -10,10 +10,10 @@ import type {
 } from "./catalog-client";
 
 export type LibraryProfileId = string;
-export type LibraryView = "all" | "on-kindle" | "recent" | "settings";
+export type LibraryView = "all" | "on-kindle" | "recent" | "series" | "attention" | "settings";
 export type LibraryLayout = "grid" | "list";
 export type LibrarySort = CatalogBookSort;
-export type KindleFilter = "all" | "on-kindle" | "not-on-kindle" | "possible";
+export type KindleFilter = "all" | "on-kindle" | "not-on-kindle" | "possible" | "unknown";
 export type MetadataFilter = "all" | "complete" | "partial";
 export type PrototypeBook = CatalogBook;
 export type LibraryProfile = CatalogProfile;
@@ -120,6 +120,7 @@ export function booksForKindleView(
     if (filters.kindle === "on-kindle" && status !== "confirmed") return false;
     if (filters.kindle === "not-on-kindle" && status !== "not-on-kindle") return false;
     if (filters.kindle === "possible" && status !== "possible") return false;
+    if (filters.kindle === "unknown" && status !== "unknown") return false;
     return true;
   });
 }
@@ -138,7 +139,7 @@ export function catalogQuery(filters: LibraryFilters): CatalogBookQuery {
     year: filters.year === "all" ? undefined : filters.year,
     metadata: filters.metadata === "all" ? undefined : filters.metadata,
     sort,
-    order: sort === "title" || sort === "author" ? "asc" : "desc",
+    order: sort === "title" || sort === "author" || sort === "series" || sort === "series-index" ? "asc" : "desc",
     limit: filters.limit,
     offset: filters.offset,
   };

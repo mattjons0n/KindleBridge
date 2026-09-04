@@ -6,27 +6,92 @@ import {
   METADATA_CLAIM_BITMAP_BASE64_LENGTH,
   METADATA_CLAIM_BITMAP_BYTES,
 } from "../../shared/catalog-contracts.js";
+import { normalizeSmartShelfQuery, SmartShelfQueryError } from "../../shared/shelf-query.js";
 import type {
   BookCoverOverride,
   BookMetadataPatchInput,
   BookMetadataResetInput,
   BookMetadataOverrides,
+  CatalogMetadataCandidate,
+  ConfigurableCoverProvider,
   CoverImportInput,
   CoverProvider,
+  CoverProviderCredentialInput,
+  CoverProviderCredentialState,
+  CoverProviderCredentialTestInput,
   CoverSearchCandidate,
   EditableBookMetadata,
+  MetadataCandidateImportInput,
+  MetadataCandidateSearchResult,
+  MetadataCandidateSearchTerms,
+  MetadataLookupJob,
+  MetadataLookupJobControlInput,
+  MetadataLookupJobInput,
+  MetadataLookupJobPage,
+  BookSelectionResult,
+  ProfileBookAnnotation,
+  ProfileBookAnnotationPatchInput,
+  SendQueueAddInput,
+  SmartShelf,
+  SmartShelfCreateInput,
+  SmartShelfPatchInput,
+  SmartShelfPinnedOrderInput,
+  SmartShelfQuery,
 } from "../../shared/catalog-contracts.js";
+import type {
+  CatalogHealthIssue,
+  CatalogHealthPage,
+  CatalogHealthQuery,
+  CatalogIssueSeverity,
+  CatalogIssueType,
+  CatalogIssueDispositionInput,
+  CatalogDuplicatePreferenceInput,
+  CatalogIssueRetryInput,
+  CatalogIssueRetryResult,
+} from "../../shared/catalog-issues.js";
 
 export type {
   BookCoverOverride,
   BookMetadataPatchInput,
   BookMetadataResetInput,
   BookMetadataOverrides,
+  CatalogMetadataCandidate,
+  ConfigurableCoverProvider,
   CoverImportInput,
   CoverProvider,
+  CoverProviderCredentialInput,
+  CoverProviderCredentialState,
+  CoverProviderCredentialTestInput,
   CoverSearchCandidate,
   EditableBookMetadata,
+  MetadataCandidateImportInput,
+  MetadataCandidateSearchResult,
+  MetadataCandidateSearchTerms,
+  MetadataLookupJob,
+  MetadataLookupJobControlInput,
+  MetadataLookupJobInput,
+  MetadataLookupJobPage,
+  BookSelectionResult,
+  ProfileBookAnnotation,
+  ProfileBookAnnotationPatchInput,
+  SendQueueAddInput,
+  SmartShelf,
+  SmartShelfCreateInput,
+  SmartShelfPatchInput,
+  SmartShelfPinnedOrderInput,
+  SmartShelfQuery,
 } from "../../shared/catalog-contracts.js";
+export type {
+  CatalogHealthIssue,
+  CatalogHealthPage,
+  CatalogHealthQuery,
+  CatalogIssueSeverity,
+  CatalogIssueType,
+  CatalogIssueDispositionInput,
+  CatalogDuplicatePreferenceInput,
+  CatalogIssueRetryInput,
+  CatalogIssueRetryResult,
+} from "../../shared/catalog-issues.js";
 
 export type CatalogRootStatus =
   | "pending"
@@ -133,6 +198,26 @@ export interface CatalogBookMetadataState {
   readonly coverOverride: BookCoverOverride | null;
 }
 
+export interface CatalogBookDetailsData extends CatalogBookMetadataState {
+  readonly source: {
+    readonly rootId: string;
+    readonly rootLabel: string;
+    readonly rootPath: string;
+    readonly rootStatus: CatalogRootStatus;
+    readonly rootLastScanAt?: string;
+    readonly rootLastErrorCode?: string;
+    readonly relativePath: string;
+    readonly available: boolean;
+  };
+  /** Latest verified transfer only; intentionally contains no device identity. */
+  readonly latestVerifiedDelivery?: {
+    readonly filename?: string;
+    readonly size?: number;
+    readonly deliveredAt: string;
+    readonly currentPresentation: boolean;
+  };
+}
+
 export interface CatalogCoverSearchResult {
   readonly provider: CoverProvider;
   readonly items: readonly CoverSearchCandidate[];
@@ -163,7 +248,16 @@ export interface CatalogFilters {
   readonly metadata: readonly CatalogFilterOption[];
 }
 
-export type CatalogBookSort = "recent" | "title" | "author" | "published" | "size";
+export type CatalogBookSort =
+  | "recent"
+  | "title"
+  | "author"
+  | "published"
+  | "size"
+  | "added"
+  | "updated"
+  | "series"
+  | "series-index";
 
 export interface CatalogBookQuery {
   readonly q?: string;
@@ -172,10 +266,15 @@ export interface CatalogBookQuery {
   readonly subject?: string;
   readonly publisher?: string;
   readonly series?: string;
+  readonly seriesKey?: string;
   readonly format?: string;
   readonly rootId?: string;
   readonly year?: string;
   readonly metadata?: string;
+  readonly available?: boolean;
+  readonly coverAvailable?: boolean;
+  readonly favorite?: boolean;
+  readonly wantToRead?: boolean;
   readonly sort?: CatalogBookSort;
   readonly order?: "asc" | "desc";
   readonly limit?: number;
@@ -229,7 +328,59 @@ export interface CatalogEvent {
   readonly profileId?: string;
   readonly rootId?: string;
   readonly bookId?: string;
+  readonly shelfId?: string;
+  readonly jobId?: string;
   readonly data?: Readonly<Record<string, unknown>>;
+}
+
+export interface CatalogSendQueueEntry {
+  readonly profileId: string;
+  readonly bookId: string;
+  readonly rank: number;
+  readonly queuedContentHash: string;
+  readonly queuedPresentationVersion: string;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly book: CatalogBook | null;
+  readonly sourceState:
+    | "ready"
+    | "source-unavailable"
+    | "source-changed"
+    | "presentation-changed"
+    | "unsupported"
+    | "missing-or-retired";
+}
+
+export interface CatalogSendQueue {
+  readonly profileId: string;
+  readonly revision: number;
+  readonly entries: readonly CatalogSendQueueEntry[];
+  readonly total: number;
+  readonly totalSourceBytes: number;
+}
+
+export interface CatalogSeriesSummary {
+  readonly key: string;
+  readonly name: string;
+  readonly bookCount: number;
+  readonly numberedCount: number;
+  readonly unnumberedCount: number;
+}
+
+export interface CatalogSeriesSummaryPage {
+  readonly items: readonly CatalogSeriesSummary[];
+  readonly total: number;
+  readonly limit: number;
+  readonly offset: number;
+}
+
+export interface CatalogSeriesDetail {
+  readonly key: string;
+  readonly name: string;
+  readonly books: CatalogBookPage;
+  readonly duplicateIndices: readonly number[];
+  readonly missingIntegerIndices: readonly number[];
+  readonly unnumberedCount: number;
 }
 
 export interface CreateDeliveryInput {
@@ -257,6 +408,8 @@ export interface CatalogMatchDelivery {
 
 export interface CatalogMatchIndexEntry {
   readonly bookId: string;
+  /** Optional catalog-presentation preference; never Kindle deletion authority. */
+  readonly preferredPresentation?: true;
   readonly sourceFilename: string;
   readonly sourceFormat: CatalogBookFormat;
   readonly sourceSize: number;
@@ -293,6 +446,22 @@ export interface CatalogBookSource {
 
 export interface CatalogApi {
   getStatus(signal?: AbortSignal): Promise<CatalogServiceStatus>;
+  listCoverProviderCredentials?(signal?: AbortSignal): Promise<readonly CoverProviderCredentialState[]>;
+  saveCoverProviderCredential?(
+    provider: ConfigurableCoverProvider,
+    input: CoverProviderCredentialInput,
+    signal?: AbortSignal,
+  ): Promise<CoverProviderCredentialState>;
+  removeCoverProviderCredential?(
+    provider: ConfigurableCoverProvider,
+    expectedRevision: number,
+    signal?: AbortSignal,
+  ): Promise<CoverProviderCredentialState>;
+  testCoverProviderCredential?(
+    provider: ConfigurableCoverProvider,
+    input: CoverProviderCredentialTestInput,
+    signal?: AbortSignal,
+  ): Promise<CoverProviderCredentialState>;
   listProfiles(signal?: AbortSignal): Promise<readonly CatalogProfile[]>;
   createProfile(
     input: CreateCatalogProfileInput,
@@ -308,8 +477,102 @@ export interface CatalogApi {
   rescanRoot(profileId: string, rootId: string, signal?: AbortSignal): Promise<void>;
   listBooks(profileId: string, query?: CatalogBookQuery, signal?: AbortSignal): Promise<CatalogBookPage>;
   queryBooks(profileId: string, query?: CatalogBookMatchQuery, signal?: AbortSignal): Promise<CatalogBookPage>;
+  resolveBookSelection?(profileId: string, query?: CatalogBookQuery, signal?: AbortSignal): Promise<BookSelectionResult>;
+  listSeries?(
+    profileId: string,
+    query?: { readonly q?: string; readonly limit?: number; readonly offset?: number },
+    signal?: AbortSignal,
+  ): Promise<CatalogSeriesSummaryPage>;
+  getSeries?(
+    profileId: string,
+    seriesKey: string,
+    query?: { readonly limit?: number; readonly offset?: number },
+    signal?: AbortSignal,
+  ): Promise<CatalogSeriesDetail>;
+  getSendQueue?(profileId: string, signal?: AbortSignal): Promise<CatalogSendQueue>;
+  addSendQueueEntries?(
+    profileId: string,
+    input: SendQueueAddInput,
+    idempotencyKey: string,
+    signal?: AbortSignal,
+  ): Promise<CatalogSendQueue>;
+  replaceSendQueue?(profileId: string, input: SendQueueAddInput, signal?: AbortSignal): Promise<CatalogSendQueue>;
+  removeSendQueueEntry?(
+    profileId: string,
+    bookId: string,
+    expectedRevision: number,
+    signal?: AbortSignal,
+  ): Promise<CatalogSendQueue>;
+  clearSendQueue?(profileId: string, expectedRevision: number, signal?: AbortSignal): Promise<CatalogSendQueue>;
+  listSmartShelves?(profileId: string, signal?: AbortSignal): Promise<readonly SmartShelf[]>;
+  getSmartShelf?(profileId: string, shelfId: string, signal?: AbortSignal): Promise<SmartShelf>;
+  createSmartShelf?(
+    profileId: string,
+    input: SmartShelfCreateInput,
+    idempotencyKey: string,
+    signal?: AbortSignal,
+  ): Promise<SmartShelf>;
+  updateSmartShelf?(
+    profileId: string,
+    shelfId: string,
+    input: SmartShelfPatchInput,
+    signal?: AbortSignal,
+  ): Promise<SmartShelf>;
+  reorderPinnedSmartShelves?(
+    profileId: string,
+    input: SmartShelfPinnedOrderInput,
+    signal?: AbortSignal,
+  ): Promise<readonly SmartShelf[]>;
+  deleteSmartShelf?(profileId: string, shelfId: string, expectedRevision: number, signal?: AbortSignal): Promise<void>;
+  getBookAnnotation?(profileId: string, bookId: string, signal?: AbortSignal): Promise<ProfileBookAnnotation>;
+  updateBookAnnotation?(
+    profileId: string,
+    bookId: string,
+    input: ProfileBookAnnotationPatchInput,
+    signal?: AbortSignal,
+  ): Promise<ProfileBookAnnotation>;
   getFilters(profileId: string, signal?: AbortSignal): Promise<CatalogFilters>;
+  listCatalogIssues?(profileId: string, query?: CatalogHealthQuery, signal?: AbortSignal): Promise<CatalogHealthPage>;
+  updateCatalogIssueDisposition?(
+    profileId: string,
+    signature: string,
+    input: CatalogIssueDispositionInput,
+    signal?: AbortSignal,
+  ): Promise<CatalogHealthIssue>;
+  updateCatalogDuplicatePreference?(
+    profileId: string,
+    signature: string,
+    input: CatalogDuplicatePreferenceInput,
+    signal?: AbortSignal,
+  ): Promise<CatalogHealthIssue>;
+  retryCatalogIssue?(
+    profileId: string,
+    signature: string,
+    input: CatalogIssueRetryInput,
+    signal?: AbortSignal,
+  ): Promise<CatalogIssueRetryResult>;
+  listMetadataLookupJobs?(
+    profileId: string,
+    query?: { readonly limit?: number; readonly offset?: number },
+    signal?: AbortSignal,
+  ): Promise<MetadataLookupJobPage>;
+  getMetadataLookupJob?(profileId: string, jobId: string, signal?: AbortSignal): Promise<MetadataLookupJob>;
+  createMetadataLookupJob?(
+    profileId: string,
+    input: MetadataLookupJobInput,
+    idempotencyKey: string,
+    signal?: AbortSignal,
+  ): Promise<MetadataLookupJob>;
+  controlMetadataLookupJob?(
+    profileId: string,
+    jobId: string,
+    action: "resume" | "pause" | "cancel" | "retry",
+    input: MetadataLookupJobControlInput,
+    signal?: AbortSignal,
+  ): Promise<MetadataLookupJob>;
+  runMetadataLookupJobStep?(profileId: string, jobId: string, signal?: AbortSignal): Promise<MetadataLookupJob>;
   getBook(profileId: string, bookId: string, signal?: AbortSignal): Promise<CatalogBook>;
+  getBookDetails?(profileId: string, bookId: string, signal?: AbortSignal): Promise<CatalogBookDetailsData>;
   getBookMetadata?(profileId: string, bookId: string, signal?: AbortSignal): Promise<CatalogBookMetadataState>;
   updateBookMetadata?(
     profileId: string,
@@ -321,6 +584,19 @@ export interface CatalogApi {
     profileId: string,
     bookId: string,
     input: BookMetadataResetInput,
+    signal?: AbortSignal,
+  ): Promise<CatalogBookMetadataState>;
+  searchBookMetadata?(
+    profileId: string,
+    bookId: string,
+    provider: CoverProvider,
+    terms: MetadataCandidateSearchTerms,
+    signal?: AbortSignal,
+  ): Promise<MetadataCandidateSearchResult>;
+  importBookMetadata?(
+    profileId: string,
+    bookId: string,
+    input: MetadataCandidateImportInput,
     signal?: AbortSignal,
   ): Promise<CatalogBookMetadataState>;
   uploadBookCover?(
@@ -773,6 +1049,38 @@ function parseBookMetadataState(value: unknown): CatalogBookMetadataState {
   };
 }
 
+function parseBookDetailsData(value: unknown): CatalogBookDetailsData {
+  const item = record(value);
+  const metadata = parseBookMetadataState(item);
+  const source = record(item.source);
+  const delivery = item.latestVerifiedDelivery === null || item.latestVerifiedDelivery === undefined
+    ? undefined
+    : record(item.latestVerifiedDelivery);
+  return {
+    ...metadata,
+    source: {
+      rootId: textValue(source.rootId),
+      rootLabel: textValue(source.rootLabel, "Library folder"),
+      rootPath: textValue(source.rootPath),
+      rootStatus: rootStatus(source.rootStatus),
+      rootLastScanAt: optionalText(source.rootLastScanAt),
+      rootLastErrorCode: optionalText(source.rootLastErrorCode),
+      relativePath: textValue(source.relativePath),
+      available: booleanValue(source.available),
+    },
+    ...(delivery ? {
+      latestVerifiedDelivery: {
+        filename: optionalText(delivery.filename),
+        size: typeof delivery.size === "number" && Number.isSafeInteger(delivery.size) && delivery.size >= 0
+          ? delivery.size
+          : undefined,
+        deliveredAt: textValue(delivery.deliveredAt),
+        currentPresentation: booleanValue(delivery.currentPresentation),
+      },
+    } : {}),
+  };
+}
+
 function parseCoverSearchResult(value: unknown): CatalogCoverSearchResult {
   const item = record(value);
   const provider = item.provider === "open-library" ? "open-library" as const : "google-books" as const;
@@ -791,6 +1099,226 @@ function parseCoverSearchResult(value: unknown): CatalogCoverSearchResult {
     }];
   }) : [];
   return { provider, items };
+}
+
+function parseMetadataCandidate(value: unknown): CatalogMetadataCandidate | null {
+  const item = record(value);
+  const provider = item.provider === "google-books" || item.provider === "open-library" ? item.provider : null;
+  const candidateId = textValue(item.candidateId);
+  const confidence = item.confidence === "high" || item.confidence === "medium" || item.confidence === "low"
+    ? item.confidence
+    : null;
+  if (!provider || !candidateId || !confidence) return null;
+  const metadata = parseMetadataOverrides(item.metadata);
+  if (Object.keys(metadata).length === 0) return null;
+  return {
+    provider,
+    candidateId,
+    confidence,
+    metadata,
+    ...(optionalText(item.coverCandidateId) ? { coverCandidateId: optionalText(item.coverCandidateId)! } : {}),
+  };
+}
+
+function parseMetadataCandidateSearchResult(value: unknown): MetadataCandidateSearchResult {
+  const item = record(value);
+  const provider = item.provider === "open-library" ? "open-library" as const : "google-books" as const;
+  const items = Array.isArray(item.items)
+    ? item.items.flatMap((entry) => {
+        const candidate = parseMetadataCandidate(entry);
+        return candidate ? [candidate] : [];
+      })
+    : [];
+  return { provider, items };
+}
+
+function parseMetadataLookupJob(value: unknown): MetadataLookupJob {
+  const item = record(value);
+  const provider = item.provider === "open-library" ? "open-library" as const : "google-books" as const;
+  const statuses = new Set(["queued", "running", "paused", "completed", "cancelled"]);
+  const entryStatuses = new Set(["pending", "searching", "ready", "no-results", "failed", "cancelled"]);
+  const errorCodes = new Set([
+    "book-unavailable",
+    "provider-unavailable",
+    "provider-not-configured",
+    "provider-response-too-large",
+    "invalid-provider-response",
+  ]);
+  const entries = Array.isArray(item.entries) ? item.entries.flatMap((value) => {
+    const entry = record(value);
+    const status = textValue(entry.status);
+    if (!entryStatuses.has(status)) return [];
+    const candidates = Array.isArray(entry.candidates)
+      ? entry.candidates.flatMap((candidate) => {
+          const parsed = parseMetadataCandidate(candidate);
+          return parsed ? [parsed] : [];
+        })
+      : [];
+    const rawErrorCode = nullableText(entry.errorCode);
+    return [{
+      jobId: textValue(entry.jobId),
+      bookId: textValue(entry.bookId),
+      rank: numberValue(entry.rank),
+      status: status as MetadataLookupJob["entries"][number]["status"],
+      attempts: numberValue(entry.attempts),
+      candidates,
+      errorCode: rawErrorCode !== null && errorCodes.has(rawErrorCode)
+        ? rawErrorCode as MetadataLookupJob["entries"][number]["errorCode"]
+        : null,
+      acceptedAt: nullableText(entry.acceptedAt),
+      updatedAt: textValue(entry.updatedAt),
+    }];
+  }) : [];
+  const rawStatus = textValue(item.status);
+  return {
+    id: textValue(item.id),
+    profileId: textValue(item.profileId),
+    provider,
+    status: statuses.has(rawStatus) ? rawStatus as MetadataLookupJob["status"] : "paused",
+    revision: numberValue(item.revision),
+    entriesIncluded: item.entriesIncluded !== false,
+    entries,
+    total: numberValue(item.total, entries.length),
+    pending: numberValue(item.pending),
+    ready: numberValue(item.ready),
+    noResults: numberValue(item.noResults),
+    failed: numberValue(item.failed),
+    cancelled: numberValue(item.cancelled),
+    createdAt: textValue(item.createdAt),
+    updatedAt: textValue(item.updatedAt),
+  };
+}
+
+function parseMetadataLookupJobPage(value: unknown): MetadataLookupJobPage {
+  const item = record(value);
+  const items = Array.isArray(item.items) ? item.items.map(parseMetadataLookupJob) : [];
+  return {
+    items,
+    total: numberValue(item.total, items.length),
+    limit: numberValue(item.limit, items.length || 20),
+    offset: numberValue(item.offset),
+  };
+}
+
+function parseCatalogHealthIssue(value: unknown): CatalogHealthIssue | null {
+  const item = record(value);
+  const type = textValue(item.type) as CatalogHealthIssue["type"];
+  const severity = textValue(item.severity) as CatalogHealthIssue["severity"];
+  const signature = textValue(item.signature);
+  if (
+    numberValue(item.version) !== 1
+    || !/^issue-[a-f0-9]{16}$/u.test(signature)
+    || ![
+      "missing-cover",
+      "incomplete-metadata",
+      "metadata-parser-failure",
+      "low-confidence-provider-data",
+      "unavailable-source",
+      "suspected-duplicate",
+    ].includes(type)
+    || !["info", "warning", "error"].includes(severity)
+  ) return null;
+  const disposition = record(item.disposition);
+  return {
+    version: 1,
+    signature,
+    profileId: textValue(item.profileId),
+    type,
+    severity,
+    reasonCode: textValue(item.reasonCode),
+    bookIds: [...stringArray(item.bookIds)],
+    sourceIds: [...stringArray(item.sourceIds)],
+    rootIds: [...stringArray(item.rootIds)],
+    displayLabels: [...stringArray(item.displayLabels)],
+    currentAvailable: booleanValue(item.currentAvailable),
+    ...(optionalText(item.firstObservedAt) ? { firstObservedAt: optionalText(item.firstObservedAt)! } : {}),
+    lastObservedAt: textValue(item.lastObservedAt),
+    disposition: {
+      ignored: booleanValue(disposition.ignored),
+      preferredBookId: nullableText(disposition.preferredBookId),
+      revision: numberValue(disposition.revision),
+      retryCount: numberValue(disposition.retryCount),
+      lastRetryAt: nullableText(disposition.lastRetryAt),
+    },
+  };
+}
+
+function emptyCatalogIssueCounts(): CatalogHealthPage["counts"] {
+  return {
+    total: 0,
+    active: 0,
+    ignored: 0,
+    byType: {
+      "missing-cover": 0,
+      "incomplete-metadata": 0,
+      "metadata-parser-failure": 0,
+      "low-confidence-provider-data": 0,
+      "unavailable-source": 0,
+      "suspected-duplicate": 0,
+    },
+    bySeverity: { info: 0, warning: 0, error: 0 },
+  };
+}
+
+function parseCatalogHealthPage(value: unknown): CatalogHealthPage {
+  const item = record(value);
+  const items = Array.isArray(item.items)
+    ? item.items.flatMap((entry) => {
+        const issue = parseCatalogHealthIssue(entry);
+        return issue ? [issue] : [];
+      })
+    : [];
+  const rawCounts = record(item.counts);
+  const rawTypes = record(rawCounts.byType);
+  const rawSeverities = record(rawCounts.bySeverity);
+  const fallback = emptyCatalogIssueCounts();
+  return {
+    items,
+    total: numberValue(item.total, items.length),
+    limit: numberValue(item.limit, items.length || 100),
+    offset: numberValue(item.offset),
+    counts: {
+      total: numberValue(rawCounts.total, fallback.total),
+      active: numberValue(rawCounts.active, fallback.active),
+      ignored: numberValue(rawCounts.ignored, fallback.ignored),
+      byType: {
+        "missing-cover": numberValue(rawTypes["missing-cover"]),
+        "incomplete-metadata": numberValue(rawTypes["incomplete-metadata"]),
+        "metadata-parser-failure": numberValue(rawTypes["metadata-parser-failure"]),
+        "low-confidence-provider-data": numberValue(rawTypes["low-confidence-provider-data"]),
+        "unavailable-source": numberValue(rawTypes["unavailable-source"]),
+        "suspected-duplicate": numberValue(rawTypes["suspected-duplicate"]),
+      },
+      bySeverity: {
+        info: numberValue(rawSeverities.info),
+        warning: numberValue(rawSeverities.warning),
+        error: numberValue(rawSeverities.error),
+      },
+    },
+  };
+}
+
+function parseCoverProviderCredentialState(value: unknown): CoverProviderCredentialState {
+  const item = record(value);
+  const configured = booleanValue(item.configured);
+  const status = item.status === "working" || item.status === "error" || item.status === "untested"
+    ? item.status
+    : configured ? "untested" : "not-configured";
+  const errorCode = item.errorCode === "invalid-or-restricted-key"
+    || item.errorCode === "quota-exhausted"
+    || item.errorCode === "timeout"
+    || item.errorCode === "provider-unavailable"
+    ? item.errorCode
+    : null;
+  return {
+    provider: "google-books",
+    configured,
+    maskedKey: configured ? "••••••••" : null,
+    revision: Math.max(0, numberValue(item.revision)),
+    status: configured ? status : "not-configured",
+    lastTestedAt: configured ? nullableText(item.lastTestedAt) : null,
+    errorCode: configured ? errorCode : null,
+  };
 }
 
 function filterOptions(value: unknown): readonly CatalogFilterOption[] {
@@ -827,6 +1355,123 @@ function parsePage(value: unknown): CatalogBookPage {
     total: numberValue(item.total, items.length),
     limit: numberValue(item.limit, items.length || 24),
     offset: numberValue(item.offset),
+  };
+}
+
+function parseSendQueue(value: unknown): CatalogSendQueue {
+  const item = record(value);
+  const states = new Set([
+    "ready", "source-unavailable", "source-changed", "presentation-changed", "unsupported", "missing-or-retired",
+  ]);
+  const entries = Array.isArray(item.entries) ? item.entries.map((value): CatalogSendQueueEntry => {
+    const entry = record(value);
+    const rawState = textValue(entry.sourceState, "missing-or-retired");
+    return {
+      profileId: textValue(entry.profileId),
+      bookId: textValue(entry.bookId),
+      rank: numberValue(entry.rank),
+      queuedContentHash: textValue(entry.queuedContentHash),
+      queuedPresentationVersion: textValue(entry.queuedPresentationVersion),
+      createdAt: textValue(entry.createdAt),
+      updatedAt: textValue(entry.updatedAt),
+      book: entry.book === null ? null : parseBook(entry.book),
+      sourceState: states.has(rawState)
+        ? rawState as CatalogSendQueueEntry["sourceState"]
+        : "missing-or-retired",
+    };
+  }) : [];
+  return {
+    profileId: textValue(item.profileId),
+    revision: numberValue(item.revision),
+    entries,
+    total: numberValue(item.total, entries.length),
+    totalSourceBytes: numberValue(item.totalSourceBytes),
+  };
+}
+
+function parseBookSelection(value: unknown): BookSelectionResult {
+  const item = record(value);
+  const bookIds = [...stringArray(item.bookIds)];
+  return {
+    profileId: textValue(item.profileId),
+    bookIds,
+    total: numberValue(item.total, bookIds.length),
+    ceiling: numberValue(item.ceiling),
+  };
+}
+
+function parseSmartShelf(value: unknown): SmartShelf {
+  const item = record(value);
+  let query: SmartShelfQuery;
+  try {
+    query = normalizeSmartShelfQuery(item.query);
+  } catch (error) {
+    if (error instanceof SmartShelfQueryError) {
+      throw new CatalogApiError(502, "INVALID_SMART_SHELF", "The catalog returned an invalid smart shelf");
+    }
+    throw error;
+  }
+  return {
+    id: textValue(item.id),
+    profileId: textValue(item.profileId),
+    name: textValue(item.name),
+    query,
+    pinnedRank: nullableNumber(item.pinnedRank),
+    revision: numberValue(item.revision),
+    serverCount: nullableNumber(item.serverCount),
+    createdAt: textValue(item.createdAt),
+    updatedAt: textValue(item.updatedAt),
+  };
+}
+
+function parseBookAnnotation(value: unknown): ProfileBookAnnotation {
+  const item = record(value);
+  return {
+    profileId: textValue(item.profileId),
+    bookId: textValue(item.bookId),
+    favorite: booleanValue(item.favorite),
+    wantToRead: booleanValue(item.wantToRead),
+    revision: numberValue(item.revision),
+    createdAt: nullableText(item.createdAt),
+    updatedAt: nullableText(item.updatedAt),
+  };
+}
+
+function parseSeriesSummaryPage(value: unknown): CatalogSeriesSummaryPage {
+  const item = record(value);
+  const items = Array.isArray(item.items) ? item.items.map((value): CatalogSeriesSummary => {
+    const series = record(value);
+    return {
+      key: textValue(series.key),
+      name: textValue(series.name),
+      bookCount: numberValue(series.bookCount),
+      numberedCount: numberValue(series.numberedCount),
+      unnumberedCount: numberValue(series.unnumberedCount),
+    };
+  }) : [];
+  return {
+    items,
+    total: numberValue(item.total, items.length),
+    limit: numberValue(item.limit, items.length || 50),
+    offset: numberValue(item.offset),
+  };
+}
+
+function numberArray(value: unknown): readonly number[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is number => typeof item === "number" && Number.isFinite(item))
+    : [];
+}
+
+function parseSeriesDetail(value: unknown): CatalogSeriesDetail {
+  const item = record(value);
+  return {
+    key: textValue(item.key),
+    name: textValue(item.name),
+    books: parsePage(item.books),
+    duplicateIndices: numberArray(item.duplicateIndices),
+    missingIntegerIndices: numberArray(item.missingIntegerIndices),
+    unnumberedCount: numberValue(item.unnumberedCount),
   };
 }
 
@@ -878,6 +1523,7 @@ function parseMatchIndex(value: unknown): CatalogMatchIndex {
       .slice(0, MAX_STALE_MANAGED_TOKENS_PER_BOOK);
     return {
       bookId: textValue(candidate.bookId),
+      ...(candidate.preferredPresentation === true ? { preferredPresentation: true as const } : {}),
       sourceFilename: textValue(candidate.sourceFilename),
       sourceFormat: textValue(candidate.sourceFormat).toLocaleUpperCase("en-US"),
       sourceSize: numberValue(candidate.sourceSize),
@@ -908,6 +1554,13 @@ function listPayload(value: unknown, key: string): readonly unknown[] {
 
 function encodePath(value: string): string {
   return encodeURIComponent(value);
+}
+
+function clientIdempotencyKey(prefix: string): string {
+  const randomUuid = globalThis.crypto?.randomUUID?.();
+  return randomUuid
+    ? `${prefix}-${randomUuid}`
+    : `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 
 function eventSourceFactory(url: string): EventStreamLike {
@@ -1096,6 +1749,49 @@ export class HttpCatalogClient implements CatalogApi {
     return parseStatus(await this.#json("/status", { signal }));
   }
 
+  async listCoverProviderCredentials(signal?: AbortSignal): Promise<readonly CoverProviderCredentialState[]> {
+    return listPayload(
+      await this.#json("/settings/cover-providers", { signal }),
+      "items",
+    ).map(parseCoverProviderCredentialState);
+  }
+
+  async saveCoverProviderCredential(
+    provider: ConfigurableCoverProvider,
+    input: CoverProviderCredentialInput,
+    signal?: AbortSignal,
+  ): Promise<CoverProviderCredentialState> {
+    const request = this.#write("PUT", input, signal);
+    (request.headers as Record<string, string>)["Idempotency-Key"] = clientIdempotencyKey("provider-save");
+    return parseCoverProviderCredentialState(await this.#json(
+      `/settings/cover-providers/${encodePath(provider)}`,
+      request,
+    ));
+  }
+
+  async removeCoverProviderCredential(
+    provider: ConfigurableCoverProvider,
+    expectedRevision: number,
+    signal?: AbortSignal,
+  ): Promise<CoverProviderCredentialState> {
+    const params = new URLSearchParams({ expectedRevision: String(expectedRevision) });
+    return parseCoverProviderCredentialState(await this.#json(
+      `/settings/cover-providers/${encodePath(provider)}?${params.toString()}`,
+      { method: "DELETE", signal, headers: { "Idempotency-Key": clientIdempotencyKey("provider-remove") } },
+    ));
+  }
+
+  async testCoverProviderCredential(
+    provider: ConfigurableCoverProvider,
+    input: CoverProviderCredentialTestInput,
+    signal?: AbortSignal,
+  ): Promise<CoverProviderCredentialState> {
+    return parseCoverProviderCredentialState(await this.#json(
+      `/settings/cover-providers/${encodePath(provider)}/test`,
+      this.#write("POST", input, signal),
+    ));
+  }
+
   async listProfiles(signal?: AbortSignal): Promise<readonly CatalogProfile[]> {
     return listPayload(await this.#json("/profiles", { signal }), "profiles").map(parseProfile);
   }
@@ -1156,12 +1852,321 @@ export class HttpCatalogClient implements CatalogApi {
     ));
   }
 
+  async resolveBookSelection(
+    profileId: string,
+    query: CatalogBookQuery = {},
+    signal?: AbortSignal,
+  ): Promise<BookSelectionResult> {
+    const { limit: _limit, offset: _offset, ...unpaged } = query;
+    return parseBookSelection(await this.#json(
+      `/profiles/${encodePath(profileId)}/books/selection`,
+      this.#write("POST", unpaged, signal),
+    ));
+  }
+
+  async listSeries(
+    profileId: string,
+    query: { readonly q?: string; readonly limit?: number; readonly offset?: number } = {},
+    signal?: AbortSignal,
+  ): Promise<CatalogSeriesSummaryPage> {
+    const params = new URLSearchParams();
+    Object.entries(query).forEach(([key, value]) => {
+      if (value !== undefined && value !== "") params.set(key, String(value));
+    });
+    const suffix = params.size > 0 ? `?${params.toString()}` : "";
+    return parseSeriesSummaryPage(await this.#json(
+      `/profiles/${encodePath(profileId)}/series${suffix}`,
+      { signal },
+    ));
+  }
+
+  async getSeries(
+    profileId: string,
+    seriesKey: string,
+    query: { readonly limit?: number; readonly offset?: number } = {},
+    signal?: AbortSignal,
+  ): Promise<CatalogSeriesDetail> {
+    const params = new URLSearchParams();
+    Object.entries(query).forEach(([key, value]) => {
+      if (value !== undefined) params.set(key, String(value));
+    });
+    const suffix = params.size > 0 ? `?${params.toString()}` : "";
+    return parseSeriesDetail(await this.#json(
+      `/profiles/${encodePath(profileId)}/series/${encodePath(seriesKey)}${suffix}`,
+      { signal },
+    ));
+  }
+
+  async getSendQueue(profileId: string, signal?: AbortSignal): Promise<CatalogSendQueue> {
+    return parseSendQueue(await this.#json(`/profiles/${encodePath(profileId)}/send-queue`, { signal }));
+  }
+
+  async addSendQueueEntries(
+    profileId: string,
+    input: SendQueueAddInput,
+    idempotencyKey: string,
+    signal?: AbortSignal,
+  ): Promise<CatalogSendQueue> {
+    return parseSendQueue(await this.#json(`/profiles/${encodePath(profileId)}/send-queue`, {
+      ...this.#write("POST", input, signal),
+      headers: { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey },
+    }));
+  }
+
+  async replaceSendQueue(
+    profileId: string,
+    input: SendQueueAddInput,
+    signal?: AbortSignal,
+  ): Promise<CatalogSendQueue> {
+    return parseSendQueue(await this.#json(
+      `/profiles/${encodePath(profileId)}/send-queue`,
+      this.#write("PATCH", input, signal),
+    ));
+  }
+
+  async removeSendQueueEntry(
+    profileId: string,
+    bookId: string,
+    expectedRevision: number,
+    signal?: AbortSignal,
+  ): Promise<CatalogSendQueue> {
+    const query = new URLSearchParams({ expectedRevision: String(expectedRevision) });
+    return parseSendQueue(await this.#json(
+      `/profiles/${encodePath(profileId)}/send-queue/${encodePath(bookId)}?${query.toString()}`,
+      { method: "DELETE", signal },
+    ));
+  }
+
+  async clearSendQueue(
+    profileId: string,
+    expectedRevision: number,
+    signal?: AbortSignal,
+  ): Promise<CatalogSendQueue> {
+    const query = new URLSearchParams({ expectedRevision: String(expectedRevision) });
+    return parseSendQueue(await this.#json(
+      `/profiles/${encodePath(profileId)}/send-queue?${query.toString()}`,
+      { method: "DELETE", signal },
+    ));
+  }
+
+  async listSmartShelves(profileId: string, signal?: AbortSignal): Promise<readonly SmartShelf[]> {
+    return listPayload(
+      await this.#json(`/profiles/${encodePath(profileId)}/shelves`, { signal }),
+      "items",
+    ).map(parseSmartShelf);
+  }
+
+  async getSmartShelf(profileId: string, shelfId: string, signal?: AbortSignal): Promise<SmartShelf> {
+    return parseSmartShelf(await this.#json(
+      `/profiles/${encodePath(profileId)}/shelves/${encodePath(shelfId)}`,
+      { signal },
+    ));
+  }
+
+  async createSmartShelf(
+    profileId: string,
+    input: SmartShelfCreateInput,
+    idempotencyKey: string,
+    signal?: AbortSignal,
+  ): Promise<SmartShelf> {
+    return parseSmartShelf(await this.#json(`/profiles/${encodePath(profileId)}/shelves`, {
+      ...this.#write("POST", input, signal),
+      headers: { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey },
+    }));
+  }
+
+  async updateSmartShelf(
+    profileId: string,
+    shelfId: string,
+    input: SmartShelfPatchInput,
+    signal?: AbortSignal,
+  ): Promise<SmartShelf> {
+    return parseSmartShelf(await this.#json(
+      `/profiles/${encodePath(profileId)}/shelves/${encodePath(shelfId)}`,
+      this.#write("PATCH", input, signal),
+    ));
+  }
+
+  async reorderPinnedSmartShelves(
+    profileId: string,
+    input: SmartShelfPinnedOrderInput,
+    signal?: AbortSignal,
+  ): Promise<readonly SmartShelf[]> {
+    return listPayload(await this.#json(
+      `/profiles/${encodePath(profileId)}/shelves/pinned-order`,
+      this.#write("PATCH", input, signal),
+    ), "items").map(parseSmartShelf);
+  }
+
+  async deleteSmartShelf(
+    profileId: string,
+    shelfId: string,
+    expectedRevision: number,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const query = new URLSearchParams({ expectedRevision: String(expectedRevision) });
+    await this.#json(
+      `/profiles/${encodePath(profileId)}/shelves/${encodePath(shelfId)}?${query.toString()}`,
+      { method: "DELETE", signal },
+    );
+  }
+
+  async getBookAnnotation(profileId: string, bookId: string, signal?: AbortSignal): Promise<ProfileBookAnnotation> {
+    return parseBookAnnotation(await this.#json(
+      `/profiles/${encodePath(profileId)}/books/${encodePath(bookId)}/annotation`,
+      { signal },
+    ));
+  }
+
+  async updateBookAnnotation(
+    profileId: string,
+    bookId: string,
+    input: ProfileBookAnnotationPatchInput,
+    signal?: AbortSignal,
+  ): Promise<ProfileBookAnnotation> {
+    return parseBookAnnotation(await this.#json(
+      `/profiles/${encodePath(profileId)}/books/${encodePath(bookId)}/annotation`,
+      this.#write("PATCH", input, signal),
+    ));
+  }
+
   async getFilters(profileId: string, signal?: AbortSignal): Promise<CatalogFilters> {
     return parseFilters(await this.#json(`/profiles/${encodePath(profileId)}/filters`, { signal }));
   }
 
+  async listCatalogIssues(
+    profileId: string,
+    query: CatalogHealthQuery = {},
+    signal?: AbortSignal,
+  ): Promise<CatalogHealthPage> {
+    const params = new URLSearchParams();
+    Object.entries(query).forEach(([key, value]) => {
+      if (value !== undefined) params.set(key, String(value));
+    });
+    const suffix = params.size > 0 ? `?${params.toString()}` : "";
+    return parseCatalogHealthPage(await this.#json(
+      `/profiles/${encodePath(profileId)}/issues${suffix}`,
+      { signal },
+    ));
+  }
+
+  async updateCatalogIssueDisposition(
+    profileId: string,
+    signature: string,
+    input: CatalogIssueDispositionInput,
+    signal?: AbortSignal,
+  ): Promise<CatalogHealthIssue> {
+    const issue = parseCatalogHealthIssue(await this.#json(
+      `/profiles/${encodePath(profileId)}/issues/${encodePath(signature)}`,
+      this.#write("PATCH", input, signal),
+    ));
+    if (!issue) throw new CatalogApiError(502, "INVALID_CATALOG_ISSUE", "The catalog returned an invalid issue");
+    return issue;
+  }
+
+  async retryCatalogIssue(
+    profileId: string,
+    signature: string,
+    input: CatalogIssueRetryInput,
+    signal?: AbortSignal,
+  ): Promise<CatalogIssueRetryResult> {
+    const payload = record(await this.#json(
+      `/profiles/${encodePath(profileId)}/issues/${encodePath(signature)}/retry`,
+      this.#write("POST", input, signal),
+    ));
+    const issue = parseCatalogHealthIssue(payload.issue);
+    if (!issue) throw new CatalogApiError(502, "INVALID_CATALOG_ISSUE", "The catalog returned an invalid issue");
+    return {
+      issue,
+      acceptedRootIds: [...stringArray(payload.acceptedRootIds)],
+      blockedRootIds: [...stringArray(payload.blockedRootIds)],
+    };
+  }
+
+  async updateCatalogDuplicatePreference(
+    profileId: string,
+    signature: string,
+    input: CatalogDuplicatePreferenceInput,
+    signal?: AbortSignal,
+  ): Promise<CatalogHealthIssue> {
+    const issue = parseCatalogHealthIssue(await this.#json(
+      `/profiles/${encodePath(profileId)}/issues/${encodePath(signature)}/preferred-book`,
+      this.#write("PATCH", input, signal),
+    ));
+    if (!issue) throw new CatalogApiError(502, "INVALID_CATALOG_ISSUE", "The catalog returned an invalid issue");
+    return issue;
+  }
+
+  async listMetadataLookupJobs(
+    profileId: string,
+    query: { readonly limit?: number; readonly offset?: number } = {},
+    signal?: AbortSignal,
+  ): Promise<MetadataLookupJobPage> {
+    const params = new URLSearchParams();
+    if (query.limit !== undefined) params.set("limit", String(query.limit));
+    if (query.offset !== undefined) params.set("offset", String(query.offset));
+    const suffix = params.size > 0 ? `?${params.toString()}` : "";
+    return parseMetadataLookupJobPage(await this.#json(
+      `/profiles/${encodePath(profileId)}/metadata-lookup-jobs${suffix}`,
+      { signal },
+    ));
+  }
+
+  async getMetadataLookupJob(profileId: string, jobId: string, signal?: AbortSignal): Promise<MetadataLookupJob> {
+    return parseMetadataLookupJob(await this.#json(
+      `/profiles/${encodePath(profileId)}/metadata-lookup-jobs/${encodePath(jobId)}`,
+      { signal },
+    ));
+  }
+
+  async createMetadataLookupJob(
+    profileId: string,
+    input: MetadataLookupJobInput,
+    idempotencyKey: string,
+    signal?: AbortSignal,
+  ): Promise<MetadataLookupJob> {
+    return parseMetadataLookupJob(await this.#json(
+      `/profiles/${encodePath(profileId)}/metadata-lookup-jobs`,
+      {
+        ...this.#write("POST", input, signal),
+        headers: { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey },
+      },
+    ));
+  }
+
+  async controlMetadataLookupJob(
+    profileId: string,
+    jobId: string,
+    action: "resume" | "pause" | "cancel" | "retry",
+    input: MetadataLookupJobControlInput,
+    signal?: AbortSignal,
+  ): Promise<MetadataLookupJob> {
+    return parseMetadataLookupJob(await this.#json(
+      `/profiles/${encodePath(profileId)}/metadata-lookup-jobs/${encodePath(jobId)}/${action}`,
+      this.#write("POST", input, signal),
+    ));
+  }
+
+  async runMetadataLookupJobStep(
+    profileId: string,
+    jobId: string,
+    signal?: AbortSignal,
+  ): Promise<MetadataLookupJob> {
+    return parseMetadataLookupJob(await this.#json(
+      `/profiles/${encodePath(profileId)}/metadata-lookup-jobs/${encodePath(jobId)}/run`,
+      this.#write("POST", {}, signal),
+    ));
+  }
+
   async getBook(profileId: string, bookId: string, signal?: AbortSignal): Promise<CatalogBook> {
     return parseBook(await this.#json(`/profiles/${encodePath(profileId)}/books/${encodePath(bookId)}`, { signal }));
+  }
+
+  async getBookDetails(profileId: string, bookId: string, signal?: AbortSignal): Promise<CatalogBookDetailsData> {
+    return parseBookDetailsData(await this.#json(
+      `/profiles/${encodePath(profileId)}/books/${encodePath(bookId)}/details`,
+      { signal },
+    ));
   }
 
   async getBookMetadata(profileId: string, bookId: string, signal?: AbortSignal): Promise<CatalogBookMetadataState> {
@@ -1191,6 +2196,35 @@ export class HttpCatalogClient implements CatalogApi {
   ): Promise<CatalogBookMetadataState> {
     return parseBookMetadataState(await this.#json(
       `/profiles/${encodePath(profileId)}/books/${encodePath(bookId)}/metadata/reset`,
+      this.#write("POST", input, signal),
+    ));
+  }
+
+  async searchBookMetadata(
+    profileId: string,
+    bookId: string,
+    provider: CoverProvider,
+    terms: MetadataCandidateSearchTerms,
+    signal?: AbortSignal,
+  ): Promise<MetadataCandidateSearchResult> {
+    const params = new URLSearchParams({ provider, limit: "12" });
+    if (terms.title) params.set("title", terms.title);
+    if (terms.author) params.set("author", terms.author);
+    if (terms.identifier) params.set("identifier", terms.identifier);
+    return parseMetadataCandidateSearchResult(await this.#json(
+      `/profiles/${encodePath(profileId)}/books/${encodePath(bookId)}/metadata-search?${params.toString()}`,
+      { signal },
+    ));
+  }
+
+  async importBookMetadata(
+    profileId: string,
+    bookId: string,
+    input: MetadataCandidateImportInput,
+    signal?: AbortSignal,
+  ): Promise<CatalogBookMetadataState> {
+    return parseBookMetadataState(await this.#json(
+      `/profiles/${encodePath(profileId)}/books/${encodePath(bookId)}/metadata-import`,
       this.#write("POST", input, signal),
     ));
   }
@@ -1389,6 +2423,8 @@ export class HttpCatalogClient implements CatalogApi {
             profileId: optionalText(item.profileId),
             rootId: optionalText(item.rootId),
             bookId: optionalText(item.bookId),
+            shelfId: optionalText(item.shelfId),
+            jobId: optionalText(item.jobId),
             data: record(item.data),
           });
         } catch {
