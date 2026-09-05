@@ -33,9 +33,10 @@ describe("smart-shelf client projections", () => {
 
   it("exposes a deliberately small immutable built-in set", () => {
     expect(BUILT_IN_SMART_SHELVES.map(({ name }) => name)).toEqual([
-      "Recently added", "Not on Kindle", "Favorites", "Want to read", "Missing cover",
+      "Read books", "Recently added", "Not on Kindle", "Favorites", "Want to read", "Missing cover",
     ]);
-    expect(BUILT_IN_SMART_SHELVES).toHaveLength(5);
+    expect(BUILT_IN_SMART_SHELVES).toHaveLength(6);
+    expect(BUILT_IN_SMART_SHELVES.find(({ id }) => id === "builtin-read-books")?.query).toEqual({ version: 1, personal: { readBook: true } });
     expect(BUILT_IN_SMART_SHELVES.at(-1)?.query).toEqual({ version: 1, catalog: { coverAvailable: false } });
     expect(BUILT_IN_SMART_SHELVES.some(({ name }) => /progress/iu.test(name))).toBe(false);
   });

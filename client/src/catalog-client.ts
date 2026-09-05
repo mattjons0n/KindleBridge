@@ -275,6 +275,7 @@ export interface CatalogBookQuery {
   readonly coverAvailable?: boolean;
   readonly favorite?: boolean;
   readonly wantToRead?: boolean;
+  readonly readBook?: boolean;
   readonly sort?: CatalogBookSort;
   readonly order?: "asc" | "desc";
   readonly limit?: number;
@@ -445,6 +446,8 @@ export interface CatalogBookSource {
 }
 
 export interface CatalogApi {
+  getOnboardingState?(signal?: AbortSignal): Promise<{ dismissed: boolean }>;
+  setOnboardingDismissed?(dismissed: boolean, signal?: AbortSignal): Promise<{ dismissed: boolean }>;
   getStatus(signal?: AbortSignal): Promise<CatalogServiceStatus>;
   listCoverProviderCredentials?(signal?: AbortSignal): Promise<readonly CoverProviderCredentialState[]>;
   saveCoverProviderCredential?(
@@ -1431,6 +1434,7 @@ function parseBookAnnotation(value: unknown): ProfileBookAnnotation {
     bookId: textValue(item.bookId),
     favorite: booleanValue(item.favorite),
     wantToRead: booleanValue(item.wantToRead),
+    readBook: item.readBook === undefined ? false : booleanValue(item.readBook),
     revision: numberValue(item.revision),
     createdAt: nullableText(item.createdAt),
     updatedAt: nullableText(item.updatedAt),
@@ -1747,6 +1751,16 @@ export class HttpCatalogClient implements CatalogApi {
 
   async getStatus(signal?: AbortSignal): Promise<CatalogServiceStatus> {
     return parseStatus(await this.#json("/status", { signal }));
+  }
+
+  async getOnboardingState(signal?: AbortSignal): Promise<{ dismissed: boolean }> {
+    const value = record(await this.#json("/settings/onboarding", { signal }));
+    return { dismissed: booleanValue(value.dismissed) };
+  }
+
+  async setOnboardingDismissed(dismissed: boolean, signal?: AbortSignal): Promise<{ dismissed: boolean }> {
+    const value = record(await this.#json("/settings/onboarding", this.#write("PUT", { dismissed }, signal)));
+    return { dismissed: booleanValue(value.dismissed) };
   }
 
   async listCoverProviderCredentials(signal?: AbortSignal): Promise<readonly CoverProviderCredentialState[]> {

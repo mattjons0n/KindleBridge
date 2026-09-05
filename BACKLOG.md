@@ -40,7 +40,7 @@ Acceptance requires strict container/field/count/byte bounds, malformed and host
 
 ## Read Kindle progress and reading state from sidecars
 
-**Status:** Bounded browser-only foundation implemented, default off — sidecar discovery, parsing, evidence, lifecycle, filtering, and accessible presentation contracts are present, but no reading-state UI is enabled until the physical format/state matrix establishes trustworthy semantics.
+**Status:** Browser projection, grid/list UI, status filtering and durable Read books shelf integration implemented, default off for automatic reading detection. The physical format/state matrix still needs to establish trustworthy semantics, including an explicit Read/Unread field. See `outputs/onboarding-reading-build-plan.md`.
 
 Add best-effort, browser-local reading progress for books that have a strong exact association with an object in the current live Kindle inventory. MTP does not expose a standard semantic progress property; the implementation must selectively enumerate and download only the small Kindle reader-data sidecars associated with that exact book. Candidate reverse-engineered KRDS files are AZW3 `.azw3f`/`.azw3r`, KFX `.yjf`/`.yjr`, and legacy MOBI `.mbs`/`.mbp1`. Known fields can include last and furthest positions, an estimated percentage, a timestamp, and local reading-time data. See the [KRDS parser](https://github.com/K-R-D-S/KRDS/blob/9c8a0b0ec9cb6af72fba900a6f9b09f92de477de/krds.py) and the [current format observations](https://github.com/zevisvei/kindle-reading-dashboard/blob/main/docs/KRDS-format.md).
 
@@ -54,6 +54,8 @@ Dashboard requirements:
 - Add a distinct **Reading status** filter with **Any**, **Unread**, **In progress**, **Read**, and **Unknown**. Keep it separate from both the existing Kindle-presence filter and the sort-order control. Filtering must remain correct across pagination and profile switches; bounded opaque book-ID selection may be reused without sending raw sidecar data to the service.
 
 The current broad `.sdr` pruning must be relaxed only through targeted inspection after exact parent/book association. Allowlist sidecar extensions and paths; enforce strict object-count, nesting, per-object, and aggregate-byte limits; use conservative `GetObjectHandles`/`GetObjectInfo` plus targeted `GetObject`; and keep `GetObjectPropList` disabled on `0x1949 / 0x9981`. Never write, rename, replace, or delete a Kindle sidecar. Raw sidecar bytes, exact positions, timestamps, reading history, and derived progress remain in the browser and are never persisted by or sent to the backend/cloud.
+
+The subsequently approved **Read books** shelf adds one narrow exception: opaque per-profile/book completed membership persists in server annotations after an exact explicit Read observation. No raw reading evidence, device identity, position, percentage or Kindle timestamp accompanies it. Membership survives disconnect/removal; it is history, not a claim about current device state.
 
 Acceptance requires malformed, truncated, oversized, duplicate, version-drift, and unsupported-sidecar fixtures; exact and ambiguous association tests; lifecycle/disconnect downgrade tests; correct accessible grid/list rendering and filtering; and a bounded physical probe on the known `0x1949 / 0x9981` Kindle. Test controlled not-started, mid-book, and completed states before and after reconnect/reboot for a managed PDOC AZW3 plus any KFX or legacy sample actually present. A missing sidecar or mock-only success is not device evidence.
 

@@ -16,7 +16,7 @@ Before calling this candidate household-ready, repeat the consolidated queue/mat
 
 ### Docker catalog service
 
-- A vendor-neutral Node.js service owns configuration, additive SQLite schema version 17, persistent profiles/root mappings, bounded delivery/idempotency history, stable catalog identity evidence, durable sparse metadata/replacement-cover overlays, the rebuildable metadata/search index, and source-cover cache. Settings replacement and direct profile creation are operation-scoped and retry-safe; arbitrary delivery-result payloads are rejected rather than persisted.
+- A vendor-neutral Node.js service owns configuration, additive SQLite schema version 18, persistent profiles/root mappings, bounded delivery/idempotency history, stable catalog identity evidence, durable sparse metadata/replacement-cover overlays, the rebuildable metadata/search index, and source-cover cache. Settings replacement and direct profile creation are operation-scoped and retry-safe; arbitrary delivery-result payloads are rejected rather than persisted.
 - EPUB and supported uncompressed/PalmDOC-compressed AZW3 sources are detected structurally and parsed with bounded, isolated metadata workers. HUFF/CDIC AZW3 is rejected rather than accepted on header plausibility alone. Metadata, covers, source fingerprints, hashes, availability, and completeness are indexed.
 - Directory watchers provide low-latency per-path hints. Frequent scheduled reconciliation uses persisted bounded source fingerprints before escalating changed candidates to a full immutable snapshot; a separate daily deep reconciliation full-hashes every unchanged source, and manual Rescan requests the same deep verification immediately. Successful full-root completion time is durable per root, so startup remains bounded while a first/overdue deep request is queued after startup and survives further restarts. Each active root scan also has a configurable hard deadline; a stalled host filesystem operation releases the shared scan slot, preserves catalog rows and the durable generation, surfaces `scan_timeout`, and retries with backoff. Confirmed healthy scans retire missing rebuildable catalog/FTS rows, while mount-loss paths keep last-known rows unavailable. Stable current/delivery-linked identities remain protected across rename, delete/re-add, and rebuild; unlinked history has a deterministic 20,000-row/32 MiB per-root ceiling.
 - Profile-scoped APIs expose catalog queries, facets, covers, match indexes, authoritative source streams, Settings mutations, manual rescans, delivery recording, health/readiness, and server-sent events.
@@ -150,6 +150,12 @@ The iOS probe under `ios/KindleProbe` also records a negative physical finding. 
 - `outputs/kindle-bridge-backlog-build-plan.md` — complete Milestone 0–14 build, validation, rollout, and omission plan
 - `outputs/kindle-bridge-backlog-feature-audit.md` — current requirement-by-requirement release-candidate audit and final evidence record
 - `outputs/kindle-bridge-implementation-build-plan.md` and `outputs/kindle-bridge-feature-audit.md` — historical pre-backlog implementation records
+
+## Onboarding and reading integration (2026-09-05)
+
+Schema v18 adds an installation-wide remembered onboarding dismissal and bounded completed-book membership in existing profile annotations. The first-run wizard uses the existing configuration save/validation flow, indexing status and optional user-initiated WebUSB connection. Settings can reopen it. The new Read books shelf is profile-scoped durable history, not device-presence or live-progress authority.
+
+Central browser reading projection, grid/list presentation, status filtering and explicit completion recording are wired, but reading sidecar/presentation rollout remains disabled pending physical acceptance. The current parser has no proven explicit Read/Unread field. Never infer Read from 100%, and never report physical success from tests. See `outputs/onboarding-reading-build-plan.md` for the precise omission/evidence record.
 
 ## Remaining release acceptance
 

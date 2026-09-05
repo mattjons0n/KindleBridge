@@ -6,7 +6,7 @@ interface Migration {
   sql: string;
 }
 
-export const CATALOG_SCHEMA_VERSION = 17;
+export const CATALOG_SCHEMA_VERSION = 18;
 /** Bounded replay window for Settings/configuration mutations per profile. */
 export const MAX_CONFIGURATION_WRITES_PER_PROFILE = 1_000;
 /** Unreferenced stable identities retained per root after confirmed scans. */
@@ -657,6 +657,19 @@ export const CATALOG_MIGRATIONS: readonly Migration[] = [
         created_at TEXT NOT NULL,
         PRIMARY KEY(profile_id, idempotency_key)
       ) STRICT;
+    `,
+  },
+  {
+    version: 18,
+    name: "onboarding dismissal and completed-book shelf membership",
+    sql: `
+      CREATE TABLE onboarding_state (
+        id INTEGER PRIMARY KEY CHECK(id = 1),
+        dismissed INTEGER NOT NULL DEFAULT 0 CHECK(dismissed IN (0, 1))
+      ) STRICT;
+      INSERT INTO onboarding_state(id, dismissed) VALUES (1, 0);
+      ALTER TABLE profile_book_annotations ADD COLUMN read_book INTEGER NOT NULL DEFAULT 0 CHECK(read_book IN (0, 1));
+      CREATE INDEX profile_book_annotations_read_idx ON profile_book_annotations(profile_id, read_book, book_id);
     `,
   },
 ];

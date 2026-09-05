@@ -56,6 +56,26 @@ function addBook(
 }
 
 describe("profile-scoped durable library state", () => {
+  it("persists completed-book membership and setup dismissal without altering other annotations", async () => {
+    const fixture = await databaseFixture();
+    let database = fixture.database;
+    const book = addBook(database, fixture.root.id, "finished");
+    const other = database.createProfile({ name: "Other reader" });
+    database.database.prepare("UPDATE onboarding_state SET dismissed = 1 WHERE id = 1").run();
+    const first = database.updateProfileBookAnnotation(fixture.profile.id, book.bookId, { expectedRevision: 0, readBook: true });
+    expect(first.annotation.readBook).toBe(true);
+    const favorite = database.updateProfileBookAnnotation(fixture.profile.id, book.bookId, { expectedRevision: 1, favorite: true });
+    expect(favorite.annotation.readBook).toBe(true);
+    expect(database.listBooks(fixture.profile.id, { readBook: true }).total).toBe(1);
+    expect(database.listBooks(other.id, { readBook: true }).total).toBe(0);
+    database.close();
+    database = new CatalogDatabase(fixture.filename);
+    try {
+      expect(database.database.prepare("SELECT dismissed FROM onboarding_state").get()?.dismissed).toBe(1);
+      expect(database.getProfileBookAnnotation(fixture.profile.id, book.bookId)).toMatchObject({ readBook: true, favorite: true });
+      expect(database.listBooks(fixture.profile.id, { readBook: true }).items[0]?.id).toBe(book.bookId);
+    } finally { database.close(); }
+  });
   it("retains every schema-v17 intent record across restarts and a rebuildable catalog loss", async () => {
     const fixture = await databaseFixture();
     let database = fixture.database;

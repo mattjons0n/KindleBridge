@@ -416,6 +416,18 @@ export class CatalogHttpServer {
       }
       return;
     }
+    if (segments.length === 2 && segments[0] === "settings" && segments[1] === "onboarding") {
+      if (method === "PUT") {
+        this.assertSettingsWritable();
+        const input = objectValue(await readJson(request, this.options.maxJsonBodyBytes));
+        requireOnlyFields(input, ["dismissed"]);
+        if (typeof input.dismissed !== "boolean") throw new HttpError(400, "invalid_request", "dismissed must be a boolean.");
+        this.database.database.prepare("UPDATE onboarding_state SET dismissed = ? WHERE id = 1").run(input.dismissed ? 1 : 0);
+      } else if (method !== "GET") throw new HttpError(405, "method_not_allowed", "Method not allowed.");
+      const row = this.database.database.prepare("SELECT dismissed FROM onboarding_state WHERE id = 1").get();
+      sendJson(response, 200, { dismissed: row?.dismissed === 1 });
+      return;
+    }
     if (segments[0] === "settings" && segments[1] === "cover-providers") {
       await this.routeCoverProviderSettings(request, response, url, segments.slice(2));
       return;
@@ -2704,7 +2716,7 @@ function queryFromSearchParams(params: URLSearchParams): BookSetQuery {
     "available",
     "coverAvailable",
     "favorite",
-    "wantToRead",
+    "wantToRead", "readBook",
     "sort",
     "order",
     "limit",
@@ -2721,7 +2733,7 @@ function queryFromObject(value: unknown, allowSets: boolean, strict = false): Bo
   if (strict) {
     const allowed = new Set([
       "q", "author", "language", "subject", "publisher", "series", "seriesKey", "year", "format", "rootId",
-      "metadata", "available", "coverAvailable", "favorite", "wantToRead", "sort", "order", "limit", "offset",
+      "metadata", "available", "coverAvailable", "favorite", "wantToRead", "readBook", "sort", "order", "limit", "offset",
       ...(allowSets ? ["includeBookIds", "excludeBookIds"] : []),
     ]);
     const unknown = Object.keys(object).find((key) => !allowed.has(key));
@@ -2766,6 +2778,9 @@ function queryFromObject(value: unknown, allowSets: boolean, strict = false): Bo
     if (object.favorite === "true") query.favorite = true;
     else if (object.favorite === "false") query.favorite = false;
     else query.favorite = optionalBoolean(object.favorite, "favorite");
+  }
+  if (object.readBook !== undefined) {
+    query.readBook = object.readBook === "true" ? true : object.readBook === "false" ? false : optionalBoolean(object.readBook, "readBook");
   }
   if (object.wantToRead !== undefined) {
     if (object.wantToRead === "true") query.wantToRead = true;
@@ -2872,14 +2887,15 @@ function validateSmartShelfPinnedOrder(value: unknown): SmartShelfPinnedOrderInp
 
 function validateProfileBookAnnotation(value: unknown): ProfileBookAnnotationPatchInput {
   const object = objectValue(value);
-  requireOnlyFields(object, ["expectedRevision", "favorite", "wantToRead"]);
-  if (object.favorite === undefined && object.wantToRead === undefined) {
+  requireOnlyFields(object, ["expectedRevision", "favorite", "wantToRead", "readBook"]);
+  if (object.favorite === undefined && object.wantToRead === undefined && object.readBook === undefined) {
     throw new HttpError(400, "invalid_request", "An annotation change is required.");
   }
   return {
     expectedRevision: boundedInteger(object.expectedRevision, "expectedRevision", 0, Number.MAX_SAFE_INTEGER),
     ...(object.favorite === undefined ? {} : { favorite: optionalBoolean(object.favorite, "favorite") }),
     ...(object.wantToRead === undefined ? {} : { wantToRead: optionalBoolean(object.wantToRead, "wantToRead") }),
+    ...(object.readBook === undefined ? {} : { readBook: optionalBoolean(object.readBook, "readBook") }),
   };
 }
 

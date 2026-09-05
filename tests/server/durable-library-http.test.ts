@@ -36,6 +36,11 @@ describe("durable library HTTP routes", () => {
     services.push(service);
     const address = await service.start();
     const base = `http://127.0.0.1:${address.port}`;
+    expect(await (await fetch(`${base}/api/settings/onboarding`)).json()).toEqual({ dismissed: false });
+    const skip = await fetch(`${base}/api/settings/onboarding`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ dismissed: true }) });
+    expect(await skip.json()).toEqual({ dismissed: true });
+    expect(await (await fetch(`${base}/api/settings/onboarding`)).json()).toEqual({ dismissed: true });
+    expect((await fetch(`${base}/api/settings/onboarding`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ dismissed: "true" }) })).status).toBe(400);
     const profile = service.database.createProfile({ name: "HTTP Reader" });
     const root = service.database.createRoot(profile.id, { label: "Books", path: library });
     const addBook = (name: string, seriesIndex: number | null) => service.database.upsertCatalogFile({
@@ -92,9 +97,11 @@ describe("durable library HTTP routes", () => {
     const annotation = await fetch(`${base}/api/profiles/${profile.id}/books/${one.bookId}/annotation`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ expectedRevision: 0, favorite: true }),
+      body: JSON.stringify({ expectedRevision: 0, favorite: true, readBook: true }),
     });
-    expect(await annotation.json()).toMatchObject({ favorite: true, revision: 1 });
+    expect(await annotation.json()).toMatchObject({ favorite: true, readBook: true, revision: 1 });
+    expect(await (await fetch(`${base}/api/profiles/${profile.id}/books?readBook=true`)).json()).toMatchObject({ total: 1, items: [{ id: one.bookId }] });
+    expect((await fetch(`${base}/api/profiles/${profile.id}/books/${one.bookId}/annotation`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ expectedRevision: 1, readBook: "yes" }) })).status).toBe(400);
     expect(publish.mock.calls.filter(([event]) => event.type === "annotation.updated")).toHaveLength(1);
 
     const shelfRequest = () => fetch(`${base}/api/profiles/${profile.id}/shelves`, {

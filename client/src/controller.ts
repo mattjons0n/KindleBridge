@@ -1,6 +1,7 @@
 import { convertEpub, type ConversionResult } from "./api/convert";
 import type { ConversionOverrides } from "./api/conversion-overrides";
 import { AppError, toAppError } from "./app-error";
+import { ACCEPTED_KINDLE_READING_SIDECARS } from "./kindle/reading-rollout";
 import {
   advancedPartialObjectProbeTargets,
   exportAdvancedPartialObjectProbeResult,
@@ -1802,6 +1803,7 @@ export class AppController {
           aggregateTimeoutMs:
             this.#dependencies.postUploadInventoryTimeoutMs ?? DEFAULT_POST_UPLOAD_INVENTORY_TIMEOUT_MS,
           deviceMetadataCache: "read-write",
+          readingSidecars: ACCEPTED_KINDLE_READING_SIDECARS,
           onObjectState: this.#objectStateHandler("metadata-cache", undefined, connection.details),
         },
         replacementCleanupStorage: this.#dependencies.replacementCleanupStorage,

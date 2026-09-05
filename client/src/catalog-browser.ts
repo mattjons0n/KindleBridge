@@ -86,7 +86,16 @@ import {
 
 export type CatalogLoadState = "idle" | "loading" | "ready" | "error";
 
+import { catalogReadingEvidence, completedReadingBookIds } from "./catalog-reading";
+import { DEFAULT_KINDLE_READING_PRESENTATION_GATE, isKindleReadingPresentationEnabled } from "./kindle/reading-reconciliation";
+import { retireKindleReadingEvidence, type KindleReadingEvidence, type KindleReadingStatus } from "./kindle/reading-state";
+
 export interface CatalogBrowserSnapshot {
+  readonly readingEnabled?: boolean;
+  readonly readingEvidence?: ReadonlyMap<string, KindleReadingEvidence>;
+  readonly readingFilter?: "any" | KindleReadingStatus;
+  readonly readingHistoryError?: string;
+  readonly onboarding?: { readonly step: "welcome" | "library" | "indexing" | "kindle"; readonly busy?: boolean; readonly error?: string };
   readonly loadState: CatalogLoadState;
   readonly serviceStatus?: CatalogServiceStatus;
   readonly profiles: readonly CatalogProfile[];
@@ -298,6 +307,7 @@ export interface CatalogSendBatchResult {
 export type KindleInventoryCompleteness = "complete" | "partial" | "last-seen";
 
 export interface CatalogKindleInventoryItem {
+  readonly readingEvidence?: KindleReadingEvidence;
   readonly id: string;
   readonly filename: string;
   readonly title?: string;
@@ -397,6 +407,8 @@ export interface CatalogHardwareHooks {
 export type CatalogRenderScope = "all" | "results" | "device" | "results-and-device";
 
 export interface CatalogBrowserOptions {
+  /** Internal validated-format rollout/test seam, never a user setting. */
+  readonly readingPresentationGate?: unknown;
   /** Aggregate deadline for one startup, profile, page, Settings-load, or event refresh. */
   readonly requestTimeoutMs?: number;
   /** Aggregate deadline for a Settings mutation plus its authoritative refresh. */
@@ -618,6 +630,8 @@ export class CatalogBrowser {
   #unsubscribeEvents?: () => void;
   #eventStreamExpected = false;
   #settingsIdempotencyKey?: string;
+  #readingHistoryOperation?: CatalogOperationLease;
+  #onboardingOperation?: CatalogOperationLease;
   #settingsIdempotencyFingerprint?: string;
   #settingsDraftDirty = false;
   #settingsExternallyChanged = false;
@@ -669,6 +683,9 @@ export class CatalogBrowser {
     );
     this.#snapshot = {
       loadState: "idle",
+      readingEnabled: isKindleReadingPresentationEnabled(options.readingPresentationGate ?? DEFAULT_KINDLE_READING_PRESENTATION_GATE),
+      readingEvidence: new Map(),
+      readingFilter: "any",
       profiles: [],
       rootsByProfile: new Map(),
       filters: initialLibraryFilters(),
@@ -741,9 +758,10 @@ export class CatalogBrowser {
     }, "all");
     const epoch = ++this.#profileEpoch;
     try {
-      const [serviceStatus, profiles] = await operation.wait(Promise.all([
+      const [serviceStatus, profiles, onboarding] = await operation.wait(Promise.all([
         this.#api.getStatus(operation.signal),
         this.#api.listProfiles(operation.signal),
+        this.#api.getOnboardingState?.(operation.signal) ?? Promise.resolve({ dismissed: false }),
       ]));
       if (epoch !== this.#profileEpoch) return;
       const remembered = safeStorageGet(this.#storage, ACTIVE_PROFILE_KEY);
@@ -759,6 +777,8 @@ export class CatalogBrowser {
         loadState: "ready",
         serviceStatus,
         profiles,
+        onboarding: this.#api.getOnboardingState && serviceStatus.settingsMode !== "read-only" && !onboarding.dismissed && !profiles.some((profile) => profile.rootCount > 0)
+          ? { step: "welcome" } : undefined,
         filters: browsingContext?.filters ?? initialLibraryFilters(selected?.id),
         layout: browsingContext?.layout ?? "grid",
         density: browsingContext?.density ?? "comfortable",
@@ -819,8 +839,11 @@ export class CatalogBrowser {
   }
 
   dispose(): void {
+    this.#onboardingOperation?.abort();
+    this.#onboardingOperation = undefined;
     this.#profileEpoch += 1;
     this.#bookEpoch += 1;
+    this.#readingHistoryOperation?.abort();
     this.#settingsEpoch += 1;
     this.#profilesReloadEpoch += 1;
     this.#eventRefreshEpoch += 1;
@@ -915,10 +938,14 @@ export class CatalogBrowser {
     this.#profileOperation = operation;
     safeStorageSet(this.#storage, ACTIVE_PROFILE_KEY, profile.id);
     const browsingContext = readLibraryBrowserContext(this.#storage, profile.id);
+    this.#readingHistoryOperation?.abort();
     this.#restoredShelfId = browsingContext.activeShelfId;
     this.#snapshot = {
       ...this.#snapshot,
       filters: browsingContext.filters,
+      readingEvidence: new Map(),
+      readingFilter: "any",
+      readingHistoryError: undefined,
       layout: browsingContext.layout,
       density: browsingContext.density,
       contextScrollY: browsingContext.scrollY,
@@ -1652,6 +1679,7 @@ export class CatalogBrowser {
       ...this.#snapshot,
       filters,
       activeShelf: { id: shelf.id, name: shelf.name, query: shelf.query, builtIn: builtIn !== undefined },
+      readingFilter: "any",
       selectedBookIds: new Set(),
       shelfManagerOpen: false,
     };
@@ -1668,6 +1696,7 @@ export class CatalogBrowser {
       activeShelf: undefined,
       filters: initialLibraryFilters(profileId),
       selectedBookIds: new Set(),
+      readingFilter: "any",
     };
     this.#persistBrowsingContext(0);
     this.#render("all");
@@ -1979,6 +2008,7 @@ export class CatalogBrowser {
     this.#snapshot = {
       ...this.#snapshot,
       filters: clearCatalogFilters(this.#snapshot.filters),
+      readingFilter: "any",
       activeShelf: undefined,
       selectedBookIds: new Set(),
       bookDetails: undefined,
@@ -2045,10 +2075,17 @@ export class CatalogBrowser {
           return { items: [], total: 0, limit: request.limit ?? 24, offset: request.offset ?? 0 };
         }
         if (wantsMatchedView || wantsOnKindle || wantsPossible || wantsAbsent || (wantsUnknown && hasProfileComparison)) {
+          const deviceIds = wantsMatchedView ? matched : wantsOnKindle ? confirmed : wantsPossible ? possible : wantsAbsent ? absent : unknown;
+          const reading = this.#readingFilterQuery();
+          const allowed = reading.includeBookIds ? new Set(reading.includeBookIds) : undefined;
           return this.#api.queryBooks(profileId, {
             ...request,
-            includeBookIds: wantsMatchedView ? matched : wantsOnKindle ? confirmed : wantsPossible ? possible : wantsAbsent ? absent : unknown,
+            ...reading,
+            includeBookIds: allowed ? deviceIds.filter((id) => allowed.has(id)) : deviceIds,
           }, operation.signal);
+        }
+        if (this.#snapshot.readingEnabled && this.#snapshot.readingFilter !== "any") {
+          return this.#api.queryBooks(profileId, { ...request, ...this.#readingFilterQuery() }, operation.signal);
         }
         return this.#api.listBooks(profileId, request, operation.signal);
       };
@@ -2290,6 +2327,45 @@ export class CatalogBrowser {
     await this.selectSettingsLibrary(profileId, true);
   }
 
+  async openOnboarding(): Promise<void> {
+    if (this.#kindleActionBusy() || this.#snapshot.settingsSaving || this.#snapshot.settingsRefreshing) return;
+    await this.setView("settings");
+    if (this.#snapshot.filters.view !== "settings") return;
+    this.#set({ onboarding: { step: "welcome" } }, "all");
+  }
+
+  async advanceOnboarding(): Promise<void> {
+    const wizard = this.#snapshot.onboarding;
+    if (!wizard || wizard.busy || this.#snapshot.settingsSaving || this.#snapshot.settingsRefreshing) return;
+    if (wizard.step === "welcome") {
+      await this.setView("settings");
+      if (this.#snapshot.filters.view === "settings") this.#set({ onboarding: { step: "library" } }, "all");
+    } else if (wizard.step === "indexing") this.#set({ onboarding: { step: "kindle" } }, "all");
+    else if (wizard.step === "kindle") {
+      await this.dismissOnboarding();
+      if (!this.#snapshot.onboarding) await this.setView("all");
+    }
+  }
+
+  async dismissOnboarding(): Promise<void> {
+    const wizard = this.#snapshot.onboarding;
+    if (!wizard || wizard.busy || this.#snapshot.settingsSaving || this.#snapshot.settingsRefreshing) return;
+    this.#set({ onboarding: { ...wizard, busy: true, error: undefined } }, "all");
+    const operation = createCatalogOperation("Remember setup dismissal", this.#settingsMutationTimeoutMs);
+    this.#onboardingOperation = operation;
+    try {
+      if (!this.#api.setOnboardingDismissed) throw new Error("The server does not support remembering setup. Update it and try again.");
+      const saved = await operation.wait(this.#api.setOnboardingDismissed(true, operation.signal));
+      if (!saved.dismissed) throw new Error("The server did not remember the setup choice.");
+      if (this.#onboardingOperation === operation) this.#set({ onboarding: undefined }, "all");
+    } catch (error) {
+      if (this.#onboardingOperation === operation) this.#set({ onboarding: { ...wizard, error: errorMessage(error, "Could not remember Skip. Please retry.") } }, "all");
+    } finally {
+      operation.dispose();
+      if (this.#onboardingOperation === operation) this.#onboardingOperation = undefined;
+    }
+  }
+
   async saveSettings(): Promise<void> {
     const current = this.#snapshot.settingsDraft;
     if (!current || this.#snapshot.settingsSaving || this.#snapshot.settingsRefreshing) return;
@@ -2365,6 +2441,7 @@ export class CatalogBrowser {
       await this.selectSettingsLibrary(savedProfileId, true, operation);
       this.#settingsIdempotencyKey = undefined;
       this.#settingsIdempotencyFingerprint = undefined;
+      if (this.#snapshot.onboarding?.step === "library") this.#set({ onboarding: { step: "indexing" } }, "all");
     } catch (error) {
       if (settingsEpoch === this.#settingsEpoch) {
         this.#set({
@@ -4232,6 +4309,14 @@ export class CatalogBrowser {
 
   setKindleInventory(inventory: CatalogKindleInventory | undefined): void {
     const profileId = this.#snapshot.filters.profileId;
+    this.#readingHistoryOperation?.abort();
+    if (this.#snapshot.readingEnabled) {
+      const readingEvidence = !inventory || inventory.completeness === "last-seen"
+        ? retireKindleReadingEvidence(this.#snapshot.readingEvidence ?? new Map())
+        : catalogReadingEvidence(inventory);
+      this.#snapshot = { ...this.#snapshot, readingEvidence };
+      if (profileId && inventory?.completeness === "complete") void this.#recordCompletedReading(profileId, readingEvidence);
+    }
     if (!inventory) {
       this.#recordActivity({
         id: `device-disconnected-${Date.now().toString(36)}`,
@@ -4535,13 +4620,61 @@ export class CatalogBrowser {
     };
   }
 
-  #currentBookQuery(): CatalogBookQuery {
+  async setReadingFilter(filter: string): Promise<void> {
+    if (!this.#snapshot.readingEnabled || this.#kindleActionBusy()
+        || !["any", "unread", "in-progress", "read", "unknown"].includes(filter)) return;
+    this.#set({ readingFilter: filter as "any" | KindleReadingStatus, filters: { ...this.#snapshot.filters, offset: 0 } }, "all");
+    await this.reloadBooks();
+  }
+
+  #readingFilterQuery(): { includeBookIds?: string[]; excludeBookIds?: string[] } {
+    const filter = this.#snapshot.readingFilter ?? "any";
+    if (!this.#snapshot.readingEnabled || filter === "any") return {};
+    const entries = [...(this.#snapshot.readingEvidence ?? new Map<string, KindleReadingEvidence>())];
+    return filter === "unknown"
+      ? { excludeBookIds: entries.filter(([, evidence]) => evidence.status !== "unknown").map(([id]) => id) }
+      : { includeBookIds: entries.filter(([, evidence]) => evidence.status === filter).map(([id]) => id) };
+  }
+
+  async #recordCompletedReading(profileId: string, evidence: ReadonlyMap<string, KindleReadingEvidence>): Promise<void> {
+    const ids = completedReadingBookIds(evidence);
+    if (!ids.length) return;
+    const operation = createCatalogOperation("Save Read books membership", this.#settingsMutationTimeoutMs);
+    this.#readingHistoryOperation = operation;
+    try {
+      if (!this.#api.getBookAnnotation || !this.#api.updateBookAnnotation) throw new Error("This server cannot save Read books membership.");
+      for (const id of ids) {
+        operation.signal.throwIfAborted();
+        if (this.#snapshot.filters.profileId !== profileId || this.#snapshot.readingEvidence !== evidence) return;
+        const annotation = await operation.wait(this.#api.getBookAnnotation(profileId, id, operation.signal));
+        operation.signal.throwIfAborted();
+        if (this.#snapshot.filters.profileId !== profileId || this.#snapshot.readingEvidence !== evidence) return;
+        if (annotation.readBook) continue;
+        await operation.wait(this.#api.updateBookAnnotation(profileId, id, { expectedRevision: annotation.revision, readBook: true }, operation.signal));
+      }
+      if (this.#snapshot.filters.profileId === profileId) {
+        this.#set({ readingHistoryError: undefined }, "results");
+        if (this.#snapshot.activeShelf?.id === "builtin-read-books") await this.reloadBooks(true);
+      }
+    } catch (error) {
+      if (this.#snapshot.readingEvidence === evidence && this.#snapshot.filters.profileId === profileId) {
+        this.#set({ readingHistoryError: errorMessage(error, "Some completed books could not be saved. Reconnect to retry.") }, "results");
+      }
+    } finally {
+      operation.dispose();
+      if (this.#readingHistoryOperation === operation) this.#readingHistoryOperation = undefined;
+    }
+  }
+
+  #currentBookQuery(): CatalogBookQuery & { includeBookIds?: string[]; excludeBookIds?: string[] } {
     const shelf = this.#currentSmartShelfQuery();
     return {
       ...catalogQuery(this.#snapshot.filters),
       ...shelf.catalog,
       ...(shelf.personal?.favorite === undefined ? {} : { favorite: shelf.personal.favorite }),
       ...(shelf.personal?.wantToRead === undefined ? {} : { wantToRead: shelf.personal.wantToRead }),
+      ...(shelf.personal?.readBook === undefined ? {} : { readBook: shelf.personal.readBook }),
+      ...this.#readingFilterQuery(),
     };
   }
 
@@ -4762,6 +4895,8 @@ export class CatalogBrowser {
           }
       : { ...initialLibraryFilters(), view: "settings" as const };
     if (profileChanged) {
+      this.#readingHistoryOperation?.abort();
+      this.#snapshot = { ...this.#snapshot, readingEvidence: new Map(), readingFilter: "any", readingHistoryError: undefined };
       this.#profileEpoch += 1;
       this.#bookEpoch += 1;
       this.#profileOperation?.abort();
@@ -4855,6 +4990,8 @@ export class CatalogBrowser {
   }
 
   #downgradeKindleEvidence(liveUpdatesConnected: boolean): void {
+    this.#readingHistoryOperation?.abort();
+    this.#snapshot = { ...this.#snapshot, readingEvidence: retireKindleReadingEvidence(this.#snapshot.readingEvidence ?? new Map()) };
     // Once the event channel is unavailable, a normal search/page request can
     // return a replacement source that retained the same book ID. The prior
     // source-version comparison must therefore stop authorizing a green badge

@@ -27,6 +27,12 @@ The original transfer engine was physically validated on an MTP Kindle with USB 
 
 See the current [`backlog build plan`](outputs/kindle-bridge-backlog-build-plan.md) and [`release-candidate omission audit`](outputs/kindle-bridge-backlog-feature-audit.md) for milestone/evidence status, and [`outputs/kindle-bridge-service-design-plan.md`](outputs/kindle-bridge-service-design-plan.md) for the architecture rationale.
 
+## Reading information and Read books
+
+The **Read books** smart shelf is durable per-profile completion history. Only a unique, current, explicitly Read device observation may automatically add a book. Disconnecting or removing the Kindle copy never removes shelf membership. The server stores only the opaque profile/book membership flag; raw sidecars, percentages, positions, device identity and Kindle timestamps remain browser-local.
+
+Reading progress/status UI, filtering and completion recording are wired behind the existing default-off physical acceptance gates. **Automatic reading detection is not yet enabled:** the current KRDS parser supplies percentage/time evidence, not a proven Kindle Read/Unread flag. Neither 100% progress nor missing data is converted to a completion claim. Physical state/format validation remains necessary before activation. See [the build plan and acceptance status](outputs/onboarding-reading-build-plan.md).
+
 ## Architecture
 
 ```text
@@ -52,6 +58,8 @@ npm run dev
 ```
 
 Open <http://127.0.0.1:5173/>. The development command starts Vite on port 5173 and the catalog API on port 5174, with `/api` proxied by Vite. Development data, cache, and allowed library paths are created under `.kindle-bridge-dev/`.
+
+On an unconfigured installation, the setup wizard guides you through creating a library, choosing a container-visible folder, checking indexing and optionally connecting a Kindle. **Skip for now** is remembered on this server across browsers and restarts; use **Run setup wizard** in Settings to reopen it. Optional provider credentials are never required. Read-only Settings deployments do not automatically launch setup.
 
 In **Settings**:
 

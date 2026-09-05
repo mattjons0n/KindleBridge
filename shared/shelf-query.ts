@@ -11,7 +11,7 @@ const CATALOG_KEYS = [
   "q", "author", "language", "subject", "publisher", "series", "seriesKey", "year",
   "format", "rootId", "metadata", "available", "coverAvailable", "sort", "order",
 ] as const;
-const PERSONAL_KEYS = ["favorite", "wantToRead"] as const;
+const PERSONAL_KEYS = ["favorite", "wantToRead", "readBook"] as const;
 const SORTS: readonly CatalogSort[] = [
   "recent", "title", "author", "published", "size", "added", "updated", "series", "series-index",
 ];
@@ -115,6 +115,7 @@ export function normalizeSmartShelfQuery(value: unknown): SmartShelfQuery {
     const personal: NonNullable<SmartShelfQuery["personal"]> = {};
     assign(personal, "favorite", optionalBoolean(input.favorite, "personal.favorite"));
     assign(personal, "wantToRead", optionalBoolean(input.wantToRead, "personal.wantToRead"));
+    assign(personal, "readBook", optionalBoolean(input.readBook, "personal.readBook"));
     if (Object.keys(personal).length > 0) query.personal = personal;
   }
   if (root.kindleStatus !== undefined) {
@@ -153,5 +154,6 @@ export function smartShelfQueryToBookQuery(query: SmartShelfQuery): BookQuery {
     ...query.catalog,
     ...(query.personal?.favorite === undefined ? {} : { favorite: query.personal.favorite }),
     ...(query.personal?.wantToRead === undefined ? {} : { wantToRead: query.personal.wantToRead }),
+    ...(query.personal?.readBook === undefined ? {} : { readBook: query.personal.readBook }),
   };
 }

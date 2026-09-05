@@ -23,6 +23,25 @@
 
 * { box-sizing: border-box; }
 
+.onboarding-wizard { padding: 24px; margin-bottom: 24px; border: 1px solid var(--border); border-radius: 14px; background: var(--surface); max-width: 780px; }
+.onboarding-wizard h2 { margin: 8px 0 12px; }
+.onboarding-wizard p, .onboarding-wizard li { line-height: 1.6; overflow-wrap: anywhere; }
+.onboarding-actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 20px; }
+.settings-page.settings-onboarding { max-width: 780px; }
+.settings-page.settings-onboarding .settings-layout { grid-template-columns: minmax(0, 1fr); }
+.settings-page.settings-onboarding .settings-page-head,
+.settings-page.settings-onboarding .settings-prototype-notice,
+.settings-page.settings-onboarding .settings-library-picker,
+.settings-page.settings-onboarding .settings-guidance,
+.settings-page.settings-onboarding .settings-editor-head,
+.settings-page.settings-onboarding .settings-delete-button { display: none; }
+.library-reading { display: grid; gap: 4px; margin-top: 7px; color: var(--muted); font-size: 12px; }
+.library-reading-track { height: 4px; border-radius: 2px; overflow: hidden; background: var(--surface-soft); }
+.library-reading-track > span { display: block; height: 100%; background: var(--green); }
+.library-reading-state { color: var(--text); }
+.library-reading-note { color: var(--muted); font-size: 13px; }
+.library-book-row .library-reading { max-width: 180px; }
+
 .sr-only {
   position: absolute;
   width: 1px;

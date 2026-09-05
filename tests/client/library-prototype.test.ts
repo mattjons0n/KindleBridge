@@ -122,6 +122,33 @@ function fakeApi(options: { readonly status?: CatalogServiceStatus } = {}): Cata
   return api;
 }
 
+it("completes setup through validated library configuration, indexing and optional USB", async () => {
+  const api = fakeApi();
+  api.profiles = [];
+  api.getOnboardingState = vi.fn(async () => ({ dismissed: false }));
+  api.setOnboardingDismissed = vi.fn(async () => ({ dismissed: true }));
+  const connect = vi.fn();
+  const browser = new CatalogBrowser(api, { onConnectRequested: connect }, () => {}, undefined);
+  await browser.start();
+  await browser.advanceOnboarding();
+  browser.setSettingsDraft({ ...browser.snapshot.settingsDraft!, name: "" });
+  await browser.saveSettings();
+  expect(browser.snapshot.onboarding?.step).toBe("library");
+  expect(browser.snapshot.settingsError).toBeDefined();
+  const draft = browser.snapshot.settingsDraft!;
+  browser.setSettingsDraft({ ...draft, name: "First library", folders: [{ ...draft.folders[0], path: "/libraries/first", label: "Books" }] });
+  await browser.saveSettings();
+  expect(browser.snapshot.settingsError).toBeUndefined();
+  expect(browser.snapshot.onboarding?.step).toBe("indexing");
+  await browser.advanceOnboarding();
+  expect(browser.snapshot.onboarding?.step).toBe("kindle");
+  expect(connect).not.toHaveBeenCalled();
+  await browser.advanceOnboarding();
+  expect(browser.snapshot.onboarding).toBeUndefined();
+  expect(browser.snapshot.filters.view).toBe("all");
+  browser.dispose();
+});
+
 function click(root: HTMLElement, selector: string): void {
   const element = root.querySelector<HTMLButtonElement>(selector);
   if (!element) throw new Error(`Missing button: ${selector}`);

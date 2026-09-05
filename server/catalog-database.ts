@@ -1502,6 +1502,7 @@ export class CatalogDatabase {
         bookId,
         favorite: false,
         wantToRead: false,
+        readBook: false,
         revision: 0,
         createdAt: null,
         updatedAt: null,
@@ -1527,9 +1528,10 @@ export class CatalogDatabase {
       }
       const favorite = input.favorite ?? (row ? bool(row.favorite) : false);
       const wantToRead = input.wantToRead ?? (row ? bool(row.want_to_read) : false);
+      const readBook = input.readBook ?? (row ? bool(row.read_book) : false);
       const changed = row
-        ? favorite !== bool(row.favorite) || wantToRead !== bool(row.want_to_read)
-        : favorite || wantToRead;
+        ? favorite !== bool(row.favorite) || wantToRead !== bool(row.want_to_read) || readBook !== bool(row.read_book)
+        : favorite || wantToRead || readBook;
       if (!changed) {
         return {
           annotation: row ? this.mapProfileBookAnnotation(row) : this.getProfileBookAnnotation(profileId, bookId),
@@ -1547,12 +1549,12 @@ export class CatalogDatabase {
       const timestamp = now();
       this.database.prepare(
         `INSERT INTO profile_book_annotations(
-           profile_id, book_id, favorite, want_to_read, revision, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, 1, ?, ?)
+           profile_id, book_id, favorite, want_to_read, read_book, revision, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, 1, ?, ?)
          ON CONFLICT(profile_id, book_id) DO UPDATE SET
-           favorite = excluded.favorite, want_to_read = excluded.want_to_read,
+           favorite = excluded.favorite, want_to_read = excluded.want_to_read, read_book = excluded.read_book,
            revision = profile_book_annotations.revision + 1, updated_at = excluded.updated_at`,
-      ).run(profileId, bookId, favorite ? 1 : 0, wantToRead ? 1 : 0, timestamp, timestamp);
+      ).run(profileId, bookId, favorite ? 1 : 0, wantToRead ? 1 : 0, readBook ? 1 : 0, timestamp, timestamp);
       return {
         annotation: this.getProfileBookAnnotation(profileId, bookId),
         applied: true,
@@ -1709,6 +1711,7 @@ export class CatalogDatabase {
       bookId: String(row.book_id),
       favorite: bool(row.favorite),
       wantToRead: bool(row.want_to_read),
+      readBook: bool(row.read_book),
       revision: Number(row.revision),
       createdAt: String(row.created_at),
       updatedAt: String(row.updated_at),
@@ -4598,6 +4601,12 @@ export class CatalogDatabase {
           WHERE annotation.profile_id = pr.profile_id AND annotation.book_id = b.id AND annotation.want_to_read = 1
         )`,
       );
+    }
+    if (query.readBook !== undefined) {
+      where.push(`${query.readBook ? "" : "NOT "}EXISTS (
+        SELECT 1 FROM profile_book_annotations annotation
+        WHERE annotation.profile_id = pr.profile_id AND annotation.book_id = b.id AND annotation.read_book = 1
+      )`);
     }
     if (query.includeBookIds) {
       where.push("b.id IN (SELECT value FROM json_each(?))");

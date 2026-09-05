@@ -8,12 +8,14 @@ export interface BuiltInSmartShelf {
     | "builtin-not-on-kindle"
     | "builtin-favorites"
     | "builtin-want-to-read"
+    | "builtin-read-books"
     | "builtin-missing-cover";
   readonly name: string;
   readonly query: SmartShelfQuery;
 }
 
 export const BUILT_IN_SMART_SHELVES: readonly BuiltInSmartShelf[] = Object.freeze([
+  Object.freeze({ id: "builtin-read-books", name: "Read books", query: Object.freeze({ version: 1, personal: Object.freeze({ readBook: true }) }) }),
   Object.freeze({ id: "builtin-recent", name: "Recently added", query: Object.freeze({ version: 1, catalog: Object.freeze({ sort: "recent", order: "desc" }) }) }),
   Object.freeze({ id: "builtin-not-on-kindle", name: "Not on Kindle", query: Object.freeze({ version: 1, kindleStatus: "not-on-kindle" }) }),
   Object.freeze({ id: "builtin-favorites", name: "Favorites", query: Object.freeze({ version: 1, personal: Object.freeze({ favorite: true }) }) }),

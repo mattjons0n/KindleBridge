@@ -507,6 +507,7 @@ export interface BookQuery {
   favorite?: boolean;
   /** Profile-owned manual state, kept distinct from Kindle evidence. */
   wantToRead?: boolean;
+  readBook?: boolean;
   sort?: CatalogSort;
   order?: SortOrder;
   limit?: number;
@@ -538,6 +539,7 @@ export interface SmartShelfQueryV1 {
   personal?: {
     favorite?: boolean;
     wantToRead?: boolean;
+    readBook?: boolean;
   };
   kindleStatus?: SmartShelfKindleStatus;
 }
@@ -618,6 +620,8 @@ export interface ProfileBookAnnotation {
   bookId: string;
   favorite: boolean;
   wantToRead: boolean;
+  /** Durable completed-book membership, not live Kindle state or progress. */
+  readBook?: boolean;
   revision: number;
   createdAt: string | null;
   updatedAt: string | null;
@@ -627,6 +631,7 @@ export interface ProfileBookAnnotationPatchInput {
   expectedRevision: number;
   favorite?: boolean;
   wantToRead?: boolean;
+  readBook?: boolean;
 }
 
 export interface BookSetQuery extends BookQuery {

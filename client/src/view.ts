@@ -594,6 +594,15 @@ export class AppView {
       if (this.#catalog.snapshot.activityOpen) this.#closeActivityCenter(false);
       void this.#catalog.setView(button.dataset.uiView as LibraryView).then(() => this.#writeCatalogRoute({ bookId: null, seriesKey: null }, "replace"));
     }));
+    const focusSetup = () => window.queueMicrotask(() => {
+      this.#root.querySelector<HTMLElement>('.onboarding-wizard button, #settings-library-name')?.focus();
+    });
+    this.#root.querySelector<HTMLSelectElement>('#library-reading-filter')?.addEventListener("change", (event) => {
+      void this.#catalog.setReadingFilter((event.currentTarget as HTMLSelectElement).value);
+    });
+    this.#root.querySelector<HTMLButtonElement>('[data-ui-action="onboarding-open"]')?.addEventListener("click", () => { void this.#catalog.openOnboarding().then(focusSetup); });
+    this.#root.querySelector<HTMLButtonElement>('[data-ui-action="onboarding-next"]')?.addEventListener("click", () => { void this.#catalog.advanceOnboarding().then(focusSetup); });
+    this.#root.querySelector<HTMLButtonElement>('[data-ui-action="onboarding-skip"]')?.addEventListener("click", () => { void this.#catalog.dismissOnboarding().then(() => this.#root.querySelector<HTMLElement>('#settings-library-name, #library-search')?.focus()); });
     this.#root.querySelectorAll<HTMLButtonElement>('button[data-ui-action="connect-catalog-device"]').forEach((button) => button.addEventListener("click", () => {
       void this.#catalog.requestConnect();
     }));
