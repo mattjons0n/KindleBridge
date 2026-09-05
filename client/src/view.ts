@@ -580,6 +580,10 @@ export class AppView {
       this.#catalog.updateFilter("kindle", (event.currentTarget as HTMLSelectElement).value as KindleFilter);
       this.#writeCatalogRoute({ bookId: null, seriesKey: null }, "replace");
     });
+    this.#root.querySelectorAll<HTMLButtonElement>("button[data-ui-kindle-filter]").forEach((button) => button.addEventListener("click", () => {
+      this.#catalog.updateFilter("kindle", button.dataset.uiKindleFilter as KindleFilter);
+      this.#writeCatalogRoute({ bookId: null, seriesKey: null }, "replace");
+    }));
     this.#root.querySelector<HTMLSelectElement>("#library-sort")?.addEventListener("change", (event) => {
       this.#catalog.updateFilter("sort", (event.currentTarget as HTMLSelectElement).value as LibrarySort);
       this.#writeCatalogRoute({ bookId: null, seriesKey: null }, "replace");
@@ -1792,6 +1796,12 @@ export class AppView {
   }
 
   #refreshCatalogResults(): void {
+    const kindleFilter = this.#catalog.snapshot.filters.kindle;
+    const kindleSelect = this.#root.querySelector<HTMLSelectElement>("#library-kindle-filter");
+    if (kindleSelect) kindleSelect.value = kindleFilter;
+    this.#root.querySelectorAll<HTMLButtonElement>("[data-ui-kindle-filter]").forEach((button) => {
+      button.setAttribute("aria-pressed", String(button.dataset.uiKindleFilter === kindleFilter));
+    });
     const results = this.#root.querySelector<HTMLElement>(".library-results");
     if (!results) return;
     results.innerHTML = renderLibraryResults(this.#state, this.#catalog.snapshot);

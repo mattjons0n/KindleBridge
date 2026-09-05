@@ -180,6 +180,37 @@ afterEach(() => {
 });
 
 describe("catalog-backed library model", () => {
+  it("integrates the modern shell, compact filters and quick tabs without losing catalog actions", async () => {
+    const { root } = await loadedView();
+    document.body.append(root);
+    expect(root.querySelector(".library-sidebar .library-brand")).not.toBeNull();
+    expect(root.querySelector(".library-topbar .library-brand")).toBeNull();
+    expect(root.querySelectorAll('[data-ui-view="settings"]')).toHaveLength(1);
+    expect(root.querySelector('.library-sidebar-bottom [data-ui-view="settings"]')).not.toBeNull();
+    expect(root.querySelector('[data-shelf-id="builtin-read-books"]')).not.toBeNull();
+    for (const id of ["library-author", "library-language", "library-kindle-filter",
+      "library-subject", "library-publisher", "library-series", "library-year",
+      "library-format", "library-root-filter", "library-metadata"]) {
+      expect(root.querySelectorAll("#" + id)).toHaveLength(1);
+      expect(root.querySelector(".library-more-filters #" + id)).not.toBeNull();
+    }
+    const filters = root.querySelector<HTMLDetailsElement>(".library-more-filters")!;
+    filters.open = true;
+    click(root, '[data-ui-kindle-filter="not-on-kindle"]');
+    await vi.waitFor(() => expect(root.querySelector<HTMLSelectElement>("#library-kindle-filter")?.value).toBe("not-on-kindle"));
+    expect(root.querySelector<HTMLDetailsElement>(".library-more-filters")?.open).toBe(true);
+    expect(root.querySelector('[data-ui-kindle-filter="not-on-kindle"]')?.getAttribute("aria-pressed")).toBe("true");
+    click(root, '[data-ui-kindle-filter="all"]');
+    await vi.waitFor(() => expect(root.querySelectorAll(".library-book-card")).toHaveLength(2));
+    expect(root.querySelectorAll(".library-card-actions > .library-send-button")).toHaveLength(2);
+    expect(root.querySelectorAll(".library-book-menu")).toHaveLength(2);
+    expect(root.querySelector(".library-card-actions .library-line-icon")).not.toBeNull();
+    click(root, '[data-ui-action="set-library-layout"][data-layout="list"]');
+    await vi.waitFor(() => expect(root.querySelector(".library-book-list")).not.toBeNull());
+    expect(root.querySelectorAll('[data-ui-action="toggle-book-selection"]')).toHaveLength(2);
+    expect(root.querySelector('[data-ui-action="bulk-remove-from-kindle"]')).not.toBeNull();
+  });
+
   it("writes active shelf routes that survive reload and back/forward for built-in and saved shelves", async () => {
     const customShelf = {
       id: "shelf-holiday", profileId: "prf_personal", name: "Holiday reading",

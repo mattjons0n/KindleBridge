@@ -178,7 +178,7 @@ describe("AppView", () => {
       activeError: error,
     }, callbacks, new DebugLog(), { autoStartCatalog: false });
 
-    const shell = root.querySelector(".library-app-shell");
+    const shell = root.querySelector(".library-app-shell > .library-workspace");
     const topbar = shell?.querySelector(":scope > .library-topbar");
     const alerts = shell?.querySelector(":scope > .library-global-alerts");
     const layout = shell?.querySelector(":scope > .library-layout");

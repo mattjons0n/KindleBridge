@@ -1,6 +1,6 @@
 # Kindle Bridge — Project Handoff
 
-Last updated: 2026-09-04
+Last updated: 2026-09-05
 
 ## Status
 
@@ -158,6 +158,8 @@ Schema v18 adds an installation-wide remembered onboarding dismissal and bounded
 Central browser reading projection, grid/list presentation, status filtering and explicit completion recording are wired, but reading sidecar/presentation rollout remains disabled pending physical acceptance. The current parser has no proven explicit Read/Unread field. Never infer Read from 100%, and never report physical success from tests. See `outputs/onboarding-reading-build-plan.md` for the precise omission/evidence record.
 
 ## Remaining release acceptance
+
+The approved Kindle Bridge Next design is now integrated into the real renderer, not only the separate mockup. `client/src/library-modern.css` provides the responsive light/dark presentation, `library-icons.ts` contains local decorative SVGs, and existing controller/capability flows retain authority. Search facets share a compact disclosure; quick Kindle filters synchronize with partial catalog renders. Settings follows Your shelves. See `outputs/modern-gui-implementation.md` for the scoped omission audit and exact validation result.
 
 Do not infer completion of these checks from automated tests or the local container acceptance:
 

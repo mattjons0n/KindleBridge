@@ -27,6 +27,10 @@ The original transfer engine was physically validated on an MTP Kindle with USB 
 
 See the current [`backlog build plan`](outputs/kindle-bridge-backlog-build-plan.md) and [`release-candidate omission audit`](outputs/kindle-bridge-backlog-feature-audit.md) for milestone/evidence status, and [`outputs/kindle-bridge-service-design-plan.md`](outputs/kindle-bridge-service-design-plan.md) for the architecture rationale.
 
+## Modern library interface
+
+The approved modern design is integrated with the real catalog: a softer sidebar, system light/dark palette, cover-first cards with direct actions, compact filters and quick Kindle-status tabs. Settings stays below Your shelves. Grid/list selection, bulk actions, metadata editing and the original transfer controls remain available. See [GUI implementation and acceptance](outputs/modern-gui-implementation.md).
+
 ## Reading information and Read books
 
 The **Read books** smart shelf is durable per-profile completion history. Only a unique, current, explicitly Read device observation may automatically add a book. Disconnecting or removing the Kindle copy never removes shelf membership. The server stores only the opaque profile/book membership flag; raw sidecars, percentages, positions, device identity and Kindle timestamps remain browser-local.
