@@ -1,4 +1,32 @@
 /* Everyday browsing stays quiet; inspection tools live in Settings. */
+.library-app-shell .library-global-alerts { background: var(--modern-canvas); }
+.library-app-shell .library-reconnect-notice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 16px 24px;
+  padding: 18px 20px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  color: var(--text);
+}
+.library-reconnect-copy { flex: 1 1 320px; min-width: 0; }
+.library-app-shell .library-reconnect-notice strong { color: var(--text); font-size: 14px; font-weight: 600; }
+.library-reconnect-notice p { margin: 5px 0 0; color: var(--muted); font-size: 13px; line-height: 1.6; }
+.library-app-shell .library-reconnect-notice button {
+  flex: none;
+  min-height: 42px;
+  padding: 10px 16px;
+  border: 1px solid var(--border-strong);
+  border-radius: 9px;
+  background: var(--surface-raised);
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+}
+.library-app-shell .library-reconnect-notice button:hover:not(:disabled) { border-color: var(--green); color: var(--green); }
 .library-topbar-status {
   display: flex;
   align-items: center;

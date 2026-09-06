@@ -39,6 +39,24 @@ function readyConversion(): AppState["conversion"] {
   };
 }
 
+function staleSessionState(reason?: "visibility-gap" | "bfcache-restore"): AppState {
+  const message = reason === "visibility-gap"
+    ? "The Kindle connection expired after this page was hidden for 344 seconds. Reconnect the Kindle and let the automatic byte self-test pass before sending."
+    : "The browser-local Kindle session is no longer current. Reconnect the Kindle and let the automatic byte self-test pass before sending.";
+  const error = new AppError("USB_SESSION_STALE", message, {
+    details: reason === "visibility-gap"
+      ? { reason, hiddenMilliseconds: 343879 }
+      : reason ? { reason } : undefined,
+  });
+  return {
+    ...initialAppState(),
+    secureContext: true,
+    webUsbAvailable: true,
+    activeError: error,
+    device: { kind: "error", error },
+  };
+}
+
 async function openTransferDiagnostics(root: HTMLElement): Promise<void> {
   root.querySelector<HTMLButtonElement>('[data-ui-view="settings"]')?.click();
   await vi.waitFor(() => expect(root.querySelector('[data-diagnostic-panel="main"]')).not.toBeNull());
@@ -164,6 +182,83 @@ describe("AppView", () => {
     const inlineError = root.querySelector(".device-error");
     expect(inlineError?.textContent).toContain("USB_MTP_INTERFACE_NOT_FOUND");
     expect(root.querySelector<HTMLButtonElement>('button[data-action="connect"]')?.textContent).toBe("Retry connection");
+  });
+
+  it("offers a simple reconnect notice for an inactive stale session while retaining Settings diagnostics", async () => {
+    const root = document.createElement("div");
+    const callbacks = { ...handlers(), onCatalogConnectRequested: vi.fn() };
+    const state = staleSessionState("visibility-gap");
+    new AppView(root, state, callbacks, new DebugLog(), { autoStartCatalog: false });
+
+    const alerts = root.querySelector(".library-global-alerts");
+    const notice = alerts?.querySelector(".library-reconnect-notice");
+    expect(notice?.getAttribute("role")).toBe("status");
+    expect(notice?.querySelector("strong")?.textContent).toBe("Kindle disconnected");
+    expect(notice?.textContent).toContain("ShelfSend disconnected from your Kindle while this page was inactive. Reconnect to send more books.");
+    for (const technicalDetail of ["USB_SESSION_STALE", "byte self-test", "hiddenMilliseconds", "visibility-gap", "343879", "344 seconds", JSON.stringify(state.activeError?.details)]) {
+      expect(alerts?.textContent).not.toContain(technicalDetail);
+    }
+    expect(alerts?.querySelector('[role="alert"]')).toBeNull();
+    expect(callbacks.onCatalogConnectRequested).not.toHaveBeenCalled();
+    expect(callbacks.onConnect).not.toHaveBeenCalled();
+
+    const reconnect = notice?.querySelector<HTMLButtonElement>('[data-ui-action="connect-catalog-device"]');
+    expect(reconnect?.disabled).toBe(false);
+    reconnect?.click();
+    expect(callbacks.onCatalogConnectRequested).toHaveBeenCalledOnce();
+    expect(callbacks.onConnect).not.toHaveBeenCalled();
+
+    await openTransferDiagnostics(root);
+    const diagnosticError = root.querySelector('[data-diagnostic-panel="transfer-tools"] .device-error');
+    expect(diagnosticError?.textContent).toContain("USB_SESSION_STALE");
+    expect(diagnosticError?.textContent).toContain(state.activeError?.message);
+  });
+
+  it.each(["bfcache-restore", undefined] as const)(
+    "uses a generic reconnect notice for stale session reason %s",
+    (reason) => {
+      const root = document.createElement("div");
+      new AppView(root, staleSessionState(reason), handlers(), new DebugLog(), { autoStartCatalog: false });
+
+      const notice = root.querySelector(".library-global-alerts .library-reconnect-notice");
+      expect(notice?.getAttribute("role")).toBe("status");
+      expect(notice?.textContent).toContain("The Kindle connection has ended. Reconnect to send more books.");
+      expect(notice?.textContent).not.toContain("inactive");
+      expect(notice?.textContent).not.toContain("USB_SESSION_STALE");
+      expect(notice?.textContent).not.toContain("byte self-test");
+    },
+  );
+
+  it("keeps interrupted-write recovery as a separate alert beside a stale session notice", () => {
+    const root = document.createElement("div");
+    const callbacks = handlers();
+    new AppView(root, {
+      ...staleSessionState("visibility-gap"),
+      pendingObjectCleanup: {
+        version: 1,
+        purpose: "catalog",
+        stage: "handle-assigned",
+        filename: "managed-book.azw3",
+        vendorId: 0x1949,
+        productId: 0x9981,
+        storageId: 1,
+        parentHandle: 2,
+        size: 123,
+        handle: 3,
+        operationId: "operation-stale-session-recovery",
+        recordedAt: Date.now(),
+      },
+    }, callbacks, new DebugLog(), { autoStartCatalog: false });
+
+    const alerts = root.querySelector(".library-global-alerts");
+    const recovery = alerts?.querySelector(".recovery-notice");
+    expect(recovery?.getAttribute("role")).toBe("alert");
+    expect(recovery?.textContent).toContain("Interrupted Kindle write");
+    expect(recovery?.textContent).toContain("managed-book.azw3");
+    expect(recovery?.querySelector(".library-reconnect-notice")).toBeNull();
+    expect(alerts?.querySelector(".library-reconnect-notice")?.getAttribute("role")).toBe("status");
+    recovery?.querySelector<HTMLButtonElement>('[data-action="confirm-cleanup-inspection"]')?.click();
+    expect(callbacks.onCleanupInspectionConfirmed).toHaveBeenCalledOnce();
   });
 
   it("redacts serials and converter output in error details", () => {

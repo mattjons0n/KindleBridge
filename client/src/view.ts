@@ -267,8 +267,16 @@ function safeDetails(value: unknown): string {
   }).slice(0, 2_000);
 }
 
-function renderError(state: AppState): string {
+function renderError(state: AppState, deviceActionBusy = false): string {
   if (!state.activeError) return "";
+  if (state.activeError.code === "USB_SESSION_STALE") {
+    const message = state.activeError.details?.reason === "visibility-gap"
+      ? "ShelfSend disconnected from your Kindle while this page was inactive. Reconnect to send more books."
+      : "The Kindle connection has ended. Reconnect to send more books.";
+    const reconnectDisabled = deviceActionBusy || !state.secureContext || !state.webUsbAvailable
+      || !["disconnected", "error"].includes(state.device.kind);
+    return `<section class="notice library-reconnect-notice" role="status"><div class="library-reconnect-copy"><strong>Kindle disconnected</strong><p>${message}</p></div><button type="button" data-ui-action="connect-catalog-device"${reconnectDisabled ? " disabled" : ""}>Reconnect Kindle</button></section>`;
+  }
   return `<div class="notice error" role="alert"><div><strong>${escapeHtml(state.activeError.code)}</strong>${escapeHtml(state.activeError.message)}${state.activeError.details ? `<div>${escapeHtml(safeDetails(state.activeError.details))}</div>` : ""}</div></div>`;
 }
 
@@ -460,7 +468,7 @@ export class AppView {
     const moreFiltersOpen = this.#root.querySelector<HTMLDetailsElement>(".library-more-filters")?.open ?? false;
     const openDiagnostics = new Set([...this.#root.querySelectorAll<HTMLDetailsElement>("details[data-diagnostic-panel][open]")]
       .map((details) => details.dataset.diagnosticPanel));
-    const globalAlerts = `${renderRecovery(state)}${renderError(state)}`;
+    const globalAlerts = `${renderRecovery(state)}${renderError(state, this.#catalog.snapshot.sendBusy || this.#catalog.snapshot.bulkActionBusy)}`;
     const connected = state.device.kind === "ready" || state.device.kind === "transferring" || state.device.kind === "recovering";
     const diagnostics = this.#catalog.snapshot.filters.view === "settings" ? `
       <section class="poc-lab settings-diagnostics" aria-labelledby="poc-lab-title">
