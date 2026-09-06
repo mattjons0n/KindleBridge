@@ -229,6 +229,43 @@ export function renderBookReading(bookId: string, snapshot: CatalogBrowserSnapsh
     : `<small role="status">${escapeHtml(progress.accessibleLabel)}</small>`}${descriptor.stateIndicator ? `<span class="library-reading-state"><span aria-hidden="true">${descriptor.stateIndicator.state === "read" ? "▣" : "▤"}</span> ${escapeHtml(descriptor.stateIndicator.accessibleLabel)}</span>` : ""}</div>`;
 }
 
+function renderInlineSend(book: CatalogBook, snapshot: CatalogBrowserSnapshot): string {
+  if (snapshot.pendingBookId !== book.id || !snapshot.sendPhase || snapshot.pendingUpdate
+    || (snapshot.batchTransfer?.total ?? 1) > 1) return "";
+  const phase = snapshot.sendPhase;
+  const complete = phase === "complete";
+  const cancelled = phase === "cancelled";
+  const failed = phase === "failed";
+  const terminal = complete || cancelled || failed;
+  const progress = complete ? 100 : Math.max(0, Math.min(99, Math.round(snapshot.sendProgress ?? 0)));
+  const canCancel = snapshot.sendBusy && snapshot.sendCancellable && !terminal;
+  const label = complete ? "Sent to Kindle" : cancelled ? "Cancelled" : failed ? "Send failed"
+    : phase === "cancelling" ? "Cancelling…"
+    : phase === "preparing" ? `Preparing ${progress}%`
+    : phase === "converting" ? `Converting ${progress}%`
+    : phase === "validating" ? `Checking ${progress}%`
+    : phase === "verifying" ? `Verifying ${progress}%` : `Sending ${progress}%`;
+  const message = snapshot.sendMessage ?? label;
+  const completionWarning = complete && /retry|recover/i.test(message);
+  const retry = (failed || cancelled) && !snapshot.sendBusy;
+  return `<div class="library-inline-send" data-inline-send-book-id="${escapeHtml(book.id)}">
+    <button type="button" class="library-send-button library-transfer-button${terminal ? ` ${phase}` : ""}" data-ui-action="${canCancel ? "cancel-book-send" : retry ? "retry-book-send" : "send-book"}" data-book-id="${escapeHtml(book.id)}" style="--send-progress:${progress}%" aria-label="${escapeHtml(`${label}: ${book.title}${canCancel ? ". Click to cancel transfer" : retry ? ". Click to try again" : ""}`)}" title="${escapeHtml(message)}"${canCancel || retry ? "" : " disabled"}>
+      <span class="library-transfer-fill" aria-hidden="true"></span><span class="library-transfer-label">${complete ? libraryIcon("check") : ""}${escapeHtml(label)}${canCancel ? '<small> · Cancel</small>' : retry ? '<small> · Retry</small>' : ""}</span>
+    </button>
+    ${terminal ? "" : `<span class="sr-only" role="progressbar" aria-label="${escapeHtml(`Transfer of ${book.title}`)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${progress}" aria-valuetext="${escapeHtml(label)}"></span>`}
+    ${phase === "cancelling" || failed || cancelled || completionWarning ? `<small class="library-inline-send-message" role="${failed ? "alert" : "status"}">${escapeHtml(message)}</small>` : ""}
+  </div>`;
+}
+
+function renderOffCardSend(snapshot: CatalogBrowserSnapshot): string {
+  const book = snapshot.pendingBook;
+  if (!book || !snapshot.sendPhase || (snapshot.batchTransfer?.total ?? 1) > 1 || snapshot.pendingUpdate) return "";
+  const visible = !["settings", "series", "attention"].includes(snapshot.filters.view)
+    && snapshot.page?.items.some(({ id }) => id === book.id);
+  if (visible) return "";
+  return `<section class="library-off-card-send" aria-label="Current book transfer"><strong>${escapeHtml(book.title)}</strong>${renderInlineSend(book, snapshot)}</section>`;
+}
+
 function renderBookCard(book: CatalogBook, snapshot: CatalogBrowserSnapshot, state: AppState): string {
   const actions = bookActionCapabilities(book, state, snapshot);
   const status = actions.kindleStatus;
@@ -259,7 +296,7 @@ function renderBookCard(book: CatalogBook, snapshot: CatalogBrowserSnapshot, sta
         <div class="library-book-meta"><span>${escapeHtml(bookPublishedYear(book))}</span><span>${escapeHtml(book.format.toLocaleUpperCase())}</span><span>${escapeHtml(formatCatalogBytes(book.size))}</span></div>
         <div class="library-tags">${actions.favorite.active ? "<span>★ Favorite</span>" : ""}${actions.wantToRead.active ? "<span>Want to read</span>" : ""}${book.subjects.slice(0, 2).map((subject) => `<span>${escapeHtml(subject)}</span>`).join("")}${book.series ? `<button type="button" data-ui-action="open-series" data-series-key="${escapeHtml(canonicalSeriesKey(book.series))}" title="Open ${escapeHtml(book.series)} in reading order">${escapeHtml(book.series)}</button>` : ""}${book.metadataEdited ? "<span>Metadata edited</span>" : ""}${book.coverEdited ? "<span>Custom cover</span>" : ""}${status === "possible" ? "<span>Possible Kindle match</span>" : ""}${currentUnknown ? "<span>Kindle presence unknown</span>" : ""}</div>
       </div>
-      <div class="library-card-actions"><button type="button" class="library-send-button${confirmed ? " installed" : ""}${disconnectedQueuePrimary ? " queue" : ""}" data-ui-action="${primaryAction}" data-book-id="${escapeHtml(book.id)}"${primaryEnabled ? "" : ` disabled title="${escapeHtml(primaryReason ?? "Unavailable")}"`}>${libraryIcon(confirmed ? "check" : disconnectedQueuePrimary ? "queue" : "send")}<span>${escapeHtml(primaryLabel)}</span></button>${renderBookMenu(book, snapshot, state)}</div>
+      <div class="library-card-actions">${renderInlineSend(book, snapshot) || `<button type="button" class="library-send-button${confirmed ? " installed" : ""}${disconnectedQueuePrimary ? " queue" : ""}" data-ui-action="${primaryAction}" data-book-id="${escapeHtml(book.id)}"${primaryEnabled ? "" : ` disabled title="${escapeHtml(primaryReason ?? "Unavailable")}"`}>${libraryIcon(confirmed ? "check" : disconnectedQueuePrimary ? "queue" : "send")}<span>${escapeHtml(primaryLabel)}</span></button>`}${renderBookMenu(book, snapshot, state)}</div>
     </article>
   `;
 }
@@ -534,6 +571,7 @@ function renderBatchTransferBooks(snapshot: CatalogBrowserSnapshot): string {
 }
 
 function renderSendPreview(state: AppState, snapshot: CatalogBrowserSnapshot): string {
+  if ((snapshot.batchTransfer?.total ?? 1) < 2) return renderOffCardSend(snapshot);
   if (!snapshot.pendingBookId) return "";
   const book = snapshot.pendingBook;
   if (!book) return "";

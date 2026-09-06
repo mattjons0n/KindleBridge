@@ -2010,7 +2010,21 @@ export class AppController {
     }
 
     const epoch = this.#deviceEpoch;
-    const signal = this.#deviceAbort?.signal;
+    const deviceSignal = this.#deviceAbort?.signal;
+    // Preparation is freely abortable, but cancelling a book must not abort
+    // the MTP session needed to remove and verify its newly created object.
+    const preparationAbort = new AbortController();
+    const abortFromDevice = (): void => preparationAbort.abort(deviceSignal?.reason);
+    const abortFromCancel = (): void => preparationAbort.abort(new AppError(
+      "TRANSFER_CANCELLED",
+      "Transfer cancelled before upload; no Kindle file was created.",
+    ));
+    if (deviceSignal?.aborted) abortFromDevice();
+    else deviceSignal?.addEventListener("abort", abortFromDevice, { once: true });
+    if (request.cancelSignal?.aborted) abortFromCancel();
+    else request.cancelSignal?.addEventListener("abort", abortFromCancel, { once: true });
+    const signal = preparationAbort.signal;
+    let uploadStarted = false;
     const operationId = globalThis.crypto?.randomUUID?.()
       ?? `delivery-${Math.max(0, Math.floor(this.#dependencies.now())).toString(36)}-${(++this.#artifactSequence).toString(36)}`;
     this.#hardwareBusy = true;
@@ -2020,6 +2034,7 @@ export class AppController {
       phase: "preparing",
       progress: 0,
       message: "Checking the indexed source bytes",
+      cancellable: request.cancelSignal !== undefined,
     });
 
     try {
@@ -2228,17 +2243,33 @@ export class AppController {
         progress: 25,
         message: "Sending a collision-safe managed filename",
       });
+      signal.throwIfAborted();
+      const recordObjectState = this.#objectStateHandler("catalog", operationId, connection.details);
+      uploadStarted = true;
       const sent = await connection.sendAzW3AndRefreshInventory(
         prepared.blob,
         prepared.filename,
         {
-          signal,
+          signal: deviceSignal,
+          cancelSignal: request.cancelSignal,
           managedToken,
           aggregateTimeoutMs: this.#dependencies.sendOperationTimeoutMs
             ?? bookTransferCommandTimeoutMs(prepared.blob.size),
           commandTimeoutMs: bookTransferCommandTimeoutMs(prepared.blob.size),
           inactivityTimeoutMs: 10_000,
-          onObjectState: this.#objectStateHandler("catalog", operationId, connection.details),
+          onObjectState: (objectState) => {
+            recordObjectState(objectState);
+            if (objectState.stage === "verified") {
+              // This is the commit boundary, before the awaited inventory and
+              // catalog work. A late click must never delete a delivered book.
+              this.#view.setCatalogTransferUpdate({
+                phase: "verifying",
+                progress: 95,
+                message: "Transfer verified; refreshing the library comparison",
+                cancellable: false,
+              });
+            }
+          },
           onProgress: ({ bytesTransferred, totalBytes }) => {
             if (!this.#isActiveConnection(epoch, connection)) return;
             const now = this.#dependencies.now();
@@ -2255,7 +2286,7 @@ export class AppController {
           },
         },
         {
-          signal,
+          signal: deviceSignal,
           aggregateTimeoutMs:
             this.#dependencies.postUploadInventoryTimeoutMs ?? DEFAULT_POST_UPLOAD_INVENTORY_TIMEOUT_MS,
           deviceMetadataCache: "read-write",
@@ -2372,6 +2403,7 @@ export class AppController {
       this.#view.setCatalogTransferUpdate({
         phase: "complete",
         progress: 100,
+        cancellable: false,
         message: request.batch
           ? "Book transferred and verified; batch comparison is deferred until the selected books finish"
           : reconciliationDegraded
@@ -2399,22 +2431,44 @@ export class AppController {
         await this.#retireFaultedConnection(connection, postTransferConnectionError);
       }
     } catch (rawError) {
-      const error = toAppError(rawError, "The catalog book could not be sent");
+      let error = toAppError(rawError, "The catalog book could not be sent");
+      if (!uploadStarted && request.cancelSignal?.aborted && !deviceSignal?.aborted
+        && (rawError === signal.reason || error.code === "CONVERSION_ABORTED")) {
+        error = new AppError(
+          "TRANSFER_CANCELLED",
+          "Transfer cancelled before upload; no Kindle file was created.",
+          { cause: rawError },
+        );
+      }
       const connectionFaulted = this.#connection === connection && (
         (rawError !== null && typeof rawError === "object" && Reflect.get(rawError, "fatal") === true)
         || !connection.readyForSend
       );
-      this.#view.setCatalogTransferUpdate({
-        phase: "failed",
-        message: error.message,
-      });
-      this.log.error(error.message, errorContext(error));
+      if (error.code === "TRANSFER_CANCELLED") {
+        // During MTP only the device layer can confirm exact cleanup. Never
+        // infer a clean cancellation just because the UI's token was aborted.
+        this.#view.setCatalogTransferUpdate({
+          phase: "cancelled",
+          message: error.message,
+          cancellable: false,
+        });
+        this.log.info(error.message, errorContext(error));
+      } else {
+        this.#view.setCatalogTransferUpdate({
+          phase: "failed",
+          message: error.message,
+          cancellable: false,
+        });
+        this.log.error(error.message, errorContext(error));
+      }
       // A fatal MTP command failure faults the underlying transaction stream.
       // Do not leave stale AppState readiness or the browser-wide device lease
       // alive for a retry on a session that can no longer accept commands.
       if (connectionFaulted) await this.#retireFaultedConnection(connection, error);
       throw error;
     } finally {
+      deviceSignal?.removeEventListener("abort", abortFromDevice);
+      request.cancelSignal?.removeEventListener("abort", abortFromCancel);
       this.#conversionPipelineBusy = false;
       this.#finishHardwareOperation();
     }

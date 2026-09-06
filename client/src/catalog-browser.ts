@@ -1,3 +1,4 @@
+import { AppError, toAppError } from "./app-error";
 import {
   CatalogApiError,
   type CatalogApi,
@@ -123,6 +124,7 @@ export interface CatalogBrowserSnapshot {
   readonly sendPhase?: CatalogTransferPhase;
   readonly sendProgress?: number;
   readonly sendMessage?: string;
+  readonly sendCancellable?: boolean;
   readonly batchTransfer?: CatalogBatchTransferState;
   readonly announcement?: string;
   readonly kindleStatus: ReadonlyMap<string, CatalogKindleStatus>;
@@ -270,12 +272,14 @@ export interface CatalogMetadataEditorState {
   };
 }
 
-export type CatalogTransferPhase = "preparing" | "converting" | "validating" | "sending" | "verifying" | "complete" | "failed";
+export type CatalogTransferPhase = "preparing" | "converting" | "validating" | "sending" | "verifying" | "cancelling" | "cancelled" | "complete" | "failed";
 
 export interface CatalogTransferUpdate {
   readonly phase: CatalogTransferPhase;
   readonly progress?: number;
   readonly message?: string;
+  /** False once verified bytes have committed, before post-transfer catalog work. */
+  readonly cancellable?: boolean;
 }
 
 export interface CatalogBatchTransferBook {
@@ -364,6 +368,8 @@ export interface CatalogSendRequest {
   readonly profileId: string;
   readonly book: CatalogBook;
   readonly batch?: CatalogSendBatchContext;
+  /** Cooperative user cancellation, never the hard USB/session abort signal. */
+  readonly cancelSignal?: AbortSignal;
 }
 
 export interface CatalogRemoveTarget {
@@ -639,6 +645,7 @@ export class CatalogBrowser {
   #settingsBaselineFingerprint?: string;
   #sendOperationSequence = 0;
   #activeSendOperation?: number;
+  #singleSendAbort?: AbortController;
   #updateOperationSequence = 0;
   #activeUpdateOperation?: number;
   #batchOperationSequence = 0;
@@ -2948,10 +2955,12 @@ export class CatalogBrowser {
       return;
     }
 
+    this.#singleSendAbort = books.length === 1 ? new AbortController() : undefined;
     const batchId = `catalog-batch-${Date.now().toString(36)}-${(++this.#batchOperationSequence).toString(36)}`;
     const verifiedBooks: CatalogBatchTransferBook[] = [];
     let failed: (CatalogBatchTransferBook & { readonly message: string }) | undefined;
     let failedIndex = -1;
+    let cancelled = false;
     this.#set({
       bulkActionBusy: true,
       bulkActionError: undefined,
@@ -2973,6 +2982,7 @@ export class CatalogBrowser {
         sendPhase: "preparing",
         sendProgress: 0,
         sendMessage: "Checking the indexed source",
+        sendCancellable: books.length === 1,
         batchTransfer: {
           id: batchId,
           position: index + 1,
@@ -3008,15 +3018,18 @@ export class CatalogBrowser {
         }
         book = currentBook;
         this.#snapshot = { ...this.#snapshot, pendingBook: currentBook };
+        this.#singleSendAbort?.signal.throwIfAborted();
         await this.#hooks.onSendRequested({
           profileId: book.profileId,
           book,
           batch: { id: batchId, position: index + 1, total: books.length },
+          ...(this.#singleSendAbort ? { cancelSignal: this.#singleSendAbort.signal } : {}),
         });
         verifiedBooks.push({ id: book.id, title: book.title });
         this.#set({
           sendPhase: "complete",
           sendProgress: 100,
+          sendCancellable: false,
           sendMessage: `“${book.title}” transferred and verified.`,
           batchTransfer: {
             id: batchId,
@@ -3027,6 +3040,7 @@ export class CatalogBrowser {
           },
         }, "all");
       } catch (error) {
+        cancelled = books.length === 1 && toAppError(error).code === "TRANSFER_CANCELLED";
         failedIndex = index;
         failed = {
           id: book.id,
@@ -3036,6 +3050,9 @@ export class CatalogBrowser {
         break;
       }
     }
+
+    this.#singleSendAbort = undefined;
+    this.#snapshot = { ...this.#snapshot, sendCancellable: false };
 
     const retryBooks = failedIndex < 0
       ? []
@@ -3049,8 +3066,8 @@ export class CatalogBrowser {
     };
     if (failed) {
       this.#set({
-        sendPhase: "failed",
-        sendMessage: `Failed on “${failed.title}”: ${failed.message} Finalizing the Kindle comparison for ${verifiedBooks.length} verified ${verifiedBooks.length === 1 ? "book" : "books"}.`,
+        sendPhase: cancelled ? "cancelled" : "failed",
+        sendMessage: cancelled ? failed.message : `Failed on “${failed.title}”: ${failed.message} Finalizing the Kindle comparison for ${verifiedBooks.length} verified ${verifiedBooks.length === 1 ? "book" : "books"}.`,
         batchTransfer: {
           id: batchId,
           position: failedIndex + 1,
@@ -3081,21 +3098,21 @@ export class CatalogBrowser {
       const selectedBookIds = new Set(retryBooks.map(({ id }) => id));
       const verifiedSummary = `${verifiedBooks.length} of ${books.length} ${verifiedBooks.length === 1 ? "book" : "books"} transferred and verified.`;
       const retrySummary = `${retryBooks.length} unsent ${retryBooks.length === 1 ? "book remains" : "books remain"} selected for retry.`;
-      const message = `${verifiedSummary} Failed on “${failed.title}”: ${failed.message} ${retrySummary}`;
+      const message = cancelled ? failed.message : `${verifiedSummary} Failed on “${failed.title}”: ${failed.message} ${retrySummary}`;
       this.#recordActivity({
         id: `transfer-batch-failed-${batchId}`,
-        kind: "failure",
-        tone: "error",
-        title: "Kindle batch stopped",
-        detail: `Failed on “${failed.title}”. ${verifiedBooks.length} of ${books.length} books transferred and verified; ${retryBooks.length} remain for retry.`,
+        kind: cancelled ? "transfer-result" : "failure",
+        tone: cancelled ? "neutral" : "error",
+        title: cancelled ? "Kindle transfer cancelled" : "Kindle batch stopped",
+        detail: cancelled ? message : `Failed on “${failed.title}”. ${verifiedBooks.length} of ${books.length} books transferred and verified; ${retryBooks.length} remain for retry.`,
         ...(books[0] ? { profileId: books[0].profileId } : {}),
         action: dequeueVerified ? "open-queue" : "retry-transfer",
       });
       this.#set({
         bulkActionBusy: false,
-        bulkActionError: message,
+        bulkActionError: cancelled ? undefined : message,
         sendBusy: false,
-        sendPhase: "failed",
+        sendPhase: cancelled ? "cancelled" : "failed",
         sendProgress: Math.round(100 * verifiedBooks.length / books.length),
         sendMessage: message,
         selectedBookIds,
@@ -4134,16 +4151,24 @@ export class CatalogBrowser {
     if (this.#kindleActionBusy()) return;
     const book = this.#snapshot.page?.items.find((candidate) => candidate.id === bookId);
     if (!book) return;
-    this.#set({ pendingBookId: book.id, pendingBook: book, announcement: undefined, sendPhase: undefined, sendProgress: undefined, sendMessage: undefined, batchTransfer: undefined }, "all");
-    // The card action is the user's explicit Send command. Keep the sheet as
-    // live progress/retry UI, but do not require a second confirmation click.
+    this.#set({ pendingBookId: book.id, pendingBook: book, announcement: undefined, sendPhase: undefined, sendProgress: undefined, sendMessage: undefined, sendCancellable: false, batchTransfer: undefined }, "all");
+    // One click starts the send; progress stays on this card.
     void this.confirmSend();
+  }
+
+  cancelSend(bookId: string): void {
+    if (this.#snapshot.pendingBookId !== bookId || !this.#snapshot.sendBusy
+      || !this.#snapshot.sendCancellable || !this.#singleSendAbort
+      || (this.#snapshot.batchTransfer?.total ?? 1) > 1) return;
+    this.#singleSendAbort.abort(new AppError("TRANSFER_CANCELLED", "Transfer cancelled before upload; no Kindle file was created."));
+    this.#set({ sendCancellable: false, sendPhase: "cancelling", sendMessage: "Cancelling… keep Kindle connected until cleanup is verified." }, "all");
   }
 
   closeSend(): void {
     if (this.#kindleActionBusy()) return;
     this.#activeSendOperation = undefined;
-    this.#set({ pendingBookId: undefined, pendingBook: undefined, sendPhase: undefined, sendProgress: undefined, sendMessage: undefined, batchTransfer: undefined, bulkActionError: undefined }, "all");
+    this.#singleSendAbort = undefined;
+    this.#set({ pendingBookId: undefined, pendingBook: undefined, sendPhase: undefined, sendProgress: undefined, sendMessage: undefined, sendCancellable: false, batchTransfer: undefined, bulkActionError: undefined }, "all");
   }
 
   async confirmSend(): Promise<void> {
@@ -4160,9 +4185,10 @@ export class CatalogBrowser {
     }
     const operation = ++this.#sendOperationSequence;
     this.#activeSendOperation = operation;
-    this.#set({ sendBusy: true, sendPhase: "preparing", sendProgress: 0, sendMessage: "Checking the indexed source", batchTransfer: undefined }, "all");
+    this.#singleSendAbort = new AbortController();
+    this.#set({ sendBusy: true, sendPhase: "preparing", sendProgress: 0, sendMessage: "Checking the indexed source", sendCancellable: true, batchTransfer: undefined }, "all");
     try {
-      await this.#hooks.onSendRequested({ profileId, book });
+      await this.#hooks.onSendRequested({ profileId, book, cancelSignal: this.#singleSendAbort.signal });
       if (this.#activeSendOperation !== operation) return;
       this.#activeSendOperation = undefined;
       // Keep the reconciled status intact: the refreshed inventory is the
@@ -4181,6 +4207,7 @@ export class CatalogBrowser {
       });
       this.#set({
         sendBusy: false,
+        sendCancellable: false,
         sendPhase: "complete",
         sendProgress: 100,
         sendMessage: terminalMessage ?? "Transfer verified",
@@ -4190,17 +4217,20 @@ export class CatalogBrowser {
       if (this.#activeSendOperation !== operation) return;
       this.#activeSendOperation = undefined;
       const message = errorMessage(error, "This book could not be sent.");
+      const cancelled = toAppError(error).code === "TRANSFER_CANCELLED";
       this.#recordActivity({
         id: `transfer-failed-${book.id}-${Date.now().toString(36)}`,
-        kind: "failure",
-        tone: "error",
-        title: "Kindle transfer failed",
-        detail: `“${book.title}” was not verified on the Kindle.`,
+        kind: cancelled ? "transfer-result" : "failure",
+        tone: cancelled ? "neutral" : "error",
+        title: cancelled ? "Kindle transfer cancelled" : "Kindle transfer failed",
+        detail: `“${book.title}”: ${message}`,
         profileId,
         bookId: book.id,
         action: "reconnect",
       });
-      this.#set({ sendBusy: false, sendPhase: "failed", sendMessage: message, error: message }, "all");
+      this.#set({ sendBusy: false, sendCancellable: false, sendPhase: cancelled ? "cancelled" : "failed", sendMessage: message, error: cancelled ? undefined : message }, "all");
+    } finally {
+      if (this.#activeSendOperation === undefined) this.#singleSendAbort = undefined;
     }
   }
 
@@ -4208,12 +4238,15 @@ export class CatalogBrowser {
     if (!this.#snapshot.pendingBook && !this.#snapshot.pendingUpdate) return;
     if (
       this.#activeSendOperation === undefined
-      && (this.#snapshot.sendPhase === "complete" || this.#snapshot.sendPhase === "failed")
+      && !this.#snapshot.bulkActionBusy
+      && (this.#snapshot.sendPhase === "complete" || this.#snapshot.sendPhase === "failed" || this.#snapshot.sendPhase === "cancelled")
       && update.phase !== "complete"
       && update.phase !== "failed"
+      && update.phase !== "cancelled"
     ) return;
     const progress = update.progress === undefined ? this.#snapshot.sendProgress : Math.max(0, Math.min(100, update.progress));
-    const terminal = update.phase === "complete" || update.phase === "failed";
+    const terminal = update.phase === "complete" || update.phase === "failed" || update.phase === "cancelled";
+    const cancelling = this.#snapshot.sendPhase === "cancelling" && !terminal;
     // Progress is presentation state only. Kindle status authority belongs to
     // setKindleStatuses/setKindleInventory after reconciliation.
     this.#set({
@@ -4223,9 +4256,10 @@ export class CatalogBrowser {
       sendBusy: this.#snapshot.bulkActionBusy
         ? true
         : this.#activeSendOperation === undefined && this.#activeUpdateOperation === undefined ? !terminal : true,
-      sendPhase: update.phase,
+      sendPhase: cancelling ? "cancelling" : update.phase,
       sendProgress: progress,
-      sendMessage: update.message,
+      sendMessage: cancelling ? this.#snapshot.sendMessage : update.message,
+      sendCancellable: terminal || cancelling ? false : update.cancellable ?? this.#snapshot.sendCancellable,
     }, "all");
   }
 
@@ -4309,6 +4343,12 @@ export class CatalogBrowser {
   }
 
   setKindleInventory(inventory: CatalogKindleInventory | undefined): void {
+    // The completed button is a receipt for this send, not durable presence
+    // authority. A later inventory (removal/reconnect) replaces that receipt.
+    if (!this.#kindleActionBusy() && this.#snapshot.sendPhase === "complete"
+      && (this.#snapshot.batchTransfer?.total ?? 1) === 1) {
+      this.#snapshot = { ...this.#snapshot, sendPhase: undefined, pendingBookId: undefined, pendingBook: undefined };
+    }
     const profileId = this.#snapshot.filters.profileId;
     this.#readingHistoryOperation?.abort();
     if (this.#snapshot.readingEnabled) {

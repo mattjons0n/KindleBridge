@@ -25,6 +25,7 @@ import { DebugLog } from "../../client/src/log";
 import { initialAppState } from "../../client/src/state";
 import { AppView, type AppViewHandlers } from "../../client/src/view";
 import { decodeLibraryRoute } from "../../client/src/library-route";
+import { AppError } from "../../client/src/app-error";
 
 const STATUS: CatalogServiceStatus = {
   available: true,
@@ -170,6 +171,33 @@ async function loadedView(api = fakeApi(), callbacks = handlers()): Promise<{ ro
   const view = new AppView(root, initialAppState(), callbacks, new DebugLog(), { catalogApi: api });
   await vi.waitFor(() => expect(root.querySelector("#library-heading")?.textContent).toBe("Your library"));
   return { root, view, api };
+}
+
+async function loadedSendView(callbacks: AppViewHandlers) {
+  const result = await loadedView(fakeApi(), callbacks);
+  const { view } = result;
+  view.setCatalogKindleStatuses(new Map([
+    ["book_time", "not-on-kindle"], ["book_dorian", "not-on-kindle"],
+  ]), new Map([
+    ["prf_personal", { confirmed: 0, possible: 0, notOnKindle: 2, unknown: 0 }],
+  ]));
+  view.setCatalogKindleInventory({
+    deviceLabel: "Current Kindle",
+    scannedAt: new Date().toISOString(),
+    completeness: "complete",
+    total: 0,
+    truncated: false,
+    metadata: { status: "complete", eligible: 0, enriched: 0, failed: 0, skipped: 0, truncated: false },
+    matching: { status: "complete", matchedProfiles: 1, failedProfiles: 0 },
+    items: [],
+  });
+  view.render({
+    ...initialAppState(),
+    device: { kind: "ready", details: { vendorId: 0x1949, productId: 0x9981 } },
+    selfTest: { kind: "passed", byteLength: 1_012 },
+    catalogInventoryState: "ready",
+  });
+  return result;
 }
 
 afterEach(() => {
@@ -1662,31 +1690,125 @@ describe("real catalog settings and device presentation", () => {
     expect(root.querySelector(".library-device-pagination")).toBeNull();
   });
 
-  it("exposes transfer phases in the real send dialog", async () => {
-    const send = vi.fn(async () => new Promise<void>(() => undefined));
-    const { root, view } = await loadedView(fakeApi(), handlers({ onCatalogSendRequested: send }));
-    view.setCatalogKindleStatuses(new Map([["book_time", "not-on-kindle"]]), new Map([
-      ["prf_personal", { confirmed: 0, possible: 0, notOnKindle: 1, unknown: 1 }],
-    ]));
-    view.setCatalogKindleInventory({
-      deviceLabel: "Current Kindle",
-      scannedAt: new Date().toISOString(),
-      completeness: "complete",
-      total: 0,
-      truncated: false,
-      matching: { status: "complete", matchedProfiles: 1, failedProfiles: 0 },
-      items: [],
-    });
-    view.render({
-      ...initialAppState(),
-      device: { kind: "ready", details: { vendorId: 0x1949, productId: 0x9981 } },
-      selfTest: { kind: "passed", byteLength: 1037 },
-      catalogInventoryState: "ready",
-    });
+  it("shows single-book progress and success on its focused card without a send dialog", async () => {
+    let finishSend!: () => void;
+    const send = vi.fn((_request: CatalogSendRequest) => new Promise<void>((resolve) => { finishSend = resolve; }));
+    const { root, view } = await loadedSendView(handlers({ onCatalogSendRequested: send }));
+    document.body.append(root);
+    root.querySelector<HTMLButtonElement>('[data-book-id="book_time"] [data-ui-action="send-book"]')!.focus();
     click(root, '[data-book-id="book_time"] [data-ui-action="send-book"]');
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0]?.[0].cancelSignal?.aborted).toBe(false);
+    expect(root.querySelector(".library-send-sheet")).toBeNull();
+    expect(root.querySelector(".library-modal-backdrop")).toBeNull();
+
     view.setCatalogTransferUpdate({ phase: "converting", progress: 37, message: "Converting a browser-local copy" });
-    expect(root.querySelector(".library-transfer-status")?.textContent).toContain("Converting a browser-local copy");
-    expect(root.querySelector('[role="progressbar"]')?.getAttribute("aria-valuenow")).toBe("37");
+    const converting = root.querySelector<HTMLButtonElement>(".library-inline-send .library-transfer-button")!;
+    expect(converting.textContent).toContain("Converting 37%");
+    expect(converting.style.getPropertyValue("--send-progress")).toBe("37%");
+    expect(converting.title).toBe("Converting a browser-local copy");
+    expect(document.activeElement).toBe(converting);
+    expect(converting.querySelector('[role="progressbar"]')).toBeNull();
+    expect(root.querySelector('.library-inline-send [role="progressbar"]')?.getAttribute("aria-valuenow")).toBe("37");
+
+    view.setCatalogTransferUpdate({ phase: "sending", progress: 67, message: "Sending bytes" });
+    expect(root.querySelector(".library-transfer-label")?.textContent).toContain("Sending 67%");
+    expect(document.activeElement).toBe(root.querySelector(".library-transfer-button"));
+    view.setCatalogTransferUpdate({ phase: "verifying", progress: 95, message: "Verified; refreshing the catalog", cancellable: false });
+    const committed = root.querySelector<HTMLButtonElement>(".library-transfer-button")!;
+    expect(committed.disabled).toBe(true);
+    expect(root.querySelector('[data-ui-action="cancel-book-send"]')).toBeNull();
+    committed.click();
+    expect(send.mock.calls[0]?.[0].cancelSignal?.aborted).toBe(false);
+
+    finishSend();
+    await vi.waitFor(() => expect(root.querySelector(".library-transfer-label")?.textContent).toContain("Sent to Kindle"));
+    expect(root.querySelector<HTMLButtonElement>(".library-transfer-button")?.disabled).toBe(true);
+    expect(root.querySelector<HTMLElement>(".library-transfer-button")?.style.getPropertyValue("--send-progress")).toBe("100%");
+    expect(root.querySelector(".library-send-sheet")).toBeNull();
+  });
+
+  it("keeps single-book cancellation busy until exact cleanup settles and then offers retry", async () => {
+    let finishSend!: () => void;
+    let failSend!: (error: unknown) => void;
+    const send = vi.fn((_request: CatalogSendRequest) => new Promise<void>((resolve, reject) => {
+      finishSend = resolve;
+      failSend = reject;
+    }));
+    const { root, view } = await loadedSendView(handlers({ onCatalogSendRequested: send }));
+    click(root, '[data-book-id="book_time"] [data-ui-action="send-book"]');
+    view.setCatalogTransferUpdate({ phase: "sending", progress: 62, message: "Sending bytes" });
+    click(root, '[data-ui-action="cancel-book-send"]');
+
+    expect(send.mock.calls[0]?.[0].cancelSignal?.aborted).toBe(true);
+    expect(root.querySelector(".library-transfer-label")?.textContent).toBe("Cancelling…");
+    expect(root.querySelector<HTMLButtonElement>(".library-transfer-button")?.disabled).toBe(true);
+    expect(root.querySelector(".library-inline-send-message")?.textContent).toContain("keep Kindle connected");
+    expect(root.querySelector<HTMLButtonElement>('[data-ui-action="set-library-layout"]')?.disabled).toBe(true);
+    expect(root.querySelector('[data-ui-action="retry-book-send"]')).toBeNull();
+    view.setCatalogTransferUpdate({ phase: "sending", progress: 80, message: "An in-flight USB update" });
+    expect(root.querySelector(".library-transfer-label")?.textContent).toBe("Cancelling…");
+    expect(root.querySelector(".library-inline-send-message")?.textContent).toContain("keep Kindle connected");
+
+    failSend(new AppError("TRANSFER_CANCELLED", "Transfer cancelled; exact cleanup verified."));
+    await vi.waitFor(() => expect(root.querySelector('[data-ui-action="retry-book-send"]')?.textContent).toContain("Cancelled"));
+    expect(root.querySelector<HTMLButtonElement>('[data-ui-action="set-library-layout"]')?.disabled).toBe(false);
+    expect(root.querySelector(".library-inline-send-message")?.textContent).toContain("exact cleanup verified");
+    expect(root.querySelector(".library-send-sheet")).toBeNull();
+    click(root, '[data-ui-action="retry-book-send"]');
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(send.mock.calls[1]?.[0].cancelSignal?.aborted).toBe(false);
+    finishSend();
+    await vi.waitFor(() => expect(root.querySelector(".library-transfer-label")?.textContent).toContain("Sent to Kindle"));
+  });
+
+  it("keeps failed cancellation cleanup visible as Send failed rather than Cancelled", async () => {
+    let failSend!: (error: unknown) => void;
+    const send = vi.fn((_request: CatalogSendRequest) => new Promise<void>((_resolve, reject) => { failSend = reject; }));
+    const { root } = await loadedSendView(handlers({ onCatalogSendRequested: send }));
+    click(root, '[data-book-id="book_time"] [data-ui-action="send-book"]');
+    click(root, '[data-ui-action="cancel-book-send"]');
+    failSend(new AppError("MTP_PARTIAL_OBJECT_CLEANUP_FAILED", "Cleanup could not be verified; reconnect and inspect exact-copy.azw3."));
+
+    await vi.waitFor(() => expect(root.querySelector(".library-transfer-label")?.textContent).toContain("Send failed"));
+    expect(root.querySelector(".library-transfer-label")?.textContent).not.toContain("Cancelled");
+    expect(root.querySelector('.library-inline-send-message[role="alert"]')?.textContent).toContain("exact-copy.azw3");
+    expect(root.querySelector('[data-ui-action="retry-book-send"]')).not.toBeNull();
+    expect(root.querySelector(".library-send-sheet")).toBeNull();
+  });
+
+  it("keeps a single selected list book inline and selected after verified cancellation", async () => {
+    let failSend!: (error: unknown) => void;
+    const send = vi.fn((_request: CatalogSendRequest) => new Promise<void>((_resolve, reject) => { failSend = reject; }));
+    const finishBatch = vi.fn(async () => undefined);
+    const { root, view } = await loadedSendView(handlers({
+      onCatalogSendRequested: send,
+      onCatalogSendBatchFinished: finishBatch,
+    }));
+    click(root, '[data-ui-action="set-library-layout"][data-layout="list"]');
+    const checkbox = root.querySelector<HTMLInputElement>('[data-book-id="book_time"] [data-ui-action="toggle-book-selection"]')!;
+    checkbox.checked = true;
+    checkbox.dispatchEvent(new Event("change", { bubbles: true }));
+    click(root, '[data-ui-action="bulk-send-to-kindle"]');
+    await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+    expect(send.mock.calls[0]?.[0].batch?.total).toBe(1);
+    expect(root.querySelector(".library-send-sheet")).toBeNull();
+    expect(root.querySelector('.library-book-row .library-inline-send')).not.toBeNull();
+    view.setCatalogTransferUpdate({ phase: "sending", progress: 42, message: "Sending selected book" });
+    expect(root.querySelector(".library-transfer-label")?.textContent).toContain("Sending 42%");
+    click(root, '[data-ui-action="cancel-book-send"]');
+    expect(send.mock.calls[0]?.[0].cancelSignal?.aborted).toBe(true);
+    failSend(new AppError("TRANSFER_CANCELLED", "Transfer cancelled; exact cleanup verified."));
+
+    await vi.waitFor(() => expect(root.querySelector(".library-transfer-label")?.textContent).toContain("Cancelled"));
+    expect(root.querySelector<HTMLInputElement>('[data-book-id="book_time"] [data-ui-action="toggle-book-selection"]')?.checked).toBe(true);
+    expect(root.querySelector(".library-bulk-selection")?.textContent).toContain("1 selected");
+    expect(finishBatch).toHaveBeenCalledWith(expect.objectContaining({
+      total: 1,
+      succeeded: [],
+      unsent: [{ id: "book_time", title: "The Time Machine" }],
+    }));
+    expect(root.querySelector(".library-send-sheet")).toBeNull();
   });
 });
 

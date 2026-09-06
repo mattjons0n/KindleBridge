@@ -71,6 +71,8 @@ export interface DeviceRuntimeHooks {
 }
 
 export interface SendBookOptions extends MtpOperationOptions {
+  /** User cancellation drains active MTP I/O, then removes its exact created object. */
+  readonly cancelSignal?: AbortSignal;
   /** Whole-operation wall-clock bound across discovery, collision scan, write, and verification. */
   readonly aggregateTimeoutMs?: number;
   readonly onProgress?: (progress: KindleTransferProgress) => void;

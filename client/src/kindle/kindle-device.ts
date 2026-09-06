@@ -90,6 +90,8 @@ export interface KindleTransferProgress {
 }
 
 export interface KindleSendOptions extends KindleOperationOptions {
+  /** Cooperative user cancellation; never used to interrupt the MTP transaction stream. */
+  readonly cancelSignal?: AbortSignal;
   readonly onProgress?: (progress: KindleTransferProgress) => void;
   /** Stable catalog-derived token embedded in the derivative filename. */
   readonly managedToken?: string;
@@ -572,6 +574,21 @@ export class KindleDevice {
     originalFilename: string,
     options: KindleSendOptions = {},
   ): Promise<KindleBookTransferResult> {
+    let created: KindleCreatedObject | undefined;
+    const throwIfCancelled = (): void => {
+      if (options.cancelSignal?.aborted) {
+        // Before creation there is nothing to remove. After creation, this
+        // error reaches the caller only after the catch below verifies exact
+        // cleanup; a cleanup failure replaces it with recovery information.
+        throw new KindleDeviceError(
+          "TRANSFER_CANCELLED",
+          created
+            ? "Transfer cancelled; the new Kindle file was removed and its absence verified."
+            : "Transfer cancelled before upload; no Kindle file was created.",
+        );
+      }
+    };
+    throwIfCancelled();
     if (blob.size === 0) {
       throw new KindleDeviceError(
         "MTP_INVALID_BOOK",
@@ -598,8 +615,8 @@ export class KindleDevice {
     );
     const { filename } = preflight;
 
-    let created: KindleCreatedObject | undefined;
     try {
+      throwIfCancelled();
       created = await this.store.createObject(
         {
           storageId: target.storageId,
@@ -615,6 +632,10 @@ export class KindleDevice {
         options,
       );
       this.recordCreated(created);
+      // Keep the hard-stop signal separate: interrupting SendObject midway
+      // faults the MTP session and prevents exact-handle cleanup. A user
+      // cancellation instead waits for that transaction to finish first.
+      throwIfCancelled();
       const verifiedInfo = await this.verifyObject(
         {
           handle: created.handle,
@@ -625,6 +646,7 @@ export class KindleDevice {
         },
         options,
       );
+      throwIfCancelled();
       this.inventoryFolderSeed = {
         parentHandle: target.documentsHandle,
         children: Object.freeze([...preflight.children, verifiedInfo]),

@@ -430,6 +430,127 @@ describe("KindleDevice policy", () => {
     });
   });
 
+  describe("cooperative transfer cancellation", () => {
+    it("creates nothing when cancelled before upload or during its read-only preflight", async () => {
+      for (const duringPreflight of [false, true]) {
+        const store = new FakeKindleObjectStore();
+        const cancel = new AbortController();
+        const objectStates = vi.fn();
+        if (duringPreflight) {
+          const getStorageInfo = store.getStorageInfo.bind(store);
+          vi.spyOn(store, "getStorageInfo").mockImplementation(async (...args) => {
+            const result = await getStorageInfo(...args);
+            cancel.abort();
+            return result;
+          });
+        } else {
+          cancel.abort();
+        }
+
+        await expect(kindle(store).sendAzW3(new Blob([Uint8Array.of(1)]), "Book.epub", {
+          cancelSignal: cancel.signal,
+          onObjectState: objectStates,
+        })).rejects.toMatchObject({ code: "TRANSFER_CANCELLED" });
+
+        expect(store.createRequests).toHaveLength(0);
+        expect(store.deletedHandles).toEqual([]);
+        expect(objectStates).not.toHaveBeenCalled();
+        expect(store.objects.has(10)).toBe(true);
+      }
+    });
+
+    it("drains an upload and removes only its created handle without aborting MTP", async () => {
+      const store = new FakeKindleObjectStore();
+      store.objects.set(11, objectInfo(11, { filename: "Existing.azw3", parentHandle: 10 }));
+      const cancel = new AbortController();
+      const connectionAbort = new AbortController();
+      const objectStates = vi.fn();
+      const deleteObject = vi.spyOn(store, "deleteObject");
+
+      await expect(kindle(store).sendAzW3(new Blob([Uint8Array.of(1, 2)]), "Book.epub", {
+        signal: connectionAbort.signal,
+        cancelSignal: cancel.signal,
+        onProgress: () => { cancel.abort(); },
+        onObjectState: objectStates,
+      })).rejects.toMatchObject({ code: "TRANSFER_CANCELLED" });
+
+      expect(connectionAbort.signal.aborted).toBe(false);
+      expect(deleteObject).toHaveBeenCalledWith(100, expect.objectContaining({
+        signal: connectionAbort.signal,
+      }));
+      expect(store.deletedHandles).toEqual([100]);
+      expect(store.objects.has(100)).toBe(false);
+      expect(store.objects.has(10)).toBe(true);
+      expect(store.objects.has(11)).toBe(true);
+      expect(objectStates.mock.calls.map(([entry]) => entry.stage)).toEqual([
+        "send-object-info-intent", "handle-assigned", "cleanup-succeeded",
+      ]);
+    });
+
+    it("removes the created handle when cancellation arrives during metadata verification", async () => {
+      const store = new FakeKindleObjectStore();
+      const cancel = new AbortController();
+      const objectStates = vi.fn();
+      const getObjectInfo = store.getObjectInfo.bind(store);
+      vi.spyOn(store, "getObjectInfo").mockImplementation(async (...args) => {
+        const result = await getObjectInfo(...args);
+        if (args[0] === 100) cancel.abort();
+        return result;
+      });
+
+      await expect(kindle(store).sendAzW3(new Blob([Uint8Array.of(1)]), "Book.epub", {
+        cancelSignal: cancel.signal,
+        onObjectState: objectStates,
+      })).rejects.toMatchObject({ code: "TRANSFER_CANCELLED" });
+
+      expect(store.deletedHandles).toEqual([100]);
+      expect(store.objects.has(100)).toBe(false);
+      expect(objectStates.mock.calls.map(([entry]) => entry.stage)).toEqual([
+        "send-object-info-intent", "handle-assigned", "cleanup-succeeded",
+      ]);
+    });
+
+    it("reports unresolved cleanup instead of claiming cancellation succeeded", async () => {
+      const store = new FakeKindleObjectStore();
+      store.failDelete = true;
+      const cancel = new AbortController();
+      const objectStates = vi.fn();
+
+      await expect(kindle(store).sendAzW3(new Blob([Uint8Array.of(1)]), "Book.epub", {
+        cancelSignal: cancel.signal,
+        onProgress: () => { cancel.abort(); },
+        onObjectState: objectStates,
+      })).rejects.toMatchObject({
+        code: "MTP_PARTIAL_OBJECT_CLEANUP_FAILED",
+        details: {
+          createdHandle: 100,
+          filename: "Book-20260826T123456Z-000000.azw3",
+          originalFailure: expect.objectContaining({ code: "TRANSFER_CANCELLED" }),
+        },
+      });
+
+      expect(store.objects.has(100)).toBe(true);
+      expect(objectStates.mock.calls.map(([entry]) => entry.stage)).toEqual([
+        "send-object-info-intent", "handle-assigned",
+      ]);
+    });
+
+    it("keeps a committed verified delivery when cancellation arrives too late", async () => {
+      const store = new FakeKindleObjectStore();
+      const cancel = new AbortController();
+
+      await expect(kindle(store).sendAzW3(new Blob([Uint8Array.of(1)]), "Book.epub", {
+        cancelSignal: cancel.signal,
+        onObjectState: (event) => {
+          if (event.stage === "verified") cancel.abort();
+        },
+      })).resolves.toMatchObject({ handle: 100, verified: true });
+
+      expect(store.deletedHandles).toEqual([]);
+      expect(store.objects.has(100)).toBe(true);
+    });
+  });
+
   it("supports a current-session self-test followed by multiple sends and inventory refresh", async () => {
     const store = new FakeKindleObjectStore();
     const device = kindle(store);

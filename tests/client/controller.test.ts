@@ -32,6 +32,8 @@ import {
   type ReplacementCleanupRecord,
 } from "../../client/src/replacement-cleanup-journal";
 import { METADATA_CLAIM_BITMAP_BYTES } from "../../shared/catalog-contracts";
+import { AppError } from "../../client/src/app-error";
+import { AppView } from "../../client/src/view";
 
 function claimantSummary(collisions: readonly number[] = [], complete = true): {
   complete: boolean;
@@ -588,6 +590,132 @@ async function managedUpdateHarness(
 afterEach(() => {
   document.body.innerHTML = "";
   window.localStorage.clear();
+});
+
+describe("AppController cooperative catalog cancellation", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it.each(["source download", "conversion"])("cancels %s before creating a Kindle object and permits retry", async (phase) => {
+    const app = harness();
+    await app.controller.connect();
+    const updates = vi.spyOn(AppView.prototype, "setCatalogTransferUpdate");
+    const cancel = new AbortController();
+    let preparationSignal: AbortSignal | undefined;
+    if (phase === "source download") {
+      vi.mocked(app.catalogApi.getBookSource).mockImplementationOnce(async (_profile, _book, signal) => {
+        preparationSignal = signal;
+        return new Promise((_resolve, reject) => signal?.addEventListener("abort", () => reject(signal.reason), { once: true }));
+      });
+    } else {
+      app.convert.mockImplementationOnce(async (_file, signal) => {
+        preparationSignal = signal;
+        return new Promise((_resolve, reject) => signal?.addEventListener("abort", () => {
+          reject(new AppError("CONVERSION_ABORTED", "Conversion was cancelled"));
+        }, { once: true }));
+      });
+    }
+    const sending = app.controller.sendCatalogBook({ profileId: "profile-1", book: app.book, cancelSignal: cancel.signal });
+    const result = expect(sending).rejects.toMatchObject({ code: "TRANSFER_CANCELLED" });
+    await vi.waitFor(() => expect(preparationSignal).toBeDefined());
+    cancel.abort();
+    await result;
+
+    expect(preparationSignal?.aborted).toBe(true);
+    expect(app.connection.sendAzW3AndRefreshInventory).not.toHaveBeenCalled();
+    expect(app.catalogApi.createDelivery).not.toHaveBeenCalled();
+    expect(readPendingObjectCleanup()).toBeUndefined();
+    expect(updates).toHaveBeenLastCalledWith(expect.objectContaining({
+      phase: "cancelled", cancellable: false, message: expect.stringContaining("no Kindle file was created"),
+    }));
+    expect(app.connection.readyForSend).toBe(true);
+    await expect(app.controller.sendCatalogBook({ profileId: "profile-1", book: app.book })).resolves.toBeUndefined();
+  });
+
+  it("keeps the device signal live until cooperative cancellation confirms exact object cleanup", async () => {
+    const app = harness();
+    await app.controller.connect();
+    const updates = vi.spyOn(AppView.prototype, "setCatalogTransferUpdate");
+    const cancel = new AbortController();
+    let deviceSignal: AbortSignal | undefined;
+    vi.mocked(app.connection.sendAzW3).mockImplementationOnce(async (blob, filename, options) => {
+      const object = { storageId: 0x10001, parentHandle: 0x37, filename, size: blob.size, handle: 0x505 };
+      deviceSignal = options?.signal;
+      expect(options?.cancelSignal).toBe(cancel.signal);
+      expect(deviceSignal).not.toBe(cancel.signal);
+      options?.onObjectState?.({ stage: "send-object-info-intent", ...object });
+      options?.onObjectState?.({ stage: "handle-assigned", ...object });
+      await new Promise<void>((resolve) => cancel.signal.addEventListener("abort", () => resolve(), { once: true }));
+      expect(deviceSignal?.aborted).toBe(false);
+      options?.onObjectState?.({ stage: "cleanup-succeeded", ...object });
+      throw new AppError("TRANSFER_CANCELLED", "Transfer cancelled; the new Kindle file was removed and its absence verified.");
+    });
+    const sending = app.controller.sendCatalogBook({ profileId: "profile-1", book: app.book, cancelSignal: cancel.signal });
+    const result = expect(sending).rejects.toMatchObject({ code: "TRANSFER_CANCELLED" });
+    await vi.waitFor(() => expect(readPendingObjectCleanup()?.handle).toBe(0x505));
+    cancel.abort();
+    await result;
+
+    expect(deviceSignal?.aborted).toBe(false);
+    expect(readPendingObjectCleanup()).toBeUndefined();
+    expect(updates).toHaveBeenLastCalledWith(expect.objectContaining({ phase: "cancelled", cancellable: false }));
+    expect(app.catalogApi.createDelivery).not.toHaveBeenCalled();
+    expect(app.connection.disconnect).not.toHaveBeenCalled();
+    expect(app.controller.log.entries.at(-1)?.level).toBe("info");
+  });
+
+  it("does not disguise failed exact cleanup as cancellation when the user token is aborted", async () => {
+    const app = harness();
+    await app.controller.connect();
+    const updates = vi.spyOn(AppView.prototype, "setCatalogTransferUpdate");
+    const cancel = new AbortController();
+    vi.mocked(app.connection.sendAzW3).mockImplementationOnce(async (blob, filename, options) => {
+      options?.onObjectState?.({
+        stage: "handle-assigned", storageId: 0x10001, parentHandle: 0x37, filename, size: blob.size, handle: 0x505,
+      });
+      cancel.abort();
+      throw new AppError("MTP_PARTIAL_OBJECT_CLEANUP_FAILED", "The exact new Kindle file could not be removed; reconnect for recovery.");
+    });
+
+    await expect(app.controller.sendCatalogBook({
+      profileId: "profile-1", book: app.book, cancelSignal: cancel.signal,
+    })).rejects.toMatchObject({ code: "MTP_PARTIAL_OBJECT_CLEANUP_FAILED" });
+
+    expect(readPendingObjectCleanup()?.handle).toBe(0x505);
+    expect(updates).toHaveBeenLastCalledWith(expect.objectContaining({ phase: "failed", cancellable: false }));
+    expect(updates.mock.calls.some(([update]) => update.phase === "cancelled")).toBe(false);
+    expect(app.catalogApi.createDelivery).not.toHaveBeenCalled();
+    await expect(app.controller.sendCatalogBook({ profileId: "profile-1", book: app.book }))
+      .rejects.toMatchObject({ code: "INVALID_STATE" });
+  });
+
+  it("closes cancellation synchronously on verified upload before inventory and ignores a late user abort", async () => {
+    const app = harness();
+    await app.controller.connect();
+    const updates = vi.spyOn(AppView.prototype, "setCatalogTransferUpdate");
+    const cancel = new AbortController();
+    let releaseInventory: (() => void) | undefined;
+    vi.mocked(app.connection.sendAzW3AndRefreshInventory).mockImplementationOnce(async (blob, filename, options, inventoryOptions) => {
+      const transfer = await app.connection.sendAzW3(blob, filename, options);
+      expect(updates).toHaveBeenLastCalledWith(expect.objectContaining({ phase: "verifying", cancellable: false }));
+      expect(inventoryOptions?.signal).toBe(options?.signal);
+      expect(inventoryOptions?.signal).not.toBe(cancel.signal);
+      await new Promise<void>((resolve) => { releaseInventory = resolve; });
+      expect(inventoryOptions?.signal?.aborted).toBe(false);
+      return { transfer, inventory: app.connection.latestInventory, inventoryRefresh: "complete" as const };
+    });
+
+    const sending = app.controller.sendCatalogBook({ profileId: "profile-1", book: app.book, cancelSignal: cancel.signal });
+    await vi.waitFor(() => expect(releaseInventory).toBeDefined());
+    expect(readPendingObjectCleanup()).toBeUndefined();
+    cancel.abort();
+    releaseInventory?.();
+    await expect(sending).resolves.toBeUndefined();
+
+    expect(updates).toHaveBeenLastCalledWith(expect.objectContaining({ phase: "complete", progress: 100, cancellable: false }));
+    expect(updates.mock.calls.some(([update]) => update.phase === "cancelled")).toBe(false);
+    expect(app.catalogApi.createDelivery).toHaveBeenCalledOnce();
+    expect(app.connection.disconnect).not.toHaveBeenCalled();
+  });
 });
 
 describe("AppController local conversion flow", () => {
@@ -2796,7 +2924,7 @@ describe("AppController local conversion flow", () => {
     }
   });
 
-  it("keeps the controller's degraded terminal message in the one-click Send sheet", async () => {
+  it("keeps the controller's degraded terminal message beside the inline Send button", async () => {
     const app = harness(true, { postUploadCatalogTimeoutMs: 20 });
     await vi.waitFor(() => expect(app.root.querySelector('[data-book-id="book-1"]')).not.toBeNull());
     await app.controller.connect();
@@ -2810,8 +2938,10 @@ describe("AppController local conversion flow", () => {
       '[data-book-id="book-1"] [data-ui-action="send-book"]',
     )?.click();
 
-    await vi.waitFor(() => expect(app.root.querySelector(".library-transfer-status")?.textContent)
+    await vi.waitFor(() => expect(app.root.querySelector(".library-inline-send-message")?.textContent)
       .toContain("live catalog matching will retry"));
+    expect(app.root.querySelector(".library-transfer-label")?.textContent).toContain("Sent to Kindle");
+    expect(app.root.querySelector(".library-send-sheet")).toBeNull();
     expect(app.root.textContent).toContain("The transfer of “Book” was verified");
     expect(app.root.textContent).not.toContain("is on the connected Kindle");
   });
@@ -3174,18 +3304,18 @@ describe("AppController local conversion flow", () => {
     sendButton?.click();
 
     await vi.waitFor(() => {
-      expect(app.root.querySelector(".library-transfer-status strong")?.textContent).toContain("Complete");
+      expect(app.root.querySelector(".library-transfer-label")?.textContent).toContain("Sent to Kindle");
     });
+    expect(app.root.querySelector(".library-send-sheet")).toBeNull();
     expect(app.connection.sendAzW3AndRefreshInventory).toHaveBeenCalledOnce();
     expect(app.controller.latestCatalogInventory?.items).toHaveLength(2);
     expect(app.controller.latestCatalogInventory?.items.every(({ match }) => match === "confirmed")).toBe(true);
     const card = app.root.querySelector<HTMLElement>('[data-book-id="book-1"]');
     expect(card?.textContent).not.toContain("Possible Kindle match");
     expect(card?.querySelector('.library-kindle-check[aria-label="Already on this Kindle"]')).not.toBeNull();
-    expect(card?.querySelector<HTMLButtonElement>('[data-ui-action="send-book"]')).toMatchObject({
-      disabled: true,
-      textContent: "✓ On Kindle",
-    });
+    const completedButton = card?.querySelector<HTMLButtonElement>('[data-ui-action="send-book"]');
+    expect(completedButton?.disabled).toBe(true);
+    expect(completedButton?.textContent).toContain("Sent to Kindle");
     await expect(
       app.controller.sendCatalogBook({ profileId: "profile-1", book: app.book }),
     ).rejects.toMatchObject({

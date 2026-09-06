@@ -440,6 +440,9 @@ export class AppView {
   render(state: AppState): void {
     this.#state = state;
     const active = document.activeElement;
+    const transferFocusBookId = active instanceof HTMLButtonElement && this.#root.contains(active)
+      && active.matches('[data-ui-action="send-book"], [data-ui-action="cancel-book-send"], [data-ui-action="retry-book-send"]')
+      ? active.dataset.bookId : undefined;
     const preservedInputFocus = active instanceof HTMLInputElement
       && active.id
       && this.#root.contains(active)
@@ -477,6 +480,10 @@ export class AppView {
     this.#renderAdvancedPartialObjectProbe();
     this.#bindEvents();
     this.#renderLog();
+    if (transferFocusBookId) {
+      [...this.#root.querySelectorAll<HTMLButtonElement>('.library-card-actions button[data-book-id], .library-off-card-send button[data-book-id]')]
+        .find((button) => button.dataset.bookId === transferFocusBookId && !button.disabled)?.focus({ preventScroll: true });
+    }
     const moreFilters = this.#root.querySelector<HTMLDetailsElement>(".library-more-filters");
     if (moreFilters) moreFilters.open = moreFiltersOpen;
     if (preservedInputFocus) {
@@ -975,6 +982,14 @@ export class AppView {
         this.#catalogDialogReturnBookId = bookId;
         this.#catalog.openSend(bookId);
       }
+    }));
+    scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="cancel-book-send"]').forEach((button) => button.addEventListener("click", () => {
+      if (button.dataset.bookId) this.#catalog.cancelSend(button.dataset.bookId);
+    }));
+    scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="retry-book-send"]').forEach((button) => button.addEventListener("click", () => {
+      // Reuse the retained immutable request; the controller revalidates source,
+      // current device comparison and recovery state before any retry writes.
+      if (button.dataset.bookId === this.#catalog.snapshot.pendingBookId) void this.#catalog.confirmSend();
     }));
     scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="update-book-on-kindle"]').forEach((button) => button.addEventListener("click", () => {
       const bookId = button.dataset.bookId;

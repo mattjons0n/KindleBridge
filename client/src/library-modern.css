@@ -183,6 +183,25 @@ body { background: var(--page); }
 .library-send-button:disabled { background: var(--surface-soft); color: var(--muted); opacity: 1; }
 .library-send-button:is(.installed, .queue) { background: var(--surface-soft); color: var(--green); border-color: transparent; }
 .library-send-button:hover:not(:disabled) { background: var(--modern-button-hover); color: var(--modern-button-text); border-color: var(--modern-button-hover); }
+.library-inline-send { min-width: 0; }
+.library-inline-send .library-transfer-button {
+  position: relative; overflow: hidden; isolation: isolate; width: 100%;
+  background: var(--green-soft); color: var(--text); border-color: var(--border);
+}
+.library-transfer-fill {
+  position: absolute; z-index: -1; inset: 0 auto 0 0; width: var(--send-progress, 0%);
+  background: light-dark(#a7e0cc, #245b47); transition: width .2s ease-out;
+}
+.library-transfer-label { display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 3px; }
+.library-transfer-label small { font: inherit; }
+.library-inline-send .library-transfer-button.complete { background: var(--modern-button); color: var(--modern-button-text); }
+.library-transfer-button.complete .library-transfer-fill { background: var(--modern-button); }
+.library-inline-send .library-transfer-button.failed { background: var(--red-soft); color: var(--red); }
+.library-transfer-button:is(.cancelled, .failed) .library-transfer-fill { display: none; }
+.library-inline-send-message { display: block; margin-top: 6px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.library-off-card-send { max-width: 420px; margin: 16px 0; padding: 14px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; }
+.library-off-card-send > strong { display: block; margin-bottom: 8px; }
+@media (prefers-reduced-motion: reduce) { .library-transfer-fill { transition: none; } }
 .library-book-menu > summary { width: 30px; min-height: 38px; border-color: var(--border); background: transparent; color: var(--muted); }
 .library-book-menu > summary:hover { background: var(--surface-raised); }
 .library-book-menu { position: static; }
