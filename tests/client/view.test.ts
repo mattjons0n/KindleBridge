@@ -142,7 +142,8 @@ describe("AppView", () => {
     };
     new AppView(root, state, handlers(), new DebugLog(), { autoStartCatalog: false });
     await openTransferDiagnostics(root);
-    expect(root.querySelector("img")).toBeNull();
+    expect(root.querySelector(".settings-diagnostics img")).toBeNull();
+    expect(root.querySelector("[onerror]")).toBeNull();
     expect(root.textContent).toContain('<img src=x onerror="boom">');
   });
 

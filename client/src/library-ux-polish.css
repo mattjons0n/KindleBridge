@@ -1,4 +1,43 @@
 /* Everyday browsing stays quiet; inspection tools live in Settings. */
+.library-app-shell .library-kindle-photo { display: block; object-fit: contain; }
+.library-app-shell .library-device-icon { flex: none; background: transparent; }
+.library-app-shell .library-device-icon .library-kindle-photo { width: 32px; height: 32px; }
+.library-app-shell .library-kindle-summary {
+  color: var(--text);
+  background: var(--green-soft);
+  border-color: light-dark(#b7d5c7, #355a4b);
+  padding: 14px 18px;
+  gap: 16px;
+}
+.library-app-shell .library-kindle-summary-icon {
+  width: 48px;
+  height: 44px;
+  background: transparent;
+}
+.library-app-shell .library-kindle-summary-icon .library-kindle-photo { width: 48px; height: 44px; }
+.library-app-shell .library-kindle-summary > div:nth-child(2) strong { color: var(--text); font-size: 15px; font-weight: 650; }
+.library-app-shell .library-kindle-summary > div:nth-child(2) span { color: light-dark(#476457, #c1d8cd); font-size: 12px; }
+.library-app-shell .library-kindle-summary-stats { gap: 16px; }
+.library-app-shell .library-kindle-summary-stats span {
+  min-width: 74px;
+  gap: 3px;
+  padding-left: 16px;
+  border-color: light-dark(#b7d5c7, #486b5b);
+  color: light-dark(#476457, #c1d8cd);
+  font-size: 12px;
+}
+.library-app-shell .library-kindle-summary-stats strong { color: var(--text); font-size: 18px; font-weight: 650; line-height: 1.25; }
+.library-app-shell .library-kindle-summary button {
+  min-height: 40px;
+  padding: 9px 14px;
+  border-color: light-dark(#749f89, #749887);
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+}
+.library-app-shell .library-kindle-summary button:hover:not(:disabled) { background: light-dark(#d4e9df, #264c3d); border-color: var(--green); }
+.library-app-shell .library-kindle-summary button:disabled { opacity: 1; color: light-dark(#476457, #c1d8cd); border-style: dashed; cursor: not-allowed; }
 .library-app-shell .library-global-alerts { background: var(--modern-canvas); }
 .library-app-shell .library-reconnect-notice {
   display: flex;

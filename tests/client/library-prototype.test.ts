@@ -22,7 +22,7 @@ import {
 } from "../../client/src/catalog-browser";
 import { catalogQuery, countLibraryBooks, initialLibraryFilters } from "../../client/src/library-prototype";
 import { DebugLog } from "../../client/src/log";
-import { initialAppState, type DeviceState } from "../../client/src/state";
+import { initialAppState, type AppState, type DeviceState } from "../../client/src/state";
 import { AppView, type AppViewHandlers } from "../../client/src/view";
 import { decodeLibraryRoute } from "../../client/src/library-route";
 import { AppError } from "../../client/src/app-error";
@@ -208,6 +208,63 @@ afterEach(() => {
 });
 
 describe("catalog-backed library model", () => {
+  it("shows the Kindle photo and a simple connected label when all connection checks are ready", async () => {
+    const { root } = await loadedSendView(handlers());
+    click(root, '.library-nav [data-ui-view="on-kindle"]');
+    await vi.waitFor(() => expect(root.querySelector(".library-kindle-summary")).not.toBeNull());
+
+    const summary = root.querySelector(".library-kindle-summary")!;
+    const deviceButton = root.querySelector(".library-device-button")!;
+    const summaryPhoto = summary.querySelector<HTMLImageElement>("img.library-kindle-photo");
+    const buttonPhoto = deviceButton.querySelector<HTMLImageElement>("img.library-kindle-photo");
+    expect(summaryPhoto?.getAttribute("src")).toContain("kindle-device.png");
+    expect(buttonPhoto?.getAttribute("src")).toBe(summaryPhoto?.getAttribute("src"));
+    expect(summary.querySelector(".library-kindle-summary-icon")?.textContent?.trim()).toBe("");
+    expect(deviceButton.querySelector("strong")?.textContent).toBe("Kindle connected");
+    expect(summary.querySelector(":scope > div > strong")?.textContent).toBe("Kindle connected");
+    expect(deviceButton.querySelector("small")).toBeNull();
+    expect(summary.querySelector(":scope > div:first-of-type > span")).toBeNull();
+    expect(summary.textContent).not.toContain("checks passed");
+    expect(deviceButton.textContent).not.toContain("checks passed");
+  });
+
+  it("retains connection progress, recovery instructions and inventory problems beside the Kindle photo", async () => {
+    const { root, view } = await loadedSendView(handlers());
+    click(root, '.library-nav [data-ui-view="on-kindle"]');
+    await vi.waitFor(() => expect(root.querySelector(".library-kindle-summary")).not.toBeNull());
+    const state: AppState = {
+      ...initialAppState(),
+      device: { kind: "ready", details: { vendorId: 0x1949, productId: 0x9981 } },
+      selfTest: { kind: "passed", byteLength: 1_012 },
+      catalogInventoryState: "ready",
+    };
+    const pendingObjectCleanup: NonNullable<AppState["pendingObjectCleanup"]> = {
+      version: 1, purpose: "catalog", stage: "handle-assigned", filename: "managed-book.azw3",
+      vendorId: 0x1949, productId: 0x9981, storageId: 1, parentHandle: 2, handle: 3,
+      size: 1_012, operationId: "active-write", recordedAt: Date.now(),
+    };
+    const scenarios: readonly [Partial<AppState>, string, string][] = [
+      [{ postConnectStage: "safe-write", selfTest: { kind: "running" } },
+        "Checking safe writes…", "Checking safe writes…"],
+      [{ postConnectStage: "inventory", catalogInventoryState: "loading" },
+        "Reading Kindle Documents…", "Safe-write passed; reading Documents inventory…"],
+      [{ postConnectStage: "reconciliation" },
+        "Comparing Kindle with library…", "Kindle inventory read; comparing it with this library…"],
+      [{ pendingObjectCleanup, activeObjectWriteId: "active-write" },
+        "Writing to Kindle…", "Writing and verifying the current Kindle file…"],
+      [{ pendingObjectCleanup },
+        "Recovery inspection required", "Inspect and acknowledge the recorded object before safe writes resume"],
+      [{ catalogInventoryState: "failed" },
+        "Kindle inventory unavailable", "Inventory unavailable; disconnect and reconnect to retry"],
+    ];
+    for (const [patch, buttonDetail, summaryDetail] of scenarios) {
+      view.render({ ...state, ...patch });
+      expect(root.querySelector(".library-device-button small")?.textContent).toBe(buttonDetail);
+      expect(root.querySelector(".library-kindle-summary > div:first-of-type > span")?.textContent).toBe(summaryDetail);
+      expect(root.querySelectorAll(".library-device-button img.library-kindle-photo, .library-kindle-summary img.library-kindle-photo")).toHaveLength(2);
+    }
+  });
+
   it("shows On Kindle in Browse only while connected and retains the open view after disconnect", async () => {
     const { root, view } = await loadedView();
     const selector = '.library-nav button[data-ui-view="on-kindle"]';
