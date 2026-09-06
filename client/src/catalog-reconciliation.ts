@@ -60,13 +60,13 @@ export function manualMatchEvidenceKey(profileId: string, bookId: string, itemId
 function manualMatchReason(evidence: KindleMatchEvidence): string {
   switch (evidence) {
     case "delivery-persistent-id": return "A prior verified delivery identity matches, but the current scan is not complete enough to confirm it.";
-    case "delivery-managed-token-size": return "The prior Kindle Bridge token and exact delivered size match, but the current scan is incomplete.";
-    case "managed-token-size": return "The embedded Kindle Bridge token and exact expected size match, but the current scan is incomplete.";
+    case "delivery-managed-token-size": return "The prior ShelfSend token and exact delivered size match, but the current scan is incomplete.";
+    case "managed-token-size": return "The embedded ShelfSend token and exact expected size match, but the current scan is incomplete.";
     case "identifier-title-author": return "The identifier, normalized title, and normalized author all match, but the current scan is incomplete.";
     case "title-author-size": return "The normalized title, normalized author, and exact expected size match, but the current scan is incomplete.";
-    case "managed-token": return "The embedded Kindle Bridge token matches, but an exact size or complete current scan is unavailable.";
+    case "managed-token": return "The embedded ShelfSend token matches, but an exact size or complete current scan is unavailable.";
     case "identifier": return "An ISBN or other identifier matches, but the title and author do not provide enough confirmation.";
-    case "title-author": return "The title and author match, but this file has no Kindle Bridge delivery identity.";
+    case "title-author": return "The title and author match, but this file has no ShelfSend delivery identity.";
     case "filename-similarity": return "The filename resembles this book, but the file has no confirming embedded identity.";
     case "inventory-partial": return "The Kindle scan was incomplete, so this possible match cannot be confirmed.";
     case "none": return "No exact device candidate was found, but the available scan cannot prove that the book is absent.";
@@ -115,7 +115,7 @@ function strongerProofUnavailable(evidence: KindleMatchEvidence, inventoryStatus
     return "A complete current Kindle inventory is required before any match can be authoritative.";
   }
   if (evidence === "identifier" || evidence === "title-author" || evidence === "filename-similarity") {
-    return "No exact prior delivery identity or current Kindle Bridge token was available to corroborate this metadata.";
+    return "No exact prior delivery identity or current ShelfSend token was available to corroborate this metadata.";
   }
   if (evidence === "inventory-partial" || evidence === "none") {
     return "The current evidence cannot identify one exact Kindle file for this catalog book.";
@@ -469,7 +469,7 @@ export async function reconcileCatalogIndexes(
         possibleMatchReviews.set(`${profileId}\u0000${bookId}`, {
           profileId,
           bookId,
-          reason: "This exact Kindle Bridge file is an older presentation of the book, not the current metadata and cover version.",
+          reason: "This exact ShelfSend file is an older presentation of the book, not the current metadata and cover version.",
           evidence: {
             tier: "prior-presentation",
             inventoryCompleteness: snapshot.status,

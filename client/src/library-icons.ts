@@ -1,5 +1,6 @@
 /** Small, local line icons: no network/font dependency or dynamic SVG input. */
 const paths = {
+  shelfSend: '<path d="M3 5h4v13H3zM9 8h4v10H9zM2 21h13M16 5h6m-3-3 3 3-3 3M16 12l3 6"/>',
   book: '<path d="M12 6c-3-2-6-2-9-1v14c3-1 6-1 9 1 3-2 6-2 9-1V5c-3-1-6-1-9 1Z"/><path d="M12 6v14"/>',
   grid: '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
   list: '<path d="M9 5h12M9 12h12M9 19h12M3 5h.01M3 12h.01M3 19h.01"/>',

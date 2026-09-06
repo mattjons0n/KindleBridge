@@ -495,7 +495,7 @@ describe("non-destructive metadata and cover editor", () => {
     expect(root.querySelector('[data-metadata-field-row="publisher"] small')?.textContent).toContain("Source Publisher");
     expect(root.querySelector(".metadata-format-note")?.textContent).toContain("temporary browser-created derivative");
     expect(root.querySelector(".metadata-existing-copy-note")?.textContent).toContain("Kindle update unavailable");
-    expect(root.querySelector(".metadata-existing-copy-note")?.textContent).toContain("Kindle Bridge-managed presentation");
+    expect(root.querySelector(".metadata-existing-copy-note")?.textContent).toContain("ShelfSend-managed presentation");
 
     const publisher = root.querySelector<HTMLInputElement>('input[data-metadata-override="publisher"]')!;
     publisher.checked = false;

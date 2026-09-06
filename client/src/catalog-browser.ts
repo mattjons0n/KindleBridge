@@ -319,7 +319,7 @@ export interface CatalogKindleInventoryItem {
   readonly managed: boolean;
   readonly bookId?: string;
   readonly match: "confirmed" | "possible" | "unmatched";
-  /** Exact prior Kindle Bridge presentation; removable, but never green/current. */
+  /** Exact prior ShelfSend presentation; removable, but never green/current. */
   readonly stalePresentation?: boolean;
   /** Exact live object facts shown in the review surface, never deletion authority. */
   readonly objectFormat?: number;
@@ -2434,7 +2434,7 @@ export class CatalogBrowser {
       this.#set({
         settingsSaving: false,
         settingsError: undefined,
-        announcement: `“${normalized.name}” was saved on the Kindle Bridge server.`,
+        announcement: `“${normalized.name}” was saved on the ShelfSend server.`,
       }, "all");
       this.#settingsDraftDirty = false;
       this.#settingsExternallyChanged = false;
@@ -3332,10 +3332,10 @@ export class CatalogBrowser {
           profileId: activeProfileId ?? "",
           bookId: reviewBookId,
           reason: item?.stalePresentation
-            ? "This is an exact older Kindle Bridge presentation, not the book's current metadata and cover version."
+            ? "This is an exact older ShelfSend presentation, not the book's current metadata and cover version."
             : inventory?.completeness !== "complete"
               ? "The Kindle scan is incomplete, so absence and an exact device candidate cannot be established yet."
-              : "Kindle Bridge could not finish an authoritative comparison for this book.",
+              : "ShelfSend could not finish an authoritative comparison for this book.",
           evidence: {
             tier: item?.stalePresentation ? "prior-presentation" as const : "reconciliation-incomplete" as const,
             inventoryCompleteness: inventory?.completeness ?? "last-seen" as const,
@@ -3946,7 +3946,7 @@ export class CatalogBrowser {
       || !versionReady
       || !prior) {
       this.#set({
-        announcement: "Update is available only for an edited EPUB with exactly one current prior Kindle Bridge-managed copy.",
+        announcement: "Update is available only for an edited EPUB with exactly one current prior ShelfSend-managed copy.",
       }, "all");
       return;
     }

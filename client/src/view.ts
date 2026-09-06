@@ -284,7 +284,7 @@ function renderRecovery(state: AppState): string {
   const canClean = state.device.kind === "ready"
     && state.selfTest.kind === "passed"
     && state.catalogInventoryState === "ready";
-  const replacementNotice = `<section class="notice error recovery-notice" role="alert"><div class="grow"><strong>Verified replacement needs exact cleanup</strong>${replacements.length === 1 ? "One replacement recovery task remains." : `${replacements.length} replacement recovery tasks remain.`} Connect the matching Kindle and use the explicit action below. Kindle Bridge will first rebuild a complete inventory and revalidate both exact objects; it will never delete from this reminder alone.<ul>${replacements.map((record) => {
+  const replacementNotice = `<section class="notice error recovery-notice" role="alert"><div class="grow"><strong>Verified replacement needs exact cleanup</strong>${replacements.length === 1 ? "One replacement recovery task remains." : `${replacements.length} replacement recovery tasks remain.`} Connect the matching Kindle and use the explicit action below. ShelfSend will first rebuild a complete inventory and revalidate both exact objects; it will never delete from this reminder alone.<ul>${replacements.map((record) => {
     const deliveryMissing = record.reason === "delivery-recording";
     return `<li><span><code>${escapeHtml(record.oldCopy.filename)}</code><br><small>${deliveryMissing ? `Unrecorded replacement: ${escapeHtml(record.newCopy.filename)}. The safe recovery removes only that new copy and retains this prior copy.` : `Replacement kept: ${escapeHtml(record.newCopy.filename)}`}</small></span><button type="button" data-action="cleanup-managed-replacement" data-cleanup-operation-id="${escapeHtml(record.operationId)}"${canClean ? "" : " disabled"}>${canClean ? deliveryMissing ? "Remove unrecorded replacement" : "Remove exact older copy" : "Connect and finish checks"}</button></li>`;
   }).join("")}</ul></div></section>`;
@@ -463,7 +463,7 @@ export class AppView {
             <div class="poc-lab-intro"><span class="local-badge">No Calibre · no cloud</span><p>The catalog above uses the private Docker catalog service. These controls preserve the physically proven single-book transfer path.</p></div>
             <ol class="gate-rail" aria-label="POC gates">${renderGateRail(state)}</ol>
             <div class="main-content">
-        ${!state.secureContext ? '<div class="notice error"><div><strong>Secure context required</strong>Open Kindle Bridge through trusted HTTPS or its localhost development URL.</div></div>' : ""}
+        ${!state.secureContext ? '<div class="notice error"><div><strong>Secure context required</strong>Open ShelfSend through trusted HTTPS or its localhost development URL.</div></div>' : ""}
         ${!state.webUsbAvailable ? '<div class="notice error"><div><strong>WebUSB unavailable</strong>Use Chrome or another compatible Chromium browser.</div></div>' : ""}
         <div class="grid">${renderConversion(state, this.#catalog.snapshot.sendBusy)}${renderDevice(state)}${renderTransfer(state)}${renderProfile(state, this.#profileDraft)}
           <section class="panel panel-wide"><details class="diagnostics"><summary>Developer diagnostics</summary><div class="log-toolbar"><button type="button" data-action="copy-log">Copy debug log</button></div><pre class="debug-log" id="debug-log"></pre></details></section>

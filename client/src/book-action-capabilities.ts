@@ -208,7 +208,7 @@ export function bookActionCapabilities(
             : staleManagedPresentation === undefined
               ? claimedKindleItems.length > 1
                 ? "More than one Kindle file claims this book; resolve the ambiguity first"
-                : "Update requires exactly one prior Kindle Bridge-managed presentation"
+                : "Update requires exactly one prior ShelfSend-managed presentation"
               : !connected
                 ? "Connect the Kindle to update this book"
                 : "Complete the Kindle safety and inventory checks first";

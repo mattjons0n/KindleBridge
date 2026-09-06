@@ -977,7 +977,7 @@ describe("real catalog settings and device presentation", () => {
     expect(root.querySelector<HTMLButtonElement>('button[data-ui-action="cancel-library-settings"]')?.disabled).toBe(true);
 
     release();
-    await vi.waitFor(() => expect(root.textContent).toContain("was saved on the Kindle Bridge server"));
+    await vi.waitFor(() => expect(root.textContent).toContain("was saved on the ShelfSend server"));
     expect(root.querySelector<HTMLInputElement>("#settings-library-name")?.value).toBe("Saved after wait");
   });
 
@@ -989,7 +989,7 @@ describe("real catalog settings and device presentation", () => {
     setInput(root.querySelector("#settings-library-name"), "Wife's updated library");
     click(root, 'button[data-ui-action="save-library-settings"]');
 
-    await vi.waitFor(() => expect(root.textContent).toContain("was saved on the Kindle Bridge server"));
+    await vi.waitFor(() => expect(root.textContent).toContain("was saved on the ShelfSend server"));
     expect(view.activeCatalogProfileId).toBe("prf_personal");
     expect(window.localStorage.getItem("kindle-bridge.active-profile")).toBe("prf_personal");
     expect(api.profiles.find((profile) => profile.id === "prf_wife")?.name).toBe("Wife's updated library");
@@ -1202,7 +1202,7 @@ describe("real catalog settings and device presentation", () => {
     const [input, idempotencyKey] = vi.mocked(api.saveConfiguration).mock.calls[0];
     expect(input).toMatchObject({ profile: { name: "Research shelf" }, roots: [{ path: "/libraries/research", recursive: true, watch: true, enabled: true }] });
     expect(idempotencyKey).toMatch(/^catalog-config-/u);
-    await vi.waitFor(() => expect(root.textContent).toContain("was saved on the Kindle Bridge server"));
+    await vi.waitFor(() => expect(root.textContent).toContain("was saved on the ShelfSend server"));
   });
 
   it("reuses the same configuration idempotency key when a committed mutation is retried after refresh failure", async () => {

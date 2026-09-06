@@ -295,7 +295,7 @@ function managedOldCopyFromInventory(
   try {
     managedToken = normalizeManagedFilenameToken(evidence.managedToken);
   } catch {
-    throw new SafeKindleUpdateError("OLD_COPY_NOT_MANAGED", "Update requires an exact KindleBridge-managed prior copy.");
+    throw new SafeKindleUpdateError("OLD_COPY_NOT_MANAGED", "Update requires an exact ShelfSend-managed prior copy.");
   }
   if (inventory.status !== "complete") {
     throw new SafeKindleUpdateError("INVENTORY_INCOMPLETE", "Update requires a complete current Kindle inventory.");
@@ -323,7 +323,7 @@ function managedOldCopyFromInventory(
   ) {
     throw new SafeKindleUpdateError(
       "OLD_COPY_NOT_MANAGED",
-      "Update requires one unchanged, direct-child KindleBridge-managed prior copy from the current inventory.",
+      "Update requires one unchanged, direct-child ShelfSend-managed prior copy from the current inventory.",
     );
   }
   return {
@@ -757,7 +757,7 @@ export class ConnectedKindle {
     } catch {
       return Promise.reject(new SafeKindleUpdateError(
         "INVALID_UPDATE_ARTIFACT",
-        "The prepared replacement does not contain a valid KindleBridge managed token.",
+        "The prepared replacement does not contain a valid ShelfSend managed token.",
       ));
     }
     if (prepared.blob.size <= 0 || prepared.blob.size > 0xffff_ffff) {

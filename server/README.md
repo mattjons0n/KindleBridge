@@ -1,4 +1,4 @@
-# Kindle Bridge catalog service
+# ShelfSend catalog service
 
 The catalog service is a vendor-neutral Node.js HTTP service. SQLite stores durable profile/root configuration, delivery history, and user-authored metadata overlays plus a rebuildable search index. Original ebook directories are only read. Extracted cover files are derived cache entries written atomically under `/cache`; user-selected replacement covers are durable assets under `/data/metadata-covers`.
 

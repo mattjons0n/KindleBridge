@@ -434,7 +434,7 @@ function manualCleanupInstruction(error: AppError): string | undefined {
   if (typeof nextAction === "string") return nextAction;
   const filename = error.details?.filename;
   const handle = error.details?.createdHandle;
-  return `Remove only the Kindle Bridge-created object${typeof filename === "string" ? ` ${filename}` : ""}${typeof handle === "number" ? ` (handle 0x${handle.toString(16)})` : ""}.`;
+  return `Remove only the ShelfSend-created object${typeof filename === "string" ? ` ${filename}` : ""}${typeof handle === "number" ? ` (handle 0x${handle.toString(16)})` : ""}.`;
 }
 
 function errorContext(error: AppError): Readonly<Record<string, unknown>> {
@@ -1578,7 +1578,7 @@ export class AppController {
         "OLD_COPY_NOT_MANAGED",
         claims.length > 1
           ? "More than one Kindle object claims this book. Resolve the ambiguity before updating."
-          : "Update requires exactly one current prior KindleBridge-managed presentation. Possible or manual-only files cannot be replaced.",
+          : "Update requires exactly one current prior ShelfSend-managed presentation. Possible or manual-only files cannot be replaced.",
       );
     }
 

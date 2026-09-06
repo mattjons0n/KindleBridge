@@ -36,7 +36,7 @@ export class KindleDeviceLeaseError extends Error {
   readonly code = "KINDLE_DEVICE_BUSY" as const;
 
   constructor() {
-    super("Another Kindle Bridge tab or operation already holds the Kindle device lease.");
+    super("Another ShelfSend tab or operation already holds the Kindle device lease.");
     this.name = "KindleDeviceLeaseError";
   }
 }

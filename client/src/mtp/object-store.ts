@@ -777,7 +777,7 @@ export class MtpObjectStore {
     ) {
       throw new MtpObjectStoreError(
         "MTP_OBJECT_DELETE_MISMATCH",
-        `object 0x${handle.toString(16).padStart(8, "0")} is not a bounded root-level Kindle Bridge metadata cache`,
+        `object 0x${handle.toString(16).padStart(8, "0")} is not a bounded root-level ShelfSend metadata cache`,
       );
     }
     const data = await this.readObject(handle, {
@@ -798,7 +798,7 @@ export class MtpObjectStore {
     } catch (error) {
       throw new MtpObjectStoreError(
         "MTP_OBJECT_DELETE_MISMATCH",
-        `object 0x${handle.toString(16).padStart(8, "0")} is not a valid Kindle Bridge metadata cache`,
+        `object 0x${handle.toString(16).padStart(8, "0")} is not a valid ShelfSend metadata cache`,
         error,
       );
     }
