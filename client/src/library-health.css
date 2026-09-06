@@ -1,0 +1,126 @@
+/* Everyday library review. Theme tokens pair every surface with legible text. */
+.library-app-shell .health-page { gap: 24px; }
+.library-app-shell .health-page .attention-page-head { align-items: center; gap: 24px; }
+.library-app-shell .health-page .attention-page-head h1 { margin: 0 0 10px; font-size: clamp(28px, 3vw, 36px); line-height: 1.15; }
+.library-app-shell .health-page .attention-page-head p { max-width: 560px; font-size: 13px; line-height: 1.65; }
+.library-app-shell .health-review-count { display: grid; flex: none; min-width: 98px; padding: 15px 20px; border: 1px solid var(--border); border-radius: 14px; background: var(--surface); text-align: center; }
+.library-app-shell .health-review-count strong { color: var(--green); font-size: 28px; font-weight: 600; line-height: 1.2; }
+.library-app-shell .health-review-count span { margin-top: 4px; color: var(--muted); font-size: 12px; }
+.library-app-shell .health-page :is(button, select) { min-height: 40px; padding: 9px 13px; font-size: 12px; line-height: 1.4; }
+.library-app-shell .health-page :is(button:not(.primary), select) { background: var(--surface); color: var(--text); border-color: var(--border); }
+.library-app-shell .health-page button:not(.primary):hover:not(:disabled) { background: var(--surface-raised); border-color: var(--border-strong); }
+.library-app-shell .health-filter-bar { display: flex; align-items: end; flex-wrap: wrap; gap: 12px; padding-bottom: 4px; }
+.library-app-shell .health-filter-bar label { display: grid; gap: 6px; min-width: 0; font-size: 12px; font-weight: 500; }
+.library-app-shell .health-filter-bar label > span { color: var(--muted); }
+.library-app-shell .health-filter-bar > label select { min-width: 235px; }
+.library-app-shell .health-filter-bar > button { margin-left: auto; }
+.library-app-shell .health-extra-filters { position: relative; padding: 0; border: 0; }
+.library-app-shell .health-extra-filters > summary { display: list-item; min-height: 40px; padding: 10px 6px; color: var(--muted); cursor: pointer; font-size: 12px; }
+.library-app-shell .health-extra-filters > div { display: flex; flex-wrap: wrap; align-items: end; gap: 18px; margin-top: 8px; }
+.library-app-shell .health-extra-filters[open] { flex: 1 1 350px; }
+.library-app-shell .health-extra-filters[open] > summary { padding-top: 0; min-height: 0; }
+.library-app-shell .health-filter-bar .health-dismissed-toggle { display: flex; align-items: center; gap: 8px; min-height: 40px; }
+.library-app-shell .health-dismissed-toggle input { width: 17px; height: 17px; min-height: 17px; padding: 0; margin: 0; }
+.library-app-shell .health-issue-list { gap: 16px; }
+.library-app-shell .health-issue { overflow: hidden; border-radius: 16px; box-shadow: none; }
+.library-app-shell .health-issue-main { display: flex; align-items: flex-start; gap: 17px; padding: 24px; }
+.library-app-shell .health-issue-icon { display: grid; flex: none; width: 46px; height: 54px; place-items: center; border: 1px solid var(--border); border-radius: 9px; background: var(--surface-soft); color: var(--muted); }
+.library-app-shell .health-issue-icon svg { width: 22px; height: 22px; }
+.library-app-shell .health-issue-copy { flex: 1; min-width: 0; }
+.library-app-shell .health-issue-label { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 7px; color: var(--muted); font-size: 11px; font-weight: 600; }
+.library-app-shell .health-issue[data-severity="error"] .health-issue-label { color: light-dark(#a62f32, #ffb0b3); }
+.library-app-shell .health-issue h2 { margin: 0; color: var(--text); font-family: inherit; font-size: 17px; font-weight: 600; line-height: 1.35; letter-spacing: -.25px; overflow-wrap: anywhere; }
+.library-app-shell .health-issue-author { display: block; margin-top: 4px; color: var(--muted); font-size: 12px; }
+.library-app-shell .health-issue-copy p { max-width: 590px; margin: 12px 0 0; color: var(--muted); font-size: 13px; line-height: 1.65; }
+.library-app-shell .health-issue-action { flex: none; align-self: center; max-width: 200px; }
+.library-app-shell .health-primary-action { width: 100%; }
+.library-app-shell .health-dismissed-label { padding: 3px 7px; border-radius: 5px; color: var(--muted); background: var(--surface-soft); font-weight: 400; }
+.library-app-shell .health-issue-details { border-top: 1px solid var(--border); }
+.library-app-shell .health-issue-details > summary { display: list-item; padding: 13px 24px; color: var(--muted); font-size: 12px; cursor: pointer; }
+.library-app-shell .health-details-body { display: grid; gap: 16px; padding: 4px 24px 24px; }
+.library-app-shell .health-secondary-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.library-app-shell .health-option-note { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.6; }
+.library-app-shell .health-source-details { display: grid; gap: 14px; padding: 18px; margin: 0; border-radius: 10px; background: var(--surface-soft); }
+.library-app-shell .health-source-details > div { display: grid; grid-template-columns: 140px minmax(0, 1fr); gap: 12px; }
+.library-app-shell .health-source-details dt { font-size: 12px; color: var(--muted); }
+.library-app-shell .health-source-details dd { display: grid; gap: 4px; margin: 0; color: var(--text); font-size: 12px; overflow-wrap: anywhere; }
+.library-app-shell .health-source-details :is(code, time) { color: var(--muted); font-size: 11px; white-space: normal; }
+.library-app-shell .health-duplicate-review { margin: -4px 24px 20px 87px; }
+.library-app-shell .health-compare-action { display: flex; justify-content: space-between; align-items: center; gap: 16px; width: fit-content; min-height: 40px; padding: 9px 14px; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--surface-soft); color: var(--text); font-size: 12px; font-weight: 600; cursor: pointer; list-style: none; }
+.library-app-shell .health-compare-action::-webkit-details-marker { display: none; }
+.library-app-shell .health-duplicate-review[open] > summary span { transform: rotate(180deg); }
+.library-app-shell .health-duplicate-body > p { margin: 15px 0; font-size: 12px; line-height: 1.6; }
+.library-app-shell .health-duplicate-entries { margin: 0; padding: 0; border: 1px solid var(--border); border-radius: 10px; list-style: none; overflow: hidden; }
+.library-app-shell .health-duplicate-entries li { display: flex; align-items: center; gap: 12px; padding: 16px; }
+.library-app-shell .health-duplicate-entries li + li { border-top: 1px solid var(--border); }
+.library-app-shell .health-duplicate-entries li[data-preferred="true"] { background: var(--green-soft); }
+.library-app-shell .health-entry-number { display: grid; flex: none; width: 26px; height: 26px; place-items: center; color: var(--muted); background: var(--surface-soft); border-radius: 50%; font-size: 11px; }
+.library-app-shell .health-entry-info { display: grid; flex: 1; min-width: 0; gap: 4px; }
+.library-app-shell .health-entry-info strong { font-size: 13px; overflow-wrap: anywhere; }
+.library-app-shell .health-entry-info > span { color: var(--muted); font-size: 12px; }
+.library-app-shell .health-entry-info small { font-size: 11px; overflow-wrap: anywhere; }
+.library-app-shell .health-entry-info .health-preferred-label { margin-top: 4px; color: var(--green); font-weight: 600; }
+.library-app-shell .health-entry-actions { display: flex; flex-wrap: wrap; justify-content: end; flex: 0 1 155px; gap: 7px; }
+.library-app-shell .health-entry-actions button { min-height: 36px; font-size: 11px; }
+.library-app-shell .health-entry-actions [aria-pressed="true"] { background: var(--green-soft); color: var(--green); border-color: var(--green); }
+.library-app-shell .health-empty { display: grid; justify-items: center; align-content: center; gap: 10px; min-height: 260px; padding: 32px; border: 1px dashed var(--border-strong); border-radius: 16px; text-align: center; }
+.library-app-shell .health-empty-icon { display: grid; place-items: center; width: 42px; height: 42px; border-radius: 50%; color: var(--green); background: var(--green-soft); font-size: 20px; }
+.library-app-shell .health-empty h2 { margin: 5px 0 0; font-family: inherit; font-size: 18px; }
+.library-app-shell .health-empty p { max-width: 420px; margin: 0; font-size: 13px; line-height: 1.6; }
+.library-app-shell .health-error { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; padding: 15px; border: 1px solid light-dark(#dfb4b6, #783337); border-radius: 10px; background: light-dark(#fff1f1, #3b2022); color: light-dark(#a62f32, #ffb0b3); font-size: 13px; }
+.library-app-shell .health-searches { border-top: 1px solid var(--border); }
+.library-app-shell .health-searches > summary { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 20px 0 0; cursor: pointer; color: var(--text); font-size: 13px; font-weight: 500; }
+.library-app-shell .health-searches > summary span { color: var(--muted); font-size: 12px; font-weight: 400; }
+.library-app-shell .health-searches-body { display: grid; gap: 16px; padding-top: 20px; }
+.library-app-shell .health-searches .attention-section-head h2 { font-family: inherit; font-size: 17px; }
+.library-app-shell .health-searches :is(p, .attention-section-head p, .metadata-job-detail > header p, .metadata-job-safety) { font-size: 12px; line-height: 1.6; }
+.library-app-shell .health-searches .metadata-job-list > button { grid-template-columns: minmax(0, 1fr) auto auto; gap: 12px; padding: 14px; }
+.library-app-shell .health-searches .metadata-job-list > button[aria-current="true"] { background: var(--green-soft); }
+.library-app-shell .health-searches .metadata-job-list :is(strong, small, em),
+.library-app-shell .health-searches .metadata-job-entries :is(strong, small) { font-size: 12px; }
+.library-app-shell .health-searches .metadata-job-list em,
+.library-app-shell .health-searches .metadata-job-status { background: var(--surface-soft); color: var(--muted); font-size: 11px; text-transform: none; }
+.library-app-shell .health-searches .metadata-job-list em[data-status="completed"],
+.library-app-shell .health-searches .metadata-job-status[data-status="completed"] { background: var(--green-soft); color: var(--green); }
+.library-app-shell .health-searches .metadata-job-detail { padding: 20px; gap: 18px; }
+.library-app-shell .health-searches .metadata-job-detail h3 { font-family: inherit; font-size: 16px; }
+.library-app-shell .health-searches .metadata-job-progress small { font-size: 12px; }
+.library-app-shell .health-searches .progress-track { margin-bottom: 6px; background: var(--border); }
+.library-app-shell .health-searches .progress-track > span { background: var(--green); }
+.library-app-shell .health-searches .metadata-job-entries li { padding: 14px; border-color: var(--border); }
+.library-app-shell .health-search-error { margin-top: 6px; font-size: 12px; }
+.library-app-shell .health-search-error summary { cursor: pointer; }
+.library-app-shell .health-search-error code { display: block; margin-top: 8px; color: var(--muted); overflow-wrap: anywhere; }
+@media (max-width: 1100px) {
+  .library-app-shell .health-issue-main { flex-wrap: wrap; }
+  .library-app-shell .health-issue-copy { flex-basis: calc(100% - 65px); }
+  .library-app-shell .health-issue-action { margin-left: 63px; max-width: none; }
+  .library-app-shell .health-entry-actions { flex-basis: 125px; }
+}
+@media (max-width: 650px) {
+  .library-app-shell .health-page .attention-page-head { align-items: flex-start; flex-direction: row; gap: 12px; }
+  .library-app-shell .health-review-count { min-width: 70px; padding: 12px; }
+  .library-app-shell .health-review-count strong { font-size: 23px; }
+  .library-app-shell .health-filter-bar > label { flex: 1 1 100%; }
+  .library-app-shell .health-filter-bar > label select { min-width: 0; width: 100%; }
+  .library-app-shell .health-extra-filters[open] { flex-basis: 100%; }
+  .library-app-shell .health-issue-main { padding: 18px; gap: 12px; }
+  .library-app-shell .health-issue-icon { width: 34px; height: 42px; }
+  .library-app-shell .health-issue-copy { flex-basis: calc(100% - 48px); }
+  .library-app-shell .health-issue h2 { font-size: 16px; }
+  .library-app-shell .health-issue-action { width: 100%; margin: 2px 0 0; }
+  .library-app-shell .health-issue-details > summary { padding: 13px 18px; }
+  .library-app-shell .health-details-body { padding: 4px 18px 18px; }
+  .library-app-shell .health-source-details { padding: 14px; }
+  .library-app-shell .health-source-details > div { grid-template-columns: 1fr; gap: 5px; }
+  .library-app-shell .health-duplicate-review { margin: -2px 18px 18px; }
+  .library-app-shell .health-compare-action { width: 100%; }
+  .library-app-shell .health-duplicate-entries li { flex-wrap: wrap; align-items: flex-start; padding: 13px; }
+  .library-app-shell .health-entry-actions { flex: 1 1 100%; justify-content: stretch; margin-left: 38px; }
+  .library-app-shell .health-entry-actions button { flex: 1; }
+  .library-app-shell .health-searches .metadata-job-list > button { grid-template-columns: 1fr auto; }
+  .library-app-shell .health-searches .metadata-job-list em { grid-column: 1 / -1; justify-self: start; }
+  .library-app-shell .health-searches .metadata-job-detail { padding: 15px; }
+  .library-app-shell .health-searches .metadata-job-entries li { align-items: stretch; flex-direction: column; }
+  .library-app-shell .health-searches .metadata-job-entries strong { white-space: normal; }
+}

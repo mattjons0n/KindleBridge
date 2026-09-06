@@ -22,7 +22,7 @@ import {
 } from "../../client/src/catalog-browser";
 import { catalogQuery, countLibraryBooks, initialLibraryFilters } from "../../client/src/library-prototype";
 import { DebugLog } from "../../client/src/log";
-import { initialAppState } from "../../client/src/state";
+import { initialAppState, type DeviceState } from "../../client/src/state";
 import { AppView, type AppViewHandlers } from "../../client/src/view";
 import { decodeLibraryRoute } from "../../client/src/library-route";
 import { AppError } from "../../client/src/app-error";
@@ -208,6 +208,77 @@ afterEach(() => {
 });
 
 describe("catalog-backed library model", () => {
+  it("shows On Kindle in Browse only while connected and retains the open view after disconnect", async () => {
+    const { root, view } = await loadedView();
+    const selector = '.library-nav button[data-ui-view="on-kindle"]';
+    const state = initialAppState();
+    const details = { vendorId: 0x1949, productId: 0x9981 };
+    expect(root.querySelector(selector)).toBeNull();
+
+    view.setCatalogKindleInventory({
+      deviceLabel: "Travel Kindle",
+      scannedAt: new Date().toISOString(),
+      completeness: "complete",
+      total: 1,
+      truncated: false,
+      items: [{ id: "mtp_retained", filename: "notes.pdf", size: 42_000, managed: false, match: "unmatched" }],
+    });
+    for (const device of [
+      { kind: "disconnected" },
+      { kind: "requesting-permission" },
+      { kind: "opening", details },
+      { kind: "mtp-reading", details },
+      { kind: "error", details, error: new AppError("USB_OPEN_TIMEOUT", "Connection timed out") },
+    ] satisfies DeviceState[]) {
+      view.render({ ...state, device });
+      expect(root.querySelector(selector), device.kind).toBeNull();
+    }
+
+    view.render({ ...state, device: { kind: "ready", details } });
+    expect(root.querySelector(selector)).not.toBeNull();
+    click(root, selector);
+    await vi.waitFor(() => expect(decodeLibraryRoute(window.location.hash)?.filters.view).toBe("on-kindle"));
+    const activeRoute = window.location.hash;
+    for (const kind of ["transferring", "recovering"] as const) {
+      view.render({ ...state, device: { kind, details } });
+      expect(root.querySelector(selector), kind).not.toBeNull();
+    }
+
+    view.render(state);
+    expect(root.querySelector(selector)).toBeNull();
+    expect(root.querySelector('[data-kindle-object-id="mtp_retained"]')).toBeNull();
+    expect(root.querySelector(".library-device-contents")).toBeNull();
+    expect(window.location.hash).toBe(activeRoute);
+  });
+
+  it("keeps everyday browsing free of diagnostics and makes summary totals apply whole-library filters", async () => {
+    const { root, view } = await loadedSendView(handlers());
+    expect(root.querySelector(".library-sidebar-label")?.textContent).toBe("Libraries");
+    expect(root.querySelector(".library-source-card")).toBeNull();
+    expect(root.querySelector(".library-profile-note")).toBeNull();
+    expect(root.querySelector(".library-sidebar-sync")).toBeNull();
+    expect(root.querySelector(".poc-lab")).toBeNull();
+    expect(root.querySelector(".footer")).toBeNull();
+    expect(root.textContent).not.toContain("boko WASM");
+    expect(root.querySelector(".library-topbar-status")?.textContent).toContain("Library index up to date");
+    view.setCatalogKindleStatuses(new Map([
+      ["book_time", "confirmed"], ["book_dorian", "possible"],
+    ]), new Map([["prf_personal", { confirmed: 1, possible: 1, notOnKindle: 0, unknown: 0 }]]));
+    click(root, '[data-ui-view="on-kindle"]');
+    await vi.waitFor(() => expect(root.querySelector("#library-heading")?.textContent).toBe("Books on Kindle"));
+    click(root, '[data-ui-summary-filter="possible"]');
+    await vi.waitFor(() => expect(root.querySelectorAll(".library-book-card")).toHaveLength(1));
+    expect(root.querySelector(".library-book-card")?.getAttribute("data-book-id")).toBe("book_dorian");
+    expect(root.querySelector<HTMLSelectElement>("#library-kindle-filter")?.value).toBe("possible");
+    expect(root.querySelector('[data-ui-summary-filter="possible"]')?.getAttribute("aria-pressed")).toBe("true");
+    expect(decodeLibraryRoute(window.location.hash)?.filters.view).toBe("all");
+    click(root, '[data-ui-summary-filter="on-kindle"]');
+    await vi.waitFor(() => expect(root.querySelector(".library-book-card")?.getAttribute("data-book-id")).toBe("book_time"));
+    click(root, '[data-ui-summary-filter="not-on-kindle"]');
+    await vi.waitFor(() => expect(root.querySelectorAll(".library-book-card")).toHaveLength(0));
+    expect(root.querySelector<HTMLSelectElement>("#library-kindle-filter")?.value).toBe("not-on-kindle");
+  });
+
   it("integrates the modern shell, compact filters and quick tabs without losing catalog actions", async () => {
     const { root } = await loadedView();
     document.body.append(root);
@@ -335,7 +406,8 @@ describe("catalog-backed library model", () => {
     expect(root.querySelector('[data-book-id="book_time"]')?.textContent).toContain("The Time Machine");
     expect(root.textContent).not.toContain("Meditations");
     expect(root.querySelector('.library-cover-image img')?.getAttribute("src")).toContain("/api/profiles/prf_personal");
-    expect(root.querySelector('[aria-label="Library summary"]')?.textContent).toContain("connect to compare");
+    expect(root.querySelector<HTMLButtonElement>('[data-ui-summary-filter="on-kindle"]')?.disabled).toBe(true);
+    expect(root.querySelector('[data-ui-summary-filter="on-kindle"] strong')?.textContent).toBe("—");
   });
 
   it("keeps compact distinguishable profile names visible in the narrow-screen CSS contract", async () => {
@@ -499,7 +571,7 @@ describe("catalog-backed library model", () => {
     const { root } = await loadedView(api);
 
     expect(root.querySelector(".library-topbar-status")?.textContent).toContain("Some books could not be indexed");
-    expect(root.querySelector(".library-topbar-status")?.textContent).toContain("Review 1 source warning in Settings");
+    expect(root.querySelector(".library-topbar-status")?.getAttribute("title")).toContain("Review 1 source warning in Settings");
     expect(root.querySelector(".library-topbar-status")?.getAttribute("data-status")).toBe("warning");
   });
 
@@ -675,7 +747,7 @@ describe("catalog-backed library model", () => {
       unsent: [],
     })));
     await vi.waitFor(() => expect(root.querySelector(".library-toast")?.textContent).toContain("2 of 2 books transferred and verified."));
-    expect(root.querySelector(".library-send-sheet")?.textContent).toContain("Batch complete");
+    expect(root.querySelector(".library-send-sheet")?.textContent).toContain("2 books sent");
     expect(root.querySelector(".library-bulk-selection")?.textContent).toContain("0 selected");
   });
 
@@ -748,7 +820,8 @@ describe("catalog-backed library model", () => {
     view.setCatalogTransferUpdate({ phase: "sending", progress: 50, message: "Sending second book" });
     expect(root.querySelector(".library-sheet-eyebrow")?.textContent).toBe("Book 2 of 2");
     expect(root.querySelector("#send-preview-title")?.textContent).toBe("The Picture of Dorian Gray");
-    expect(root.querySelector(".library-batch-book-list")?.textContent).toContain("The Time Machine");
+    expect(root.querySelector(".library-batch-book-list")).toBeNull();
+    expect(root.querySelector(".library-send-sheet")?.textContent).toContain("1 of 2 books sent");
     expect(root.querySelector('[role="progressbar"]')?.getAttribute("aria-valuenow")).toBe("75");
 
     rejectSecond(new Error("USB stalled"));
@@ -900,6 +973,10 @@ describe("catalog-backed library model", () => {
 
   it("uses backend include-ID matching for confirmed and possible books before paginating the On Kindle view", async () => {
     const { root, view, api } = await loadedView();
+    view.render({
+      ...initialAppState(),
+      device: { kind: "ready", details: { vendorId: 0x1949, productId: 0x9981 } },
+    });
     view.setCatalogKindleStatuses(new Map([
       ["book_time", "confirmed"],
       ["book_dorian", "possible"],
@@ -960,7 +1037,7 @@ describe("catalog-backed library model", () => {
       items: [{ id: "mtp_1", filename: "time-machine.azw3", size: 10, managed: true, bookId: "book_time", match: "confirmed" }],
     });
     await vi.waitFor(() => expect(root.querySelector('[data-book-id="book_time"] .library-kindle-check')).toBeNull());
-    expect(root.querySelector(".library-stat-row")?.textContent).toContain("0 matched here");
+    expect(root.querySelector('[data-ui-summary-filter="on-kindle"] strong')?.textContent).toBe("—");
   });
 });
 
@@ -1610,6 +1687,10 @@ describe("real catalog settings and device presentation", () => {
 
   it("renders bounded current Kindle contents separately from matched catalog books", async () => {
     const { root, view } = await loadedView();
+    view.render({
+      ...initialAppState(),
+      device: { kind: "ready", details: { vendorId: 0x1949, productId: 0x9981 } },
+    });
     view.setCatalogKindleInventory({
       deviceLabel: "Travel Kindle",
       scannedAt: new Date().toISOString(),
@@ -1623,8 +1704,11 @@ describe("real catalog settings and device presentation", () => {
         { id: "mtp_2", filename: "notes.pdf", format: "PDF", size: 42_000, path: "/documents/notes.pdf", managed: false, match: "unmatched" },
       ],
     });
-    click(root, 'button[data-ui-view="on-kindle"]');
+    expect(root.querySelector(".library-device-contents")).toBeNull();
+    click(root, 'button[data-ui-view="settings"]');
+    await vi.waitFor(() => expect(root.querySelector(".settings-diagnostics")).not.toBeNull());
     await vi.waitFor(() => expect(root.querySelector("#device-contents-title")?.textContent).toContain("Travel Kindle"));
+    view.render(initialAppState());
     expect(root.querySelector(".library-inventory-chip")?.textContent).toBe("Last seen");
     expect(root.querySelector('[data-kindle-object-id="mtp_1"]')?.textContent).toContain("Last seen match");
     expect(root.querySelector('[data-kindle-object-id="mtp_2"]')?.textContent).toContain("Last seen unmatched");
@@ -1653,7 +1737,9 @@ describe("real catalog settings and device presentation", () => {
       selfTest: { kind: "passed", byteLength: 1037 },
       catalogInventoryState: "ready",
     });
-    click(root, 'button[data-ui-view="on-kindle"]');
+    expect(root.querySelector(".library-device-contents")).toBeNull();
+    click(root, 'button[data-ui-view="settings"]');
+    await vi.waitFor(() => expect(root.querySelector(".settings-diagnostics")).not.toBeNull());
     expect(root.querySelector('[data-kindle-object-id="mtp_unmatched"]')?.textContent).toContain("Comparison unavailable");
 
     view.setCatalogKindleInventory({
@@ -1665,6 +1751,10 @@ describe("real catalog settings and device presentation", () => {
 
   it("keeps late Kindle-only inventory items searchable and pages the full bounded presentation", async () => {
     const { root, view } = await loadedView();
+    view.render({
+      ...initialAppState(),
+      device: { kind: "ready", details: { vendorId: 0x1949, productId: 0x9981 } },
+    });
     const items = Array.from({ length: 550 }, (_, index) => ({
       id: `mtp_${index}`,
       filename: `kindle-only-${index}.azw3`,
@@ -1682,10 +1772,13 @@ describe("real catalog settings and device presentation", () => {
       truncated: false,
       items,
     });
-    click(root, 'button[data-ui-view="on-kindle"]');
+    expect(root.querySelector(".library-device-contents")).toBeNull();
+    click(root, 'button[data-ui-view="settings"]');
+    await vi.waitFor(() => expect(root.querySelector(".settings-diagnostics")).not.toBeNull());
     await vi.waitFor(() => expect(root.querySelector(".library-device-pagination")?.textContent).toContain("1–100 of 550"));
 
-    setInput(root.querySelector("#library-search"), "Tail-only-device-book");
+    setInput(root.querySelector("#diagnostics-device-search"), "Tail-only-device-book");
+    expect(root.querySelector("#library-search")).toBeNull();
     expect(root.querySelector('[data-kindle-object-id="mtp_549"]')?.textContent).toContain("Tail-only-device-book");
     expect(root.querySelector(".library-device-pagination")).toBeNull();
   });

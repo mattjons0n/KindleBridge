@@ -33,6 +33,7 @@ import {
 } from "./library-route";
 import {
   deriveGateStatuses,
+  pendingObjectWriteActive,
   targetProfileComplete,
   type AppState,
   type DeviceDetails,
@@ -273,7 +274,7 @@ function renderError(state: AppState): string {
 
 function renderRecovery(state: AppState): string {
   const pending = state.pendingObjectCleanup;
-  const interrupted = !pending || state.device.kind === "transferring" || state.selfTest.kind === "running"
+  const interrupted = !pending || pendingObjectWriteActive(state)
     ? ""
     : (() => {
         const location = pending.purpose === "metadata-cache" ? "the Kindle storage root" : "Documents";
@@ -307,6 +308,7 @@ export class AppView {
   readonly #catalog: CatalogBrowser;
   #state: AppState;
   #profileDraft: TargetProfile;
+  #diagnosticsDeviceQuery = "";
   #catalogDialogReturnBookId?: string;
   #catalogRemovalReturnBookId?: string;
   #catalogUpdateReturnBookId?: string;
@@ -446,7 +448,7 @@ export class AppView {
     const preservedInputFocus = active instanceof HTMLInputElement
       && active.id
       && this.#root.contains(active)
-      && active.closest(".settings-page, .library-toolbar")
+      && active.closest(".settings-page, .library-toolbar, .settings-diagnostics")
       ? {
           id: active.id,
           value: active.value,
@@ -456,27 +458,44 @@ export class AppView {
         }
       : undefined;
     const moreFiltersOpen = this.#root.querySelector<HTMLDetailsElement>(".library-more-filters")?.open ?? false;
+    const openDiagnostics = new Set([...this.#root.querySelectorAll<HTMLDetailsElement>("details[data-diagnostic-panel][open]")]
+      .map((details) => details.dataset.diagnosticPanel));
     const globalAlerts = `${renderRecovery(state)}${renderError(state)}`;
-    this.#root.innerHTML = `<div class="app-shell library-app-shell">
-      ${renderLibraryPrototype(state, this.#catalog.snapshot, globalAlerts)}
-      <section class="poc-lab" aria-labelledby="poc-lab-title">
-        <details>
-          <summary><span><strong id="poc-lab-title">Proven transfer engine</strong><small>Open the original conversion, WebUSB, MTP, self-test, and transfer controls</small></span><span class="poc-lab-summary-badge">Transfer checks preserved</span></summary>
+    const connected = state.device.kind === "ready" || state.device.kind === "transferring" || state.device.kind === "recovering";
+    const diagnostics = this.#catalog.snapshot.filters.view === "settings" ? `
+      <section class="poc-lab settings-diagnostics" aria-labelledby="poc-lab-title">
+        <details data-diagnostic-panel="main">
+          <summary><span><strong id="poc-lab-title">Diagnostics</strong><small>Device files, connection tools, and debug reports</small></span></summary>
           <div class="poc-lab-content">
-            <div class="poc-lab-intro"><span class="local-badge">No Calibre · no cloud</span><p>The catalog above uses the private Docker catalog service. These controls preserve the physically proven single-book transfer path.</p></div>
-            <ol class="gate-rail" aria-label="POC gates">${renderGateRail(state)}</ol>
-            <div class="main-content">
-        ${!state.secureContext ? '<div class="notice error"><div><strong>Secure context required</strong>Open ShelfSend through trusted HTTPS or its localhost development URL.</div></div>' : ""}
-        ${!state.webUsbAvailable ? '<div class="notice error"><div><strong>WebUSB unavailable</strong>Use Chrome or another compatible Chromium browser.</div></div>' : ""}
-        <div class="grid">${renderConversion(state, this.#catalog.snapshot.sendBusy)}${renderDevice(state)}${renderTransfer(state)}${renderProfile(state, this.#profileDraft)}
-          <section class="panel panel-wide"><details class="diagnostics"><summary>Developer diagnostics</summary><div class="log-toolbar"><button type="button" data-action="copy-log">Copy debug log</button></div><pre class="debug-log" id="debug-log"></pre></details></section>
-        </div>
-            </div>
+            <details data-diagnostic-panel="device-files" class="settings-diagnostic-group">
+              <summary>Kindle files <small>Inspect the most recent device scan</small></summary>
+              <label class="diagnostics-search"><span>Search Kindle files</span><input type="search" id="diagnostics-device-search" value="${escapeHtml(this.#diagnosticsDeviceQuery)}" placeholder="Title, author, or filename" /></label>
+              ${renderKindleDeviceContents(this.#catalog.snapshot, connected, state.catalogInventoryState, this.#diagnosticsDeviceQuery)}
+            </details>
+            <details data-diagnostic-panel="transfer-tools" class="settings-diagnostic-group">
+              <summary>Connection &amp; transfer tools <small>Manual checks for troubleshooting</small></summary>
+              <ol class="gate-rail" aria-label="Diagnostic checks">${renderGateRail(state)}</ol>
+              <div class="main-content">
+                ${!state.secureContext ? '<div class="notice error"><div><strong>Secure context required</strong>Open ShelfSend through trusted HTTPS or localhost.</div></div>' : ""}
+                ${!state.webUsbAvailable ? '<div class="notice error"><div><strong>WebUSB unavailable</strong>Use Chrome or another compatible Chromium browser.</div></div>' : ""}
+                <div class="grid">${renderConversion(state, this.#catalog.snapshot.sendBusy)}${renderDevice(state)}${renderTransfer(state)}${renderProfile(state, this.#profileDraft)}</div>
+              </div>
+            </details>
+            <details data-diagnostic-panel="reports" class="settings-diagnostic-group">
+              <summary>Debug reports <small>Detailed activity and device diagnostics</small></summary>
+              <div class="log-toolbar"><button type="button" data-action="copy-log">Copy debug log</button><button type="button" data-ui-action="export-activity-report">Download activity report</button></div>
+              <pre class="debug-log" id="debug-log"></pre>
+              <div data-ui-partial-object-probe></div>
+            </details>
           </div>
         </details>
-      </section>
-      <footer class="footer"><span>Private self-hosted catalog · browser-local conversion</span><span>boko WASM (GPL-3.0-or-later) · no overwrite support</span></footer>
+      </section>` : "";
+    this.#root.innerHTML = `<div class="app-shell library-app-shell">
+      ${renderLibraryPrototype(state, this.#catalog.snapshot, globalAlerts, diagnostics)}
     </div>`;
+    this.#root.querySelectorAll<HTMLDetailsElement>("details[data-diagnostic-panel]").forEach((details) => {
+      details.open = openDiagnostics.has(details.dataset.diagnosticPanel);
+    });
     this.#renderAdvancedPartialObjectProbe();
     this.#bindEvents();
     this.#renderLog();
@@ -558,6 +577,25 @@ export class AppView {
   }
 
   #bindCatalogEvents(): void {
+    this.#root.querySelector<HTMLInputElement>("#diagnostics-device-search")?.addEventListener("input", (event) => {
+      this.#diagnosticsDeviceQuery = (event.currentTarget as HTMLInputElement).value;
+      this.#catalog.goToKindleInventoryPage(0);
+    });
+    this.#root.querySelectorAll<HTMLButtonElement>("[data-ui-summary-filter]").forEach((button) => button.addEventListener("click", () => {
+      this.#catalog.applyKindleSummaryFilter(button.dataset.uiSummaryFilter as KindleFilter);
+      this.#writeCatalogRoute({ bookId: null, seriesKey: null }, "replace");
+    }));
+    this.#root.querySelector<HTMLButtonElement>('[data-ui-action="open-settings-diagnostics"]')?.addEventListener("click", () => {
+      this.#closeActivityCenter(false);
+      void this.#catalog.setView("settings").then(() => {
+        this.#writeCatalogRoute({}, "replace");
+        const details = this.#root.querySelector<HTMLDetailsElement>('[data-diagnostic-panel="main"]');
+        if (details) {
+          details.open = true;
+          details.querySelector<HTMLElement>("summary")?.focus();
+        }
+      });
+    });
     this.#root.querySelector<HTMLInputElement>("#library-search")?.addEventListener("input", (event) => {
       this.#catalog.updateFilter("query", (event.currentTarget as HTMLInputElement).value);
       this.#writeCatalogRoute({ bookId: null, seriesKey: null }, "replace");
@@ -1817,6 +1855,9 @@ export class AppView {
     this.#root.querySelectorAll<HTMLButtonElement>("[data-ui-kindle-filter]").forEach((button) => {
       button.setAttribute("aria-pressed", String(button.dataset.uiKindleFilter === kindleFilter));
     });
+    this.#root.querySelectorAll<HTMLButtonElement>("[data-ui-summary-filter]").forEach((button) => {
+      button.setAttribute("aria-pressed", String(button.dataset.uiSummaryFilter === kindleFilter && this.#catalog.snapshot.filters.view === "all"));
+    });
     const results = this.#root.querySelector<HTMLElement>(".library-results");
     if (!results) return;
     results.innerHTML = renderLibraryResults(this.#state, this.#catalog.snapshot);
@@ -1833,6 +1874,7 @@ export class AppView {
       this.#catalog.snapshot,
       connected,
       this.#state.catalogInventoryState,
+      this.#diagnosticsDeviceQuery,
     );
     const replacement = this.#root.querySelector<HTMLElement>(".library-device-contents");
     if (replacement) this.#bindCatalogResultActions(replacement);

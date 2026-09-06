@@ -4201,6 +4201,11 @@ export class AppController {
 
   #finishHardwareOperation(): void {
     this.#hardwareBusy = false;
+    if (this.#state.activeObjectWriteId !== undefined) {
+      // An unresolved record becomes recovery UI once its owning operation
+      // settles. Keeping the durable journal is intentional, even on failure.
+      this.#commit({ ...this.#state, activeObjectWriteId: undefined });
+    }
     for (const resolve of this.#hardwareIdleWaiters) resolve();
     this.#hardwareIdleWaiters.clear();
     if (this.#catalogEventReconciliationQueued && !this.#catalogSendBatch) {
@@ -4237,6 +4242,8 @@ export class AppController {
   ): (event: MtpObjectCreationState) => void {
     const label = (details.model ?? details.productName)?.replace(/[\u0000-\u001f\u007f]/gu, " ").trim().slice(0, 120);
     const operationId = this.#newRecoveryOperationId();
+    const connection = this.#connection;
+    const epoch = this.#deviceEpoch;
     return (event) => {
       if (event.stage === "cleanup-succeeded" || event.stage === "verified") {
         const pending = this.#state.pendingObjectCleanup;
@@ -4251,6 +4258,7 @@ export class AppController {
           return;
         }
         if (!clearPendingObjectCleanup(pending)) {
+          this.#commit({ ...this.#state, activeObjectWriteId: undefined });
           this.log.warn("The completed-object recovery record could not be cleared", {
             purpose,
             stage: event.stage,
@@ -4262,6 +4270,7 @@ export class AppController {
         this.#commit({
           ...this.#state,
           pendingObjectCleanup: undefined,
+          activeObjectWriteId: undefined,
           ...(event.stage === "verified" && transferKey && transfer?.kind === "sending"
             ? {
                 [transferKey]: {
@@ -4296,7 +4305,12 @@ export class AppController {
           "Durable browser recovery storage is unavailable, so no MTP object was created.",
         );
       }
-      this.#commit({ ...this.#state, pendingObjectCleanup: entry });
+      this.#commit({
+        ...this.#state,
+        pendingObjectCleanup: entry,
+        activeObjectWriteId: this.#hardwareBusy && connection && this.#isActiveConnection(epoch, connection)
+          ? operationId : undefined,
+      });
     };
   }
 

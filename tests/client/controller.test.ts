@@ -592,6 +592,92 @@ afterEach(() => {
   window.localStorage.clear();
 });
 
+describe("AppController active write recovery display", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it.each(["catalog", "metadata-cache"] as const)(
+    "keeps the %s recovery journal without showing an interruption during a normal send",
+    async (purpose) => {
+      const app = harness();
+      await app.controller.connect();
+      let releaseIntent!: () => void;
+      let releaseHandle!: () => void;
+      vi.mocked(app.connection.sendAzW3AndRefreshInventory).mockImplementationOnce(async (blob, filename, options, inventoryOptions) => {
+        const transfer = purpose === "metadata-cache"
+          ? await app.connection.sendAzW3(blob, filename, options)
+          : { storageId: 0x10001, parentHandle: 0x37, filename, size: blob.size, handle: 0x505, verified: true as const };
+        const object = purpose === "metadata-cache"
+          ? { storageId: 0x10001, parentHandle: 0xffff_ffff, filename: ".kindle-bridge-device-metadata-cache-v1-a.json", size: 1_024, handle: 0x606 }
+          : transfer;
+        const onObjectState = purpose === "metadata-cache" ? inventoryOptions?.onObjectState : options?.onObjectState;
+        onObjectState?.({ stage: "send-object-info-intent", ...object });
+        await new Promise<void>((resolve) => { releaseIntent = resolve; });
+        onObjectState?.({ stage: "handle-assigned", ...object });
+        await new Promise<void>((resolve) => { releaseHandle = resolve; });
+        onObjectState?.({ stage: "verified", ...object });
+        return { transfer, inventory: app.connection.latestInventory!, inventoryRefresh: "complete" as const };
+      });
+
+      const sending = app.controller.sendCatalogBook({ profileId: "profile-1", book: app.book });
+      for (const stage of ["send-object-info-intent", "handle-assigned"] as const) {
+        await vi.waitFor(() => expect(readPendingObjectCleanup()).toMatchObject({ purpose, stage }));
+        expect(app.controller.state.pendingObjectCleanup).toEqual(readPendingObjectCleanup());
+        expect(app.root.querySelector(".recovery-notice")).toBeNull();
+        expect(app.root.textContent).not.toContain("Recovery inspection required");
+        expect(app.root.querySelector(".library-device-button")?.textContent).toContain(
+          purpose === "metadata-cache" ? "Updating Kindle metadata" : "Writing to Kindle",
+        );
+        if (stage === "send-object-info-intent") releaseIntent();
+      }
+      releaseHandle();
+      await sending;
+
+      expect(readPendingObjectCleanup()).toBeUndefined();
+      expect(app.controller.state.pendingObjectCleanup).toBeUndefined();
+      expect(app.root.querySelector(".recovery-notice")).toBeNull();
+      expect(app.root.textContent).not.toContain("Recovery inspection required");
+    },
+  );
+
+  it("shows interrupted-write recovery immediately when USB disconnects during an active catalog upload", async () => {
+    const usbEvents = new EventTarget();
+    const usb: NonNullable<AppControllerDependencies["usb"]> = {
+      requestDevice: vi.fn(),
+      getDevices: vi.fn(),
+      addEventListener: (type, listener) => usbEvents.addEventListener(type, listener as EventListener),
+      removeEventListener: (type, listener) => usbEvents.removeEventListener(type, listener as EventListener),
+    };
+    const app = harness(false, { usb });
+    await app.controller.connect();
+    let releaseUpload!: () => void;
+    vi.mocked(app.connection.sendAzW3).mockImplementationOnce(async (blob, filename, options) => {
+      const object = { storageId: 0x10001, parentHandle: 0x37, filename, size: blob.size, handle: 0x505 };
+      options?.onObjectState?.({ stage: "send-object-info-intent", ...object });
+      options?.onObjectState?.({ stage: "handle-assigned", ...object });
+      await new Promise<void>((resolve) => { releaseUpload = resolve; });
+      options?.signal?.throwIfAborted();
+      throw new Error("The disconnected upload must not complete");
+    });
+    const sending = app.controller.sendCatalogBook({ profileId: "profile-1", book: app.book });
+    const result = expect(sending).rejects.toThrow();
+    await vi.waitFor(() => expect(readPendingObjectCleanup()?.handle).toBe(0x505));
+    expect(app.root.querySelector(".recovery-notice")).toBeNull();
+    const pending = readPendingObjectCleanup();
+
+    const disconnected = new Event("disconnect");
+    Object.defineProperty(disconnected, "device", { value: app.connection.device });
+    usbEvents.dispatchEvent(disconnected);
+
+    expect(app.controller.state.device.kind).toBe("error");
+    expect(app.root.querySelector(".recovery-notice")?.textContent).toContain("Interrupted Kindle write");
+    expect(readPendingObjectCleanup()).toEqual(pending);
+    releaseUpload();
+    await result;
+    expect(app.root.querySelector(".recovery-notice")?.textContent).toContain("Interrupted Kindle write");
+    expect(readPendingObjectCleanup()).toEqual(pending);
+  });
+});
+
 describe("AppController cooperative catalog cancellation", () => {
   afterEach(() => vi.restoreAllMocks());
 
@@ -652,11 +738,14 @@ describe("AppController cooperative catalog cancellation", () => {
     const sending = app.controller.sendCatalogBook({ profileId: "profile-1", book: app.book, cancelSignal: cancel.signal });
     const result = expect(sending).rejects.toMatchObject({ code: "TRANSFER_CANCELLED" });
     await vi.waitFor(() => expect(readPendingObjectCleanup()?.handle).toBe(0x505));
+    expect(app.root.querySelector(".recovery-notice")).toBeNull();
+    expect(app.root.textContent).not.toContain("Recovery inspection required");
     cancel.abort();
     await result;
 
     expect(deviceSignal?.aborted).toBe(false);
     expect(readPendingObjectCleanup()).toBeUndefined();
+    expect(app.root.querySelector(".recovery-notice")).toBeNull();
     expect(updates).toHaveBeenLastCalledWith(expect.objectContaining({ phase: "cancelled", cancellable: false }));
     expect(app.catalogApi.createDelivery).not.toHaveBeenCalled();
     expect(app.connection.disconnect).not.toHaveBeenCalled();
@@ -681,6 +770,8 @@ describe("AppController cooperative catalog cancellation", () => {
     })).rejects.toMatchObject({ code: "MTP_PARTIAL_OBJECT_CLEANUP_FAILED" });
 
     expect(readPendingObjectCleanup()?.handle).toBe(0x505);
+    expect(app.root.querySelector(".recovery-notice")?.textContent).toContain("Interrupted Kindle write");
+    expect(app.root.querySelector(".library-device-button")?.textContent).toContain("Recovery inspection required");
     expect(updates).toHaveBeenLastCalledWith(expect.objectContaining({ phase: "failed", cancellable: false }));
     expect(updates.mock.calls.some(([update]) => update.phase === "cancelled")).toBe(false);
     expect(app.catalogApi.createDelivery).not.toHaveBeenCalled();

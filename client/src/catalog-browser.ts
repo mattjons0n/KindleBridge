@@ -38,6 +38,7 @@ import {
   clearCatalogFilters,
   EMPTY_CATALOG_FILTERS,
   initialLibraryFilters,
+  type KindleFilter,
   type LibraryFilters,
   type LibraryLayout,
   type LibraryProfileId,
@@ -81,6 +82,7 @@ import type {
 import type { LibraryRouteState } from "./library-route";
 import {
   MAX_BOOK_SELECTION_IDS,
+  MAX_MATCH_INDEX_ENTRIES,
   MAX_METADATA_LOOKUP_JOBS_PER_PROFILE,
   MAX_PINNED_SMART_SHELVES_PER_PROFILE,
 } from "../../shared/catalog-contracts.js";
@@ -128,6 +130,9 @@ export interface CatalogBrowserSnapshot {
   readonly batchTransfer?: CatalogBatchTransferState;
   readonly announcement?: string;
   readonly kindleStatus: ReadonlyMap<string, CatalogKindleStatus>;
+  /** Current-profile filter membership retained only during a live catalog refresh.
+   * Display-only: badges, Send, Remove and matching must use kindleStatus. */
+  readonly kindleFilterStatuses?: ReadonlyMap<string, CatalogKindleStatus>;
   readonly kindleStatusCountsByProfile: ReadonlyMap<string, CatalogKindleStatusCounts>;
   readonly kindleInventory?: CatalogKindleInventory;
   readonly kindleInventoryOffset: number;
@@ -756,6 +761,7 @@ export class CatalogBrowser {
     this.#set({
       loadState: "loading",
       booksState: "loading",
+      kindleFilterStatuses: undefined,
       page: undefined,
       facets: EMPTY_CATALOG_FILTERS,
       error: undefined,
@@ -951,6 +957,7 @@ export class CatalogBrowser {
     this.#snapshot = {
       ...this.#snapshot,
       filters: browsingContext.filters,
+      kindleFilterStatuses: undefined,
       readingEvidence: new Map(),
       readingFilter: "any",
       readingHistoryError: undefined,
@@ -2026,6 +2033,39 @@ export class CatalogBrowser {
     void this.reloadBooks();
   }
 
+  async applyKindleSummaryFilter(kindle: KindleFilter): Promise<void> {
+    // Summary totals describe the whole active library. Clear narrower shelf,
+    // search and reading constraints together so selecting a total shows it.
+    // The summary is never a Settings navigation/discard action.
+    if (!this.#snapshot.filters.profileId || this.#kindleActionBusy()
+      || this.#snapshot.settingsSaving || this.#snapshot.settingsRefreshing
+      || this.#snapshot.filters.view === "settings") return;
+    this.#bookEpoch += 1;
+    this.#bookOperation?.abort();
+    if (this.#searchTimer !== undefined) {
+      window.clearTimeout(this.#searchTimer);
+      this.#searchTimer = undefined;
+    }
+    this.#restoredShelfId = undefined;
+    this.#snapshot = {
+      ...this.#snapshot,
+      filters: { ...clearCatalogFilters(this.#snapshot.filters), view: "all", kindle },
+      readingFilter: "any",
+      activeShelf: undefined,
+      selectedBookIds: new Set(),
+      bookDetails: undefined,
+      matchReview: undefined,
+      pendingRemoval: undefined,
+      pendingUpdate: undefined,
+      kindleInventoryOffset: 0,
+      error: undefined,
+      bulkActionError: undefined,
+    };
+    this.#persistBrowsingContext(0);
+    this.#render("all");
+    await this.reloadBooks();
+  }
+
   goToPage(offset: number): void {
     if (this.#kindleActionBusy()) return;
     this.#bookEpoch += 1;
@@ -2062,10 +2102,14 @@ export class CatalogBrowser {
     if (!background) this.#set({ booksState: "loading", error: undefined }, "results");
     try {
       const query = this.#currentBookQuery();
-      const confirmed = [...this.#snapshot.kindleStatus].filter(([, status]) => status === "confirmed").map(([bookId]) => bookId);
-      const possible = [...this.#snapshot.kindleStatus].filter(([, status]) => status === "possible").map(([bookId]) => bookId);
-      const absent = [...this.#snapshot.kindleStatus].filter(([, status]) => status === "not-on-kindle").map(([bookId]) => bookId);
-      const unknown = [...this.#snapshot.kindleStatus].filter(([, status]) => status === "unknown").map(([bookId]) => bookId);
+      // Keep filter membership stable while fresh matching is pending. These
+      // IDs only query current catalog cards; they never restore match or write
+      // authority, which is revoked immediately when a scan event arrives.
+      const filterStatuses = this.#snapshot.kindleFilterStatuses ?? this.#snapshot.kindleStatus;
+      const confirmed = [...filterStatuses].filter(([, status]) => status === "confirmed").map(([bookId]) => bookId);
+      const possible = [...filterStatuses].filter(([, status]) => status === "possible").map(([bookId]) => bookId);
+      const absent = [...filterStatuses].filter(([, status]) => status === "not-on-kindle").map(([bookId]) => bookId);
+      const unknown = [...filterStatuses].filter(([, status]) => status === "unknown").map(([bookId]) => bookId);
       const wantsMatchedView = this.#snapshot.filters.view === "on-kindle";
       const wantsOnKindle = this.#snapshot.filters.kindle === "on-kindle";
       const wantsPossible = this.#snapshot.filters.kindle === "possible";
@@ -4343,6 +4387,9 @@ export class CatalogBrowser {
   }
 
   setKindleInventory(inventory: CatalogKindleInventory | undefined): void {
+    // A new live comparison (including a failed/partial one), disconnect, or
+    // last-seen inventory ends the previous refresh's display-only membership.
+    this.#snapshot = { ...this.#snapshot, kindleFilterStatuses: undefined };
     // The completed button is a receipt for this send, not durable presence
     // authority. A later inventory (removal/reconnect) replaces that receipt.
     if (!this.#kindleActionBusy() && this.#snapshot.sendPhase === "complete"
@@ -4976,6 +5023,7 @@ export class CatalogBrowser {
       settingsDraft: nextSettingsDraft,
       settingsDirty: nextSettingsDirty,
       ...(profileChanged ? {
+        kindleFilterStatuses: undefined,
         page: undefined,
         facets: EMPTY_CATALOG_FILTERS,
         booksState: selected ? "loading" as const : "idle" as const,
@@ -5030,7 +5078,21 @@ export class CatalogBrowser {
     );
   }
 
-  #downgradeKindleEvidence(liveUpdatesConnected: boolean): void {
+  #downgradeKindleEvidence(liveUpdatesConnected: boolean, preserveFilterMembership = false): void {
+    const profileId = this.#snapshot.filters.profileId;
+    const canRetainFilters = preserveFilterMembership
+      && this.#snapshot.liveUpdatesConnected
+      && this.#snapshot.kindleInventory?.completeness === "complete"
+      && profileId !== undefined;
+    const kindleFilterStatuses = canRetainFilters
+      ? this.#snapshot.kindleFilterStatuses ?? (
+        this.#snapshot.kindleInventory?.matching?.status === "complete"
+        && this.#snapshot.kindleStatusCountsByProfile.has(profileId)
+        && this.#snapshot.kindleStatus.size <= MAX_MATCH_INDEX_ENTRIES
+          ? new Map(this.#snapshot.kindleStatus)
+          : undefined
+      )
+      : undefined;
     this.#readingHistoryOperation?.abort();
     this.#snapshot = { ...this.#snapshot, readingEvidence: retireKindleReadingEvidence(this.#snapshot.readingEvidence ?? new Map()) };
     // Once the event channel is unavailable, a normal search/page request can
@@ -5063,6 +5125,7 @@ export class CatalogBrowser {
       : undefined;
     this.#set({
       liveUpdatesConnected,
+      kindleFilterStatuses,
       kindleStatus,
       kindleStatusCountsByProfile,
       ...(kindleInventory === undefined ? {} : { kindleInventory }),
@@ -5160,7 +5223,8 @@ export class CatalogBrowser {
     // Catalog mutations can preserve a book ID while changing its immutable
     // source version. Downgrade every live association before updated cards are
     // rendered; only a fresh controller reconciliation may restore green.
-    this.#downgradeKindleEvidence(true);
+    const ordinaryScanEvent = /^(?:root\.scan\.(?:started|completed)|book\.(?:added|updated|removed))$/u.test(event.type);
+    this.#downgradeKindleEvidence(true, ordinaryScanEvent);
     if (event.profileId) this.#pendingEventProfileIds.add(event.profileId);
     this.#latestCatalogEvent = event;
     if (this.#eventRefreshRunning) return;

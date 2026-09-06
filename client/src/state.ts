@@ -112,9 +112,19 @@ export interface AppState {
   readonly catalogInventoryState: CatalogInventoryState;
   readonly integratedTransfer: TransferState;
   readonly pendingObjectCleanup?: PendingObjectCleanup;
+  /** In-memory UI ownership of a live write; never persisted or used as write authority. */
+  readonly activeObjectWriteId?: string;
   /** Durable, non-authoritative reminders for verified replacement duplicates. */
   readonly pendingReplacementCleanups?: readonly ReplacementCleanupRecord[];
   readonly activeError?: AppError;
+}
+
+/** A recovery journal exists during healthy uploads too. Only its live owner
+ * may present it as work in progress; reloads and disconnected sessions cannot. */
+export function pendingObjectWriteActive(state: AppState): boolean {
+  return Boolean(state.activeObjectWriteId
+    && state.pendingObjectCleanup?.operationId === state.activeObjectWriteId
+    && (state.device.kind === "ready" || state.device.kind === "transferring"));
 }
 
 const PROFILE_STORAGE_KEY = "kindle-poc-target-profile";

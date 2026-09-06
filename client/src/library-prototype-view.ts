@@ -6,7 +6,6 @@ import {
 import type {
   BookMetadataOverrides,
   CatalogBook,
-  CatalogHealthIssue,
   CatalogBookMetadataState,
   CatalogFilterOption,
   CatalogProfile,
@@ -24,10 +23,11 @@ import {
   type LibraryView,
 } from "./library-prototype";
 import type { LibraryFolderDraft, LibrarySettingsDraft } from "./library-settings-prototype";
-import type { AppState } from "./state";
+import { pendingObjectWriteActive, type AppState } from "./state";
 import { libraryIcon } from "./library-icons";
 import { describeKindleReadingPresentation } from "./kindle/reading-presentation";
 import { renderRecordedReadingData } from "./recorded-reading-view";
+import { renderNeedsAttention } from "./library-health-view";
 import {
   actualDeviceConnected,
   bookActionCapabilities,
@@ -107,7 +107,7 @@ function renderProfileRail(snapshot: CatalogBrowserSnapshot): string {
   `).join("");
 }
 
-function renderLibraryNav(snapshot: CatalogBrowserSnapshot): string {
+function renderLibraryNav(snapshot: CatalogBrowserSnapshot, connected: boolean): string {
   const profile = activeProfile(snapshot);
   const counts = countLibraryBooks(
     profile,
@@ -122,7 +122,7 @@ function renderLibraryNav(snapshot: CatalogBrowserSnapshot): string {
     ["series", libraryIcon("series"), "Series", snapshot.seriesPage?.total],
     ["attention", libraryIcon("attention"), "Needs attention", snapshot.healthPage?.counts.active || undefined],
   ];
-  return items.map(([view, icon, label, count]) => `
+  return items.filter(([view]) => view !== "on-kindle" || connected).map(([view, icon, label, count]) => `
     <button type="button" class="library-nav-item${snapshot.filters.view === view ? " active" : ""}${view === "settings" ? " settings" : ""}" data-ui-view="${view}"${snapshot.filters.view === view ? ' aria-current="page"' : ""}>
       <span class="library-nav-icon" aria-hidden="true">${icon}</span>
       <span>${escapeHtml(label)}</span>
@@ -353,7 +353,7 @@ export function renderLibraryResults(state: AppState, snapshot: CatalogBrowserSn
   const enabledProfile = snapshot.profiles.find((profile) => profile.enabled);
   if (!enabledProfile) {
     const configured = snapshot.profiles.length > 0;
-    return `<div class="library-empty-state"><span aria-hidden="true">${configured ? "○" : "+"}</span><h2>${configured ? "No library enabled" : "No library configured"}</h2><p>${configured ? "Enable a household library in Settings to browse its books." : "Create a household library and add a container-mounted folder in Settings."}</p><button type="button" data-ui-view="settings">Open Settings</button></div>`;
+    return `<div class="library-empty-state"><span aria-hidden="true">${configured ? "○" : "+"}</span><h2>${configured ? "No library enabled" : "No library configured"}</h2><p>${configured ? "Enable a library in Settings to browse its books." : "Create a library and add a container-mounted folder in Settings."}</p><button type="button" data-ui-view="settings">Open Settings</button></div>`;
   }
   if (snapshot.booksState === "loading" && !snapshot.page) {
     return `<div class="library-loading-state" role="status"><span aria-hidden="true"></span><strong>Loading this library…</strong><small>Reading catalog metadata and covers</small></div>`;
@@ -362,7 +362,8 @@ export function renderLibraryResults(state: AppState, snapshot: CatalogBrowserSn
     return `<div class="library-empty-state library-error-state" role="alert"><span aria-hidden="true">!</span><h2>Library unavailable</h2><p>${escapeHtml(snapshot.error ?? "The catalog service could not load this library.")}</p><button type="button" data-ui-action="retry-catalog">Try again</button></div>`;
   }
   const page = snapshot.page;
-  const books = booksForKindleView(page?.items ?? [], snapshot.filters, snapshot.kindleStatus);
+  // Retained membership is presentation-only; badges and actions still use live evidence.
+  const books = booksForKindleView(page?.items ?? [], snapshot.filters, snapshot.kindleFilterStatuses ?? snapshot.kindleStatus);
   const summary = snapshot.filters.view === "on-kindle"
     ? `<strong>${books.length}</strong> matched items in these results`
     : `<strong>${page?.total ?? 0}</strong> books`;
@@ -370,6 +371,7 @@ export function renderLibraryResults(state: AppState, snapshot: CatalogBrowserSn
   return `
     ${snapshot.stale ? `<div class="library-stale-notice" role="status"><strong>Catalog temporarily unavailable.</strong> Showing the most recent results in this browser. <button type="button" data-ui-action="retry-catalog">Retry</button></div>` : ""}
     <div class="library-results-head"><p>${summary}</p><div class="library-results-controls"><span>${snapshot.booksState === "loading" ? "Refreshing…" : snapshot.filters.view === "on-kindle" ? "Device comparison" : snapshot.layout === "list" ? "List view" : "Cover grid"}</span>${renderLayoutControls(snapshot)}</div></div>
+    ${snapshot.kindleFilterStatuses ? '<p class="library-refresh-note" role="status">Updating library… Your books stay visible while we refresh their Kindle status.</p>' : ""}
     ${renderActiveFilters(snapshot)}
     ${snapshot.readingHistoryError ? `<p role="alert">Read books could not be fully saved: ${escapeHtml(snapshot.readingHistoryError)} Reconnect to retry.</p>` : ""}
     ${snapshot.activeShelf?.id === "builtin-read-books" ? `<p class="library-reading-note">Books confirmed Read on your Kindle stay here after disconnecting or removing the Kindle copy.${snapshot.readingEnabled ? "" : " Automatic reading detection is awaiting physical Kindle validation; no completion is inferred from percentage alone."}</p>` : ""}
@@ -517,7 +519,7 @@ export function renderOnboarding(snapshot: CatalogBrowserSnapshot, state: AppSta
   const busy = wizard.busy || snapshot.settingsSaving || snapshot.settingsRefreshing;
   const supported = state.secureContext && state.webUsbAvailable;
   const content = wizard.step === "welcome"
-    ? `<h2>Welcome to ShelfSend</h2><p>Set up your household library in a few steps. Your original books stay untouched, and no account or provider API key is required.</p>`
+    ? `<h2>Welcome to ShelfSend</h2><p>Add your first library, then start browsing and sending books. Your original files stay untouched.</p>`
     : wizard.step === "library"
       ? `<h2>Create your library</h2><p>Give it a name and add a folder in the form below. Use the path inside the container, such as <code>/libraries/books</code>—not a host path or SMB address. Save the library to continue.</p>`
       : wizard.step === "indexing"
@@ -533,17 +535,17 @@ function renderLibrarySettings(snapshot: CatalogBrowserSnapshot): string {
   const editsDisabled = locked || snapshot.settingsSaving || snapshot.settingsRefreshing || snapshot.settingsConflict;
   return `
     <section class="settings-page${snapshot.onboarding ? " settings-onboarding" : ""}" aria-labelledby="settings-heading">
-      <header class="settings-page-head"><div><div class="library-eyebrow">Household configuration</div><h1 id="settings-heading" tabindex="-1">Library settings</h1><p>Create libraries and choose which container-mounted folders each one can see.</p></div><button type="button" class="primary" data-ui-action="new-library"${editsDisabled ? " disabled" : ""}>+ New library</button></header>
+      <header class="settings-page-head"><div><div class="library-eyebrow">Libraries</div><h1 id="settings-heading" tabindex="-1">Library settings</h1><p>Create libraries and choose which container-mounted folders each one can see.</p></div><button type="button" class="primary" data-ui-action="new-library"${editsDisabled ? " disabled" : ""}>+ New library</button></header>
       <div class="settings-prototype-notice" role="note"><strong>Saved on this server</strong><span>Configuration persists across restarts. Catalog folders must be mounted read-only into the ShelfSend container.</span></div>
       ${locked ? '<div class="settings-prototype-notice settings-locked-notice" role="status"><strong>Settings locked</strong><span>This server manages its library configuration outside the browser. You can inspect folders and request a scan, but editing is disabled.</span></div>' : ""}
-      <div class="settings-prototype-notice warning" role="note"><strong>No private accounts</strong><span>Anyone who can open this service can switch between every configured household library. Keep it on a trusted LAN or VPN.</span></div>
+      <div class="settings-prototype-notice warning" role="note"><strong>No private accounts</strong><span>Anyone who can open this service can switch between every configured library. Keep it on a trusted LAN or VPN.</span></div>
       ${snapshot.onboarding ? "" : `<button type="button" data-ui-action="onboarding-open"${editsDisabled ? " disabled" : ""}>Run setup wizard</button>${renderCoverProviderSettings(snapshot)}`}
       ${snapshot.settingsError && draft ? `<div class="settings-error-summary" role="alert" tabindex="-1"><strong>Check these settings</strong><span>${escapeHtml(snapshot.settingsError)}</span></div>` : ""}
       <div class="settings-layout">
-        <aside class="settings-library-picker" aria-label="Configured libraries"><div class="settings-section-label">Household libraries</div><div class="settings-library-options">${renderSettingsLibraryList(snapshot) || '<p class="settings-empty-copy">No libraries configured yet.</p>'}</div><div class="settings-picker-note"><strong>${snapshot.profiles.length} configured</strong><span>Each library can contain multiple container folders.</span></div></aside>
+        <aside class="settings-library-picker" aria-label="Configured libraries"><div class="settings-section-label">Libraries</div><div class="settings-library-options">${renderSettingsLibraryList(snapshot) || '<p class="settings-empty-copy">No libraries configured yet.</p>'}</div><div class="settings-picker-note"><strong>${snapshot.profiles.length} configured</strong><span>Each library can contain multiple container folders.</span></div></aside>
         ${draft ? `<form class="settings-editor" aria-label="Edit ${escapeHtml(draft.name)}" data-settings-library-id="${escapeHtml(draft.id)}"${snapshot.settingsSaving || snapshot.settingsRefreshing ? ' aria-busy="true"' : ""}>
           <div class="settings-editor-head"><div><span class="settings-library-icon" aria-hidden="true">${escapeHtml(draft.initial)}</span><span><strong>${draft.persisted ? "Edit library" : "Create library"}</strong><small>${draft.persisted ? `Profile ID · ${escapeHtml(draft.id)}` : "Not saved yet"}</small></span></div><span class="settings-unsaved-chip${snapshot.settingsDirty ? " dirty" : ""}">${snapshot.settingsDirty ? "Unsaved changes" : "Server configuration"}</span></div>
-          <div class="settings-library-fields"><label class="settings-field"><span>Display name</span><input id="settings-library-name" value="${escapeHtml(draft.name)}" maxlength="50" placeholder="e.g. Family classics" autocomplete="off"${editsDisabled ? " disabled" : ""} /><small>Shown in the household library switcher.</small></label><label class="settings-library-enabled"><input id="settings-library-enabled" type="checkbox"${draft.enabled ? " checked" : ""}${editsDisabled ? " disabled" : ""} /><span><strong>Enable this library</strong><small>Disabled libraries stay configured but are hidden from the main switcher.</small></span></label></div>
+          <div class="settings-library-fields"><label class="settings-field"><span>Display name</span><input id="settings-library-name" value="${escapeHtml(draft.name)}" maxlength="50" placeholder="e.g. Family classics" autocomplete="off"${editsDisabled ? " disabled" : ""} /><small>Shown in the library switcher.</small></label><label class="settings-library-enabled"><input id="settings-library-enabled" type="checkbox"${draft.enabled ? " checked" : ""}${editsDisabled ? " disabled" : ""} /><span><strong>Enable this library</strong><small>Disabled libraries stay configured but are hidden from the main switcher.</small></span></label></div>
           <div class="settings-folders-head"><div><strong>Container-mounted folders</strong><span>Each enabled folder is indexed independently.</span></div><button type="button" data-ui-action="add-settings-folder"${editsDisabled ? " disabled" : ""}>+ Add folder</button></div>
           <div class="settings-folder-list">${draft.folders.map((folder, index) => renderSettingsFolder(folder, index, draft.folders.length, snapshot, locked)).join("")}</div>
           ${renderDeleteConfirmation(snapshot, draft)}
@@ -557,17 +559,17 @@ function renderLibrarySettings(snapshot: CatalogBrowserSnapshot): string {
 
 function renderBatchTransferBooks(snapshot: CatalogBrowserSnapshot): string {
   const batch = snapshot.batchTransfer;
-  if (!batch) return "";
+  if (!batch || (snapshot.sendBusy && !batch.failedBook)) return "";
   const verified = batch.verifiedBooks.length === 0
-    ? '<p class="library-batch-empty">No books verified yet.</p>'
-    : `<ul class="library-batch-book-list">${batch.verifiedBooks.map(({ title }) => `<li><span aria-hidden="true">✓</span>${escapeHtml(title)}</li>`).join("")}</ul>`;
+    ? '<p class="library-batch-empty">No books were sent.</p>'
+    : `<strong class="library-batch-result-label">Sent to Kindle · ${batch.verifiedBooks.length}</strong><ul class="library-batch-book-list">${batch.verifiedBooks.map(({ title }) => `<li><span aria-hidden="true">✓</span>${escapeHtml(title)}</li>`).join("")}</ul>`;
   const failure = batch.failedBook
-    ? `<div class="library-batch-failure"><strong>Failed</strong><span>${escapeHtml(batch.failedBook.title)}</span></div>`
+    ? `<div class="library-batch-failure"><strong>Couldn’t send</strong><span>${escapeHtml(batch.failedBook.title)}</span></div>`
     : "";
   const retry = batch.retryBooks.length === 0
     ? ""
-    : `<div class="library-batch-retry"><strong>Selected for retry</strong><ul>${batch.retryBooks.map(({ title }) => `<li>${escapeHtml(title)}</li>`).join("")}</ul></div>`;
-  return `<div class="library-batch-book-results"><strong>Transferred and verified</strong>${verified}${failure}${retry}</div>`;
+    : `<div class="library-batch-retry"><strong>${batch.retryBooks.length} ${batch.retryBooks.length === 1 ? "book" : "books"} selected for retry</strong><ul>${batch.retryBooks.map(({ title }) => `<li>${escapeHtml(title)}</li>`).join("")}</ul></div>`;
+  return `<div class="library-batch-book-results" aria-label="Transfer results">${verified}${failure}${retry}</div>`;
 }
 
 function renderSendPreview(state: AppState, snapshot: CatalogBrowserSnapshot): string {
@@ -579,17 +581,16 @@ function renderSendPreview(state: AppState, snapshot: CatalogBrowserSnapshot): s
   const connected = actualDeviceConnected(state);
   const connecting = deviceConnecting(state);
   const phase = snapshot.sendPhase;
-  const sourceDone = Boolean(phase);
-  const derivativeDone = phase === "sending" || phase === "verifying" || phase === "complete";
   const transferDone = phase === "complete";
-  const batch = snapshot.batchTransfer;
-  const batchSucceeded = Boolean(batch && phase === "complete" && batch.verifiedBooks.length === batch.total);
-  const batchFailed = Boolean(batch?.failedBook && phase === "failed");
+  const batch = snapshot.batchTransfer!;
+  const batchSucceeded = !snapshot.sendBusy && phase === "complete" && batch.verifiedBooks.length === batch.total;
+  const batchFailed = Boolean(batch.failedBook && phase === "failed");
+  const finalizing = snapshot.sendBusy && (batch.verifiedBooks.length === batch.total || batchFailed);
   const buttonAction = batchSucceeded || batchFailed || transferDone
     ? "close-send"
     : ready ? "confirm-catalog-send" : "connect-catalog-device";
   const buttonLabel = batchFailed
-    ? `Review ${batch!.retryBooks.length} selected`
+    ? `Review ${batch.retryBooks.length} selected`
     : batchSucceeded || transferDone
     ? "Done"
     : phase === "failed"
@@ -601,35 +602,50 @@ function renderSendPreview(state: AppState, snapshot: CatalogBrowserSnapshot): s
           : connecting
             ? "Connecting Kindle…"
             : connected
-              ? state.selfTest.kind === "passed" ? "Kindle inventory unavailable" : "Waiting for safe-write test"
+              ? state.selfTest.kind === "passed" ? "Waiting for Kindle" : "Checking Kindle…"
               : "Connect Kindle";
-  const progress = snapshot.sendProgress;
-  const overallProgress = batch
-    ? phase === "failed"
-      ? Math.round(100 * batch.verifiedBooks.length / batch.total)
-      : Math.round(100 * ((batch.position - 1) + (progress ?? 0) / 100) / batch.total)
-    : progress;
+  const progress = Math.max(0, Math.min(100, snapshot.sendProgress ?? 0));
+  const overallProgress = Math.max(0, Math.min(100, Math.round(100 * (phase === "failed"
+    ? batch.verifiedBooks.length
+    : (batch.position - 1) + progress / 100) / batch.total)));
   const heading = batchSucceeded
-    ? "Batch complete"
+    ? `${batch.total} books sent`
     : batchFailed
-      ? `Stopped at “${book.title}”`
+      ? "Transfer stopped"
       : book.title;
   const author = batchSucceeded
-    ? `${batch!.total} selected books`
+    ? "All selected books are on your Kindle."
     : bookAuthor(book);
-  const statusTitle = batchSucceeded
-    ? "Batch complete"
+  const statusTitle = finalizing
+    ? "Updating your library…"
+    : batchSucceeded
+    ? "Transfer complete"
     : batchFailed
-      ? "Batch stopped"
+      ? "Transfer needs attention"
       : phase === "complete"
-        ? batch ? "Verified" : "Complete"
+        ? "Book sent"
         : phase === "failed"
-          ? "Transfer failed"
-          : phase?.replace(/^./u, (value) => value.toLocaleUpperCase());
-  const progressDetail = batch && overallProgress !== undefined
-    ? `<small class="library-batch-progress-detail">Overall ${overallProgress}% · Current book ${progress ?? 0}%</small>`
-    : "";
-  return `<div class="library-modal-backdrop"${snapshot.sendBusy ? "" : ' data-ui-action="close-send"'} aria-hidden="true"></div><section class="library-send-sheet" role="dialog" aria-modal="true" aria-labelledby="send-preview-title" data-send-book-id="${escapeHtml(book.id)}" tabindex="-1"><button type="button" class="library-sheet-close" data-ui-action="close-send" aria-label="Close send dialog"${snapshot.sendBusy ? " disabled" : ""}>×</button><div class="library-sheet-eyebrow">${batch ? `Book ${batch.position} of ${batch.total}` : "Send to Kindle"}</div><h2 id="send-preview-title">${escapeHtml(heading)}</h2><p class="library-sheet-author">${escapeHtml(author)}</p><div class="library-send-plan"><div class="${sourceDone ? "done" : ""}"><span>1</span><div><strong>Check source</strong><small>${escapeHtml(book.format.toLocaleUpperCase())} · ${escapeHtml(formatCatalogBytes(book.size))}</small></div></div><div class="${derivativeDone ? "done" : phase === "converting" || phase === "validating" ? "active" : ""}"><span>2</span><div><strong>${book.format.toLocaleLowerCase() === "epub" ? "Convert a copy locally" : "Validate Kindle file"}</strong><small>${book.format.toLocaleLowerCase() === "epub" ? "boko WASM → AZW3 personal document" : "BOOKMOBI and cover checks"}</small></div></div><div class="${transferDone ? "done" : phase === "sending" || phase === "verifying" ? "active" : ""}"><span>3</span><div><strong>Send and verify</strong><small>Collision-safe WebUSB/MTP transfer</small></div></div></div>${phase ? `<div class="library-transfer-status${phase === "failed" ? " failed" : ""}" role="status"><strong>${escapeHtml(statusTitle ?? "Working")}</strong><span>${escapeHtml(snapshot.sendMessage ?? "Working locally in this browser")}</span>${progressDetail}${overallProgress === undefined ? "" : `<div class="progress-track" role="progressbar" aria-label="${batch ? "Overall batch progress" : "Book transfer progress"}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${overallProgress}"><span style="width:${overallProgress}%"></span></div>`}</div>` : ""}${renderBatchTransferBooks(snapshot)}<div class="library-original-note"><strong>Original protected</strong><span>The source in the container-mounted library remains unchanged.</span></div><button type="button" class="primary library-confirm-send" data-ui-action="${buttonAction}"${snapshot.sendBusy || connecting || (connected && !ready && !transferDone && !batchFailed) ? " disabled" : ""}>${buttonLabel}</button></section>`;
+          ? "Couldn’t send this book"
+          : phase === "sending"
+            ? "Sending to Kindle…"
+            : phase === "verifying"
+              ? "Checking transfer…"
+              : "Preparing book…";
+  return `<div class="library-modal-backdrop"${snapshot.sendBusy ? "" : ' data-ui-action="close-send"'} aria-hidden="true"></div>
+    <section class="library-send-sheet library-batch-sheet" role="dialog" aria-modal="true" aria-labelledby="send-preview-title" data-send-book-id="${escapeHtml(book.id)}" tabindex="-1">
+      <button type="button" class="library-sheet-close" data-ui-action="close-send" aria-label="Close send dialog"${snapshot.sendBusy ? " disabled" : ""}>×</button>
+      <div class="library-sheet-eyebrow">Book ${batch.position} of ${batch.total}</div>
+      <h2 id="send-preview-title">${escapeHtml(heading)}</h2>
+      <p class="library-sheet-author">${escapeHtml(author)}</p>
+      <div class="library-transfer-status${phase === "failed" ? " failed" : ""}" role="status">
+        <div class="library-batch-progress-heading"><strong>${escapeHtml(statusTitle)}</strong><span>${overallProgress}%</span></div>
+        <div class="progress-track" role="progressbar" aria-label="Overall batch progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${overallProgress}" aria-valuetext="${batch.verifiedBooks.length} of ${batch.total} books sent${finalizing ? "; updating your library" : `; ${overallProgress}% overall`}"><span style="width:${overallProgress}%"></span></div>
+        <div class="library-batch-progress-detail"><span>${batch.verifiedBooks.length} of ${batch.total} books sent</span>${snapshot.sendBusy ? "<span>Keep your Kindle connected</span>" : ""}</div>
+        ${phase === "failed" && snapshot.sendMessage ? `<p class="library-batch-error">${escapeHtml(snapshot.sendMessage)}</p>` : ""}
+      </div>
+      ${renderBatchTransferBooks(snapshot)}
+      ${snapshot.sendBusy ? "" : `<button type="button" class="primary library-confirm-send" data-ui-action="${buttonAction}"${connecting || (connected && !ready && !transferDone && !batchFailed) ? " disabled" : ""}>${buttonLabel}</button>`}
+    </section>`;
 }
 
 function renderRemovalConfirmation(snapshot: CatalogBrowserSnapshot): string {
@@ -645,7 +661,17 @@ function renderRemovalConfirmation(snapshot: CatalogBrowserSnapshot): string {
     : currentAuthority
       ? `Remove ${fileCount === 1 ? "file" : `${fileCount} files`}`
       : "Reconnect to remove";
-  return `<div class="library-modal-backdrop" data-ui-action="cancel-remove-from-kindle" aria-hidden="true"></div><section class="library-remove-sheet" role="alertdialog" aria-modal="true" aria-labelledby="remove-kindle-title" aria-describedby="remove-kindle-description" tabindex="-1"><div class="library-sheet-eyebrow">Kindle cleanup</div><h2 id="remove-kindle-title">Remove ${bookCount === 1 ? `“${escapeHtml(request.targets[0]!.title)}”` : `${bookCount} books`} from this Kindle?</h2><p id="remove-kindle-description">This deletes only the ${fileCount} exact matched ${fileCount === 1 ? "file" : "files"} shown below from the connected Kindle. Library originals are not changed.</p>${snapshot.bulkActionError ? `<div class="library-transfer-status failed" role="alert"><strong>Removal did not complete</strong><span>${escapeHtml(snapshot.bulkActionError)}</span></div>` : ""}<ul class="library-remove-targets">${request.targets.map((target) => `<li><span><strong>${escapeHtml(target.title)}</strong><small>${escapeHtml(target.filename)}</small></span><span>${escapeHtml(formatCatalogBytes(target.size))}</span></li>`).join("")}</ul><div class="library-remove-warning" role="note"><strong>This cannot be undone on the Kindle.</strong><span>You can send the library copy again later.</span></div><div class="library-remove-actions"><button type="button" data-ui-action="cancel-remove-from-kindle"${snapshot.bulkActionBusy ? " disabled" : ""}>Cancel</button><button type="button" class="danger" data-ui-action="confirm-remove-from-kindle"${removalLocked ? " disabled" : ""}>${actionLabel}</button></div></section>`;
+  return `<div class="library-modal-backdrop" data-ui-action="cancel-remove-from-kindle" aria-hidden="true"></div>
+    <section class="library-remove-sheet" role="alertdialog" aria-modal="true" aria-labelledby="remove-kindle-title" aria-describedby="remove-kindle-description remove-kindle-warning" tabindex="-1">
+      <div class="library-remove-heading"><span class="library-remove-icon" aria-hidden="true">${libraryIcon("device")}</span><div class="library-sheet-eyebrow">On your Kindle</div></div>
+      <h2 id="remove-kindle-title">Remove ${bookCount === 1 ? `“${escapeHtml(request.targets[0]!.title)}”` : `${bookCount} books`} from this Kindle?</h2>
+      <p id="remove-kindle-description">Only these Kindle copies will be removed. Library originals are not changed.</p>
+      ${snapshot.bulkActionError ? `<div class="library-transfer-status failed" role="alert"><strong>Removal did not complete</strong><span>${escapeHtml(snapshot.bulkActionError)}</span></div>` : ""}
+      <div class="library-remove-list-heading">${fileCount} exact matched ${fileCount === 1 ? "file" : "files"}</div>
+      <ul class="library-remove-targets" aria-label="Files to remove from Kindle">${request.targets.map((target) => `<li><span><strong>${escapeHtml(target.title)}</strong><small>${escapeHtml(target.filename)}</small></span><span>${escapeHtml(formatCatalogBytes(target.size))}</span></li>`).join("")}</ul>
+      <div class="library-remove-warning" id="remove-kindle-warning" role="note"><strong>Removal can’t be undone.</strong><span>You can send these books to your Kindle again later.</span></div>
+      <div class="library-remove-actions"><button type="button" data-ui-action="cancel-remove-from-kindle"${snapshot.bulkActionBusy ? " disabled" : ""}>Cancel</button><button type="button" class="danger" data-ui-action="confirm-remove-from-kindle"${removalLocked ? " disabled" : ""}>${actionLabel}</button></div>
+    </section>`;
 }
 
 function renderUpdateConfirmation(snapshot: CatalogBrowserSnapshot): string {
@@ -1039,12 +1065,13 @@ export function renderKindleDeviceContents(
   snapshot: CatalogBrowserSnapshot,
   connected: boolean,
   inventoryState: AppState["catalogInventoryState"] = "idle",
+  searchQuery = snapshot.filters.query,
 ): string {
   const inventory = snapshot.kindleInventory;
   if (!inventory) {
     return `<section class="library-device-contents" aria-labelledby="device-contents-title"><div class="library-device-contents-head"><div><span class="library-eyebrow">Device contents</span><h2 id="device-contents-title">Kindle Documents</h2></div><span class="library-inventory-chip">No inventory</span></div><div class="library-empty-state compact"><span aria-hidden="true">▯</span><h3>No Kindle inventory available</h3><p>${connected ? inventoryState === "failed" ? "The automatic inventory failed. Disconnect and reconnect the Kindle to try again." : "The connected-device scan has not completed yet." : "Connect a Kindle to read its Documents content."}</p></div></section>`;
   }
-  const query = snapshot.filters.query.trim().toLocaleLowerCase();
+  const query = searchQuery.trim().toLocaleLowerCase();
   const matchingItems = inventory.items.filter((item) => !query || [item.title, item.author, item.filename, item.format, item.path].filter(Boolean).join(" ").toLocaleLowerCase().includes(query));
   const pageSize = 100;
   const maximumOffset = Math.max(0, Math.floor((matchingItems.length - 1) / pageSize) * pageSize);
@@ -1081,79 +1108,6 @@ export function renderKindleDeviceContents(
               : "Comparison unavailable";
     return `<article data-kindle-object-id="${escapeHtml(item.id)}"><span class="library-device-file-icon" aria-hidden="true">${escapeHtml((item.format ?? "DOC").slice(0, 4).toLocaleUpperCase())}</span><span><strong>${escapeHtml(item.title ?? item.filename)}</strong><small>${escapeHtml(item.author ?? item.filename)} · ${escapeHtml(formatCatalogBytes(item.size))}</small>${item.path ? `<code>${escapeHtml(item.path)}</code>` : ""}</span><span class="library-device-match" data-match="${matchTone}">${matchLabel}</span><button type="button" class="library-device-review" data-ui-action="open-match-review" data-item-id="${escapeHtml(item.id)}"${item.bookId ? ` data-book-id="${escapeHtml(item.bookId)}"` : ""}>Compare</button></article>`;
   }).join("") || '<p class="settings-empty-copy">No device items match this search.</p>'}</div>${matchingItems.length > pageSize ? `<nav class="library-pagination library-device-pagination" aria-label="Kindle content pages"><button type="button" data-ui-action="kindle-page" data-page-offset="${Math.max(0, offset - pageSize)}"${offset === 0 ? " disabled" : ""}>Previous</button><span>${offset + 1}–${Math.min(offset + pageSize, matchingItems.length)} of ${matchingItems.length}</span><button type="button" data-ui-action="kindle-page" data-page-offset="${offset + pageSize}"${offset + pageSize >= matchingItems.length ? " disabled" : ""}>Next</button></nav>` : ""}${inventory.truncated ? '<p class="library-device-truncated">The device hierarchy reached its bounded 10,000-object scan limit; this inventory is explicitly partial.</p>' : ""}</section>`;
-}
-
-const ISSUE_TYPE_LABELS = Object.freeze({
-  "missing-cover": "Missing cover",
-  "incomplete-metadata": "Incomplete metadata",
-  "metadata-parser-failure": "Metadata parser failure",
-  "low-confidence-provider-data": "Low-confidence provider result",
-  "unavailable-source": "Source unavailable",
-  "suspected-duplicate": "Possible duplicate",
-} as const);
-
-function issueReason(reasonCode: string): string {
-  const known: Readonly<Record<string, string>> = {
-    "cover-missing": "No usable cover is available for this book.",
-    "core-fields-incomplete": "One or more core metadata fields could not be read.",
-    "provider-candidates-low-confidence": "The latest provider lookup returned only low-confidence suggestions.",
-    "source-unavailable": "The indexed source file is not currently accessible.",
-    "duplicate-content-hash": "These entries have identical source content.",
-    "duplicate-identifier": "These entries share an identifier such as ISBN.",
-    "duplicate-title-author": "These entries have the same normalized title and author.",
-  };
-  return known[reasonCode] ?? reasonCode.replaceAll("-", " ").replace(/^./u, (letter) => letter.toLocaleUpperCase());
-}
-
-function renderMetadataLookupJobs(snapshot: CatalogBrowserSnapshot): string {
-  const page = snapshot.metadataLookupJobs;
-  const active = snapshot.activeMetadataLookupJob;
-  const busy = snapshot.metadataLookupBusy;
-  if (snapshot.metadataLookupState === "loading" && !page) {
-    return '<section class="attention-jobs"><div class="library-loading-state compact" role="status"><span></span><strong>Loading metadata lookups…</strong></div></section>';
-  }
-  const summaries = page?.items ?? [];
-  const detail = !active ? "" : `<section class="metadata-job-detail" aria-labelledby="metadata-job-detail-title"><header><div><span class="library-eyebrow">${escapeHtml(active.provider === "google-books" ? "Google Books" : "Open Library")}</span><h3 id="metadata-job-detail-title">Lookup job</h3><p>${active.ready} ready · ${active.pending} pending · ${active.failed} failed · ${active.noResults} without results</p></div><button type="button" data-ui-action="close-metadata-job" aria-label="Close lookup details">×</button></header>${snapshot.metadataLookupError ? `<div class="metadata-candidate-status error" role="alert">${escapeHtml(snapshot.metadataLookupError)}</div>` : ""}<div class="metadata-job-controls"><span class="metadata-job-status" data-status="${escapeHtml(active.status)}">${escapeHtml(active.status)}</span>${active.status === "paused" ? `<button type="button" data-ui-action="control-metadata-job" data-job-action="resume"${busy ? " disabled" : ""}>Resume and continue</button>` : active.status === "running" ? `<button type="button" data-ui-action="control-metadata-job" data-job-action="pause">Pause</button>` : ""}${active.status === "completed" && active.failed > 0 ? `<button type="button" data-ui-action="control-metadata-job" data-job-action="retry"${busy ? " disabled" : ""}>Retry failed</button>` : ""}${active.status !== "completed" && active.status !== "cancelled" ? `<button type="button" data-ui-action="run-metadata-job"${busy || active.status === "paused" ? " disabled" : ""}>${busy ? "Looking up books…" : "Start lookup"}</button><button type="button" class="danger" data-ui-action="control-metadata-job" data-job-action="cancel">Cancel</button>` : ""}</div><div class="metadata-job-progress"><div class="progress-track" role="progressbar" aria-label="Metadata lookup progress" aria-valuemin="0" aria-valuemax="${Math.max(1, active.total)}" aria-valuenow="${Math.max(0, active.total - active.pending)}"><span style="width:${active.total > 0 ? Math.round(100 * (active.total - active.pending) / active.total) : 0}%"></span></div><small>${active.total - active.pending} of ${active.total} checked</small></div><ol class="metadata-job-entries">${active.entries.map((entry) => {
-    const book = snapshot.healthBooks.get(entry.bookId);
-    const candidate = entry.candidates[0];
-    return `<li data-status="${escapeHtml(entry.status)}"><span><strong>${escapeHtml(book?.title ?? `Book ${entry.rank + 1}`)}</strong><small>${escapeHtml(entry.status.replaceAll("-", " "))}${entry.errorCode ? ` · ${escapeHtml(entry.errorCode.replaceAll("-", " "))}` : ""}${entry.acceptedAt ? " · imported" : ""}</small></span>${candidate && !entry.acceptedAt ? `<button type="button" data-ui-action="review-metadata-job-candidate" data-job-id="${escapeHtml(active.id)}" data-book-id="${escapeHtml(entry.bookId)}" data-candidate-id="${escapeHtml(candidate.candidateId)}">Review ${entry.candidates.length} ${entry.candidates.length === 1 ? "suggestion" : "suggestions"}</button>` : ""}</li>`;
-  }).join("")}</ol><p class="metadata-job-safety">Suggestions remain review-only. ShelfSend never changes metadata or covers until you choose fields and import them.</p></section>`;
-  return `<section class="attention-jobs" aria-labelledby="metadata-jobs-title"><div class="attention-section-head"><div><h2 id="metadata-jobs-title">Metadata lookups</h2><p>Bounded provider searches for up to 100 explicitly selected books.</p></div><button type="button" data-ui-action="reload-metadata-jobs"${snapshot.metadataLookupState === "loading" ? " disabled" : ""}>Refresh</button></div>${snapshot.metadataLookupError && !active ? `<div class="metadata-candidate-status error" role="alert">${escapeHtml(snapshot.metadataLookupError)}</div>` : ""}${summaries.length === 0 ? '<div class="attention-empty compact"><strong>No lookup jobs yet</strong><span>Select books in List view and choose Find metadata.</span></div>' : `<div class="metadata-job-list">${summaries.map((job) => `<button type="button" data-ui-action="open-metadata-job" data-job-id="${escapeHtml(job.id)}"${active?.id === job.id ? ' aria-current="true"' : ""}><span><strong>${escapeHtml(job.provider === "google-books" ? "Google Books" : "Open Library")}</strong><small>${escapeHtml(relativeScanTime(job.updatedAt))}</small></span><span>${job.ready} ready / ${job.total}</span><em data-status="${escapeHtml(job.status)}">${escapeHtml(job.status)}</em></button>`).join("")}</div>`}${detail}</section>`;
-}
-
-function renderCatalogIssueContext(issue: CatalogHealthIssue, snapshot: CatalogBrowserSnapshot): string {
-  const roots = issue.rootIds.map((rootId) => ({
-    rootId,
-    root: snapshot.rootsByProfile.get(issue.profileId)?.find(({ id }) => id === rootId),
-  }));
-  const labels = issue.displayLabels.length > 0
-    ? `<div class="attention-issue-labels"><strong>Affected ${issue.displayLabels.length === 1 ? "entry" : "entries"}</strong>${issue.displayLabels.map((label) => `<span>${escapeHtml(label)}</span>`).join("")}</div>`
-    : '<div class="attention-issue-labels"><strong>Affected entry</strong><span>Label unavailable</span></div>';
-  const rootContext = roots.length > 0
-    ? `<div class="attention-issue-roots">${roots.map(({ rootId, root }) => `<span><strong>${escapeHtml(root?.label ?? `Catalog root ${rootId.slice(0, 12)}`)}</strong><code>${escapeHtml(root?.path ?? "Container path unavailable")}</code><small>${root ? escapeHtml(root.status.replaceAll("-", " ")) : "Root configuration unavailable"}</small></span>`).join("")}</div>`
-    : '<div class="attention-issue-roots"><span><strong>Catalog source</strong><code>Container path unavailable</code></span></div>';
-  return `<div class="attention-issue-context" aria-label="Affected source context"><span class="attention-source-state" data-available="${issue.currentAvailable}">${issue.currentAvailable ? "Current source available" : "Current source unavailable"}</span>${labels}${rootContext}</div>`;
-}
-
-function renderNeedsAttention(snapshot: CatalogBrowserSnapshot): string {
-  const page = snapshot.healthPage;
-  const filter = snapshot.healthFilter;
-  const counts = page?.counts;
-  const issues = page?.items ?? [];
-  const pagination = page && page.total > page.limit
-    ? `<nav class="library-pagination" aria-label="Needs attention pages"><button type="button" data-ui-action="catalog-health-page" data-page-offset="${Math.max(0, page.offset - page.limit)}"${page.offset === 0 || snapshot.healthState === "loading" ? " disabled" : ""}>Previous</button><span>${page.offset + 1}–${Math.min(page.offset + page.items.length, page.total)} of ${page.total}</span><button type="button" data-ui-action="catalog-health-page" data-page-offset="${page.offset + page.limit}"${page.offset + page.items.length >= page.total || snapshot.healthState === "loading" ? " disabled" : ""}>Next</button></nav>`
-    : "";
-  return `<section class="attention-page" aria-labelledby="attention-heading"><header class="attention-page-head"><div><div class="library-eyebrow">Catalog health</div><h1 id="attention-heading" tabindex="-1">Needs attention</h1><p>Fix index and presentation problems without changing a mounted source file.</p></div><div class="attention-counts" aria-label="Issue summary"><span><strong>${counts?.active ?? 0}</strong> active</span><span><strong>${counts?.bySeverity.error ?? 0}</strong> errors</span><span><strong>${counts?.ignored ?? 0}</strong> ignored</span></div></header><div class="attention-filter-bar"><label><span>Issue type</span><select id="catalog-health-type"><option value="all">All types</option>${Object.entries(ISSUE_TYPE_LABELS).map(([value, label]) => `<option value="${value}"${filter.type === value ? " selected" : ""}>${escapeHtml(label)}${counts ? ` (${counts.byType[value as keyof typeof ISSUE_TYPE_LABELS]})` : ""}</option>`).join("")}</select></label><label><span>Severity</span><select id="catalog-health-severity"><option value="all">All severities</option>${(["error", "warning", "info"] as const).map((severity) => `<option value="${severity}"${filter.severity === severity ? " selected" : ""}>${severity.replace(/^./u, (letter) => letter.toLocaleUpperCase())}${counts ? ` (${counts.bySeverity[severity]})` : ""}</option>`).join("")}</select></label><label class="attention-ignored-toggle"><input id="catalog-health-ignored" type="checkbox"${filter.ignored ? " checked" : ""} /><span>Show ignored only</span></label><button type="button" data-ui-action="reload-catalog-health"${snapshot.healthState === "loading" ? " disabled" : ""}>Refresh</button></div>${snapshot.healthError ? `<div class="metadata-candidate-status error" role="alert"><span>${escapeHtml(snapshot.healthError)}</span><button type="button" data-ui-action="reload-catalog-health">Try again</button></div>` : ""}${snapshot.healthState === "loading" && !page ? '<div class="library-loading-state" role="status"><span></span><strong>Checking catalog health…</strong><small>Deriving current issues from the durable index</small></div>' : issues.length === 0 ? `<div class="attention-empty"><span aria-hidden="true">✓</span><strong>${filter.ignored ? "No ignored issues" : "Nothing needs attention"}</strong><p>${filter.ignored ? "Ignored issues will appear here while their underlying evidence still exists." : "The current catalog has no issues matching these filters."}</p></div>` : `<ol class="attention-issue-list">${issues.map((issue) => {
-    const busy = snapshot.healthBusySignature === issue.signature;
-    const books = issue.bookIds.map((bookId) => snapshot.healthBooks.get(bookId));
-    const canLookup = issue.type === "missing-cover" || issue.type === "incomplete-metadata" || issue.type === "low-confidence-provider-data";
-    const preferred = issue.disposition.preferredBookId;
-    return `<li class="attention-issue" data-severity="${escapeHtml(issue.severity)}"><header><span class="attention-severity" aria-label="${escapeHtml(issue.severity)}"></span><div><span class="library-eyebrow">${escapeHtml(issue.severity)}</span><h2>${escapeHtml(ISSUE_TYPE_LABELS[issue.type])}</h2><p>${escapeHtml(issueReason(issue.reasonCode))}</p></div><time datetime="${escapeHtml(issue.lastObservedAt)}">${escapeHtml(relativeScanTime(issue.lastObservedAt))}</time></header>${renderCatalogIssueContext(issue, snapshot)}${books.length ? `<ul class="attention-issue-books">${issue.bookIds.map((bookId, index) => {
-      const book = books[index];
-      const preferredBook = preferred === bookId;
-      return `<li${preferredBook ? ' data-preferred="true"' : ""}><span><strong>${escapeHtml(book?.title ?? `Catalog book ${bookId.slice(0, 12)}`)}</strong><small>${escapeHtml(book ? bookAuthor(book) : bookId)}${preferredBook ? " · preferred entry" : ""}</small></span>${issue.type === "suspected-duplicate" ? `<button type="button" data-ui-action="set-duplicate-preference" data-issue-signature="${escapeHtml(issue.signature)}" data-book-id="${escapeHtml(bookId)}" aria-pressed="${preferredBook}"${busy ? " disabled" : ""}>${preferredBook ? "Preferred" : "Keep this entry"}</button>` : `<button type="button" data-ui-action="review-issue-metadata" data-book-id="${escapeHtml(bookId)}"${busy ? " disabled" : ""}>Review metadata</button>`}</li>`;
-    }).join("")}</ul>` : ""}<footer><span>${issue.disposition.lastRetryAt ? `Last retry ${escapeHtml(relativeScanTime(issue.disposition.lastRetryAt))} · ${issue.disposition.retryCount} ${issue.disposition.retryCount === 1 ? "attempt" : "attempts"}` : "Not retried yet"}</span><div>${issue.type === "suspected-duplicate" && preferred ? `<button type="button" data-ui-action="set-duplicate-preference" data-issue-signature="${escapeHtml(issue.signature)}" data-book-id=""${busy ? " disabled" : ""}>Clear preference</button>` : ""}${canLookup ? `<button type="button" data-ui-action="lookup-issue-metadata" data-issue-signature="${escapeHtml(issue.signature)}" data-provider="open-library"${busy || issue.disposition.ignored ? " disabled" : ""}>Find metadata</button>` : ""}${issue.rootIds.length ? `<button type="button" data-ui-action="retry-catalog-issue" data-issue-signature="${escapeHtml(issue.signature)}"${busy || issue.disposition.ignored ? " disabled" : ""}>${busy ? "Requesting…" : "Retry / rescan"}</button>` : ""}<button type="button"${issue.disposition.ignored ? "" : ' class="danger"'} data-ui-action="set-catalog-issue-ignored" data-issue-signature="${escapeHtml(issue.signature)}" data-ignored="${issue.disposition.ignored ? "false" : "true"}"${busy ? " disabled" : ""}>${issue.disposition.ignored ? "Restore" : issue.type === "suspected-duplicate" ? "Reject grouping" : "Ignore"}</button></div></footer></li>`;
-  }).join("")}</ol>`}${pagination}${renderMetadataLookupJobs(snapshot)}</section>`;
 }
 
 function activityActionLabel(action: KindleBridgeActivityEvent["action"]): string {
@@ -1200,7 +1154,7 @@ function renderActivityCenter(state: AppState, snapshot: CatalogBrowserSnapshot)
   const metadataLookupFact = metadataLookup
     ? `<div class="activity-metadata-job" data-job-status="${escapeHtml(metadataLookup.status)}"><dt>Metadata lookup</dt><dd><strong>${metadataLookup.provider === "google-books" ? "Google Books" : "Open Library"} · ${escapeHtml(metadataLookup.status)}</strong><span>${metadataLookup.ready} ready · ${metadataLookup.pending} pending · ${metadataLookup.failed} failed · ${metadataLookup.noResults} without results</span><button type="button" data-ui-action="open-activity-metadata-job" data-job-id="${escapeHtml(metadataLookup.id)}">Open in Needs Attention</button></dd></div>`
     : "";
-  return `<div class="library-modal-backdrop" data-ui-action="close-activity-center" aria-hidden="true"></div><aside class="library-activity-sheet" role="dialog" aria-modal="true" aria-labelledby="activity-center-title" tabindex="-1"><button type="button" class="library-sheet-close" data-ui-action="close-activity-center" aria-label="Close activity center">×</button><header><div class="library-sheet-eyebrow">Current work</div><h2 id="activity-center-title">Activity &amp; device</h2><p>Plain-language status for this browser, Kindle, and the selected library.</p></header><section class="activity-current" data-phase="${escapeHtml(status.phase)}"><span class="activity-current-icon" aria-hidden="true">${status.phase === "ready" ? "✓" : status.phase === "needs-attention" ? "!" : status.phase === "disconnected" ? "▯" : "↻"}</span><div><strong>${escapeHtml(phaseLabel)}</strong><span>${status.currentTitle ? `${status.batchPosition ? `Book ${status.batchPosition} of ${status.batchTotal}: ` : ""}${escapeHtml(status.currentTitle)}` : status.phase === "disconnected" ? "No Kindle is connected" : `${escapeHtml(status.deviceLabel)} · ${capacity}`}</span>${status.currentProgress === undefined ? "" : `<div class="progress-track" role="progressbar" aria-label="Current book progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${status.currentProgress}"><span style="width:${status.currentProgress}%"></span></div>`}</div></section><dl class="activity-facts"><div><dt>Send later</dt><dd>${status.queueCount} ${status.queueCount === 1 ? "book" : "books"} · ${formatCatalogBytes(status.queuedSourceBytes)}${status.approximateQueueCapacity === "unknown" ? " estimated" : status.approximateQueueCapacity === "fits" ? " · likely fits" : " · may exceed free space"}</dd></div><div><dt>Kindle inventory</dt><dd>${status.lastInventoryAt ? `${escapeHtml(relativeScanTime(status.lastInventoryAt))} · ${escapeHtml(status.inventoryCompleteness ?? "unknown")}` : "Not read in this session"}</dd></div><div><dt>Library index</dt><dd>${status.indexedBooks} books · ${status.scanningRoots ? `${status.scanningRoots} scanning` : "watching"}${status.sourceWarnings ? ` · ${status.sourceWarnings} source warnings` : ""}</dd></div>${metadataLookupFact}<div><dt>Needs attention</dt><dd>${snapshot.healthPage?.counts.active ?? 0} current catalog issues</dd></div></dl><div class="activity-quick-actions"><button type="button" data-ui-action="open-send-queue">Open Send later</button><button type="button" data-ui-view="attention">Needs attention</button>${status.phase === "disconnected" ? `<button type="button" class="primary" data-ui-action="connect-catalog-device"${connectSupported ? "" : " disabled"}>Connect Kindle</button>` : ""}</div><section class="activity-history" aria-labelledby="activity-history-title"><div class="attention-section-head"><div><h3 id="activity-history-title">Recent activity</h3><p>Bounded to the latest 100 events in this browser.</p></div><button type="button" data-ui-action="clear-activity-history"${history.events.length === 0 ? " disabled" : ""}>Clear</button></div>${history.events.length === 0 ? '<div class="attention-empty compact"><strong>No recent results</strong><span>Transfers, removals, scans, lookups, and actionable failures will appear here.</span></div>' : `<ol>${history.events.slice(0, 20).map((event) => `<li data-tone="${escapeHtml(event.tone)}"${event.acknowledged ? ' data-acknowledged="true"' : ""}><span aria-hidden="true"></span><div><strong>${escapeHtml(event.title)}</strong>${event.detail ? `<small>${escapeHtml(event.detail)}</small>` : ""}<time datetime="${escapeHtml(event.at)}">${escapeHtml(relativeScanTime(event.at))}</time></div>${event.action ? `<button type="button" data-ui-action="activity-event-action" data-event-action="${escapeHtml(event.action)}" data-event-id="${escapeHtml(event.id)}"${activityActionAttributes(event, state, snapshot)}>${escapeHtml(activityActionLabel(event.action))}</button>` : !event.acknowledged ? `<button type="button" data-ui-action="acknowledge-activity" data-event-id="${escapeHtml(event.id)}" aria-label="Dismiss ${escapeHtml(event.title)}">×</button>` : ""}</li>`).join("")}</ol>`}</section><details class="activity-advanced"><summary>Advanced diagnostics</summary><div><p>Detailed debug and Kindle metadata-cache diagnostics stay out of the everyday interface.</p><div class="activity-advanced-actions"><button type="button" data-action="copy-log">Copy full debug log</button><button type="button" data-ui-action="export-activity-report">Download activity report</button></div><div data-ui-partial-object-probe></div></div></details></aside>`;
+  return `<div class="library-modal-backdrop" data-ui-action="close-activity-center" aria-hidden="true"></div><aside class="library-activity-sheet" role="dialog" aria-modal="true" aria-labelledby="activity-center-title" tabindex="-1"><button type="button" class="library-sheet-close" data-ui-action="close-activity-center" aria-label="Close activity center">×</button><header><div class="library-sheet-eyebrow">Current work</div><h2 id="activity-center-title">Activity &amp; device</h2><p>Plain-language status for this browser, Kindle, and the selected library.</p></header><section class="activity-current" data-phase="${escapeHtml(status.phase)}"><span class="activity-current-icon" aria-hidden="true">${status.phase === "ready" ? "✓" : status.phase === "needs-attention" ? "!" : status.phase === "disconnected" ? "▯" : "↻"}</span><div><strong>${escapeHtml(phaseLabel)}</strong><span>${status.currentTitle ? `${status.batchPosition ? `Book ${status.batchPosition} of ${status.batchTotal}: ` : ""}${escapeHtml(status.currentTitle)}` : status.phase === "disconnected" ? "No Kindle is connected" : `${escapeHtml(status.deviceLabel)} · ${capacity}`}</span>${status.currentProgress === undefined ? "" : `<div class="progress-track" role="progressbar" aria-label="Current book progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${status.currentProgress}"><span style="width:${status.currentProgress}%"></span></div>`}</div></section><dl class="activity-facts"><div><dt>Send later</dt><dd>${status.queueCount} ${status.queueCount === 1 ? "book" : "books"} · ${formatCatalogBytes(status.queuedSourceBytes)}${status.approximateQueueCapacity === "unknown" ? " estimated" : status.approximateQueueCapacity === "fits" ? " · likely fits" : " · may exceed free space"}</dd></div><div><dt>Kindle inventory</dt><dd>${status.lastInventoryAt ? `${escapeHtml(relativeScanTime(status.lastInventoryAt))} · ${escapeHtml(status.inventoryCompleteness ?? "unknown")}` : "Not read in this session"}</dd></div><div><dt>Library index</dt><dd>${status.indexedBooks} books · ${status.scanningRoots ? `${status.scanningRoots} scanning` : "watching"}${status.sourceWarnings ? ` · ${status.sourceWarnings} source warnings` : ""}</dd></div>${metadataLookupFact}<div><dt>Needs attention</dt><dd>${snapshot.healthPage?.counts.active ?? 0} current catalog issues</dd></div></dl><div class="activity-quick-actions"><button type="button" data-ui-action="open-send-queue">Open Send later</button><button type="button" data-ui-view="attention">Needs attention</button>${status.phase === "disconnected" ? `<button type="button" class="primary" data-ui-action="connect-catalog-device"${connectSupported ? "" : " disabled"}>Connect Kindle</button>` : ""}</div><section class="activity-history" aria-labelledby="activity-history-title"><div class="attention-section-head"><div><h3 id="activity-history-title">Recent activity</h3><p>Bounded to the latest 100 events in this browser.</p></div><button type="button" data-ui-action="clear-activity-history"${history.events.length === 0 ? " disabled" : ""}>Clear</button></div>${history.events.length === 0 ? '<div class="attention-empty compact"><strong>No recent results</strong><span>Transfers, removals, scans, lookups, and actionable failures will appear here.</span></div>' : `<ol>${history.events.slice(0, 20).map((event) => `<li data-tone="${escapeHtml(event.tone)}"${event.acknowledged ? ' data-acknowledged="true"' : ""}><span aria-hidden="true"></span><div><strong>${escapeHtml(event.title)}</strong>${event.detail ? `<small>${escapeHtml(event.detail)}</small>` : ""}<time datetime="${escapeHtml(event.at)}">${escapeHtml(relativeScanTime(event.at))}</time></div>${event.action ? `<button type="button" data-ui-action="activity-event-action" data-event-action="${escapeHtml(event.action)}" data-event-id="${escapeHtml(event.id)}"${activityActionAttributes(event, state, snapshot)}>${escapeHtml(activityActionLabel(event.action))}</button>` : !event.acknowledged ? `<button type="button" data-ui-action="acknowledge-activity" data-event-id="${escapeHtml(event.id)}" aria-label="Dismiss ${escapeHtml(event.title)}">×</button>` : ""}</li>`).join("")}</ol>`}</section><div class="activity-diagnostics-link"><button type="button" data-ui-action="open-settings-diagnostics">Open Diagnostics in Settings</button></div></aside>`;
 }
 
 function renderToolbar(snapshot: CatalogBrowserSnapshot): string {
@@ -1222,7 +1176,7 @@ function renderToolbar(snapshot: CatalogBrowserSnapshot): string {
 }
 
 function sourceSummary(snapshot: CatalogBrowserSnapshot): { readonly title: string; readonly detail: string; readonly tone: string } {
-  if (snapshot.loadState === "loading") return { title: "Connecting to catalog…", detail: "Loading household libraries", tone: "loading" };
+  if (snapshot.loadState === "loading") return { title: "Connecting to catalog…", detail: "Loading libraries", tone: "loading" };
   if (snapshot.loadState === "error") return { title: "Catalog service unavailable", detail: "Open Settings or retry the connection", tone: "error" };
   if (snapshot.serviceStatus?.database === "error" || snapshot.serviceStatus?.state === "unavailable") {
     return { title: "Catalog database unavailable", detail: "Durable storage needs operator attention", tone: "error" };
@@ -1275,6 +1229,7 @@ export function renderLibraryPrototype(
   state: AppState,
   snapshot: CatalogBrowserSnapshot,
   topAlertsHtml = "",
+  settingsDiagnosticsHtml = "",
 ): string {
   const profile = activeProfile(snapshot);
   const counts = countLibraryBooks(
@@ -1298,9 +1253,8 @@ export function renderLibraryPrototype(
   const currentComparison = connected
     && state.catalogInventoryState === "ready"
     && currentKindleComparison(snapshot);
-  const sendSummary = currentComparison
-    ? `<strong>${counts.readyToSend}</strong> ready to send`
-    : `<strong>—</strong> ${connecting || connected ? "checking inventory" : "connect to compare"}`;
+  const summaryFilter = (filter: string, count: number, label: string) => `<button type="button" data-ui-summary-filter="${filter}" aria-label="Show ${count} books: ${label}" aria-pressed="${snapshot.filters.kindle === filter && snapshot.filters.view === "all"}"${!currentComparison || snapshot.sendBusy ? " disabled" : ""}><strong>${currentComparison ? count : "—"}</strong><span>${label}</span></button>`;
+  const summary = `${summaryFilter("on-kindle", counts.onKindle, "On Kindle")}${summaryFilter("possible", counts.possible, "Possible matches")}${summaryFilter("not-on-kindle", counts.readyToSend, "Ready to send")}`;
   const source = sourceSummary(snapshot);
   const activityStatus = projectKindleBridgeActivityCenter(state, snapshot);
   const activityHistory = buildKindleBridgeActivityHistory(snapshot.activityEvents, activityStatus.phase);
@@ -1308,16 +1262,7 @@ export function renderLibraryPrototype(
     + (snapshot.healthPage?.counts.active ?? 0)
     + activityStatus.replacementCleanupCount;
   const activityLabel = activityStatus.phase.replaceAll("-", " ").replace(/^./u, (letter) => letter.toLocaleUpperCase());
-  const heading = snapshot.filters.view === "on-kindle" ? "Books on Kindle" : snapshot.filters.view === "recent" ? "Recently added" : profile?.name ?? "Household library";
-  const roots = profile ? snapshot.rootsByProfile.get(profile.id) ?? [] : [];
-  const enabledRoots = roots.filter((root) => root.enabled);
-  const sourceCardDetail = enabledRoots.length === 0
-    ? (roots.length === 0 ? "No folders configured" : "No folders enabled")
-    : enabledRoots.some((root) => root.status === "scanning")
-      ? "Scanning for changes"
-      : enabledRoots.some((root) => root.lastErrorCode || root.status === "paused")
-      ? "Scheduled checks continue"
-      : "Monitoring automatically";
+  const heading = snapshot.filters.view === "on-kindle" ? "Books on Kindle" : snapshot.filters.view === "recent" ? "Recently added" : profile?.name ?? "Library";
   const deviceTitle = disconnecting
     ? "Disconnecting Kindle…"
     : connected
@@ -1338,6 +1283,8 @@ export function renderLibraryPrototype(
           ? "Reading Kindle Documents…"
           : state.postConnectStage === "reconciliation"
             ? "Comparing Kindle with library…"
+            : pendingObjectWriteActive(state)
+              ? state.pendingObjectCleanup?.purpose === "metadata-cache" ? "Updating Kindle metadata…" : "Writing to Kindle…"
             : state.pendingObjectCleanup
               ? "Recovery inspection required"
               : ready ? "Safe-write and inventory checks passed" : "Kindle inventory unavailable"
@@ -1351,6 +1298,8 @@ export function renderLibraryPrototype(
           ? safeWritePassed ? "Safe-write passed; reading Documents inventory…" : "Reading Documents for recovery…"
           : state.postConnectStage === "reconciliation"
             ? "Kindle inventory read; comparing it with this library…"
+            : pendingObjectWriteActive(state)
+              ? "Writing and verifying the current Kindle file…"
             : state.pendingObjectCleanup
               ? "Inspect and acknowledge the recorded object before safe writes resume"
               : ready ? "Exact-byte safe-write and inventory checks passed" : "Inventory unavailable; disconnect and reconnect to retry"
@@ -1359,8 +1308,8 @@ export function renderLibraryPrototype(
   const kindleConnectionButton = connected
     ? `<button type="button" data-ui-action="disconnect-catalog-device"${disconnectBlocked ? " disabled" : ""}>${disconnecting ? "Disconnecting…" : snapshot.sendBusy ? "Transfer in progress…" : "Disconnect"}</button>`
     : `<button type="button" data-ui-action="connect-catalog-device"${webUsbUsable ? "" : ' disabled aria-disabled="true" title="Kindle connection requires a secure page and a WebUSB-compatible browser"'}>Connect Kindle</button>`;
-  return `<div class="library-workspace"><header class="library-topbar"><span class="library-breadcrumb">Your library <span aria-hidden="true">/</span> ${escapeHtml(profile?.name ?? "Getting started")}</span><div class="library-topbar-status" data-status="${source.tone}"><span class="library-source-dot"></span><span>${escapeHtml(source.title)}</span><small>${escapeHtml(source.detail)}</small></div><button type="button" class="library-activity-button" data-ui-action="open-activity-center" aria-expanded="${snapshot.activityOpen}" aria-label="Open activity and device center${activityAttention ? `, ${activityAttention} items need attention` : ""}"><span class="library-source-dot" data-status="${escapeHtml(activityStatus.phase)}"></span><span><strong>${escapeHtml(activityLabel)}</strong><small>Activity${activityAttention ? ` · ${activityAttention}` : ""}</small></span></button><button type="button" class="library-queue-button" data-ui-action="open-send-queue" aria-label="Open Send later queue">${libraryIcon("queue")}<strong>${snapshot.sendQueue?.total ?? 0}</strong><small>Send later</small></button><button type="button" class="library-device-button${connected ? " connected" : ""}" data-ui-action="${connected ? "show-kindle" : "connect-catalog-device"}"${connecting || disconnecting || (!connected && !webUsbUsable) ? " disabled" : ""}><span class="library-device-icon" aria-hidden="true">${libraryIcon("device")}</span><span><strong>${deviceTitle}</strong><small>${deviceDetail}</small></span></button></header>
+  return `<div class="library-workspace"><header class="library-topbar"><span class="library-breadcrumb">Your library <span aria-hidden="true">/</span> ${escapeHtml(profile?.name ?? "Getting started")}</span><div class="library-topbar-status" data-status="${source.tone}" title="${escapeHtml(source.detail)}" role="status"><span class="library-source-dot" aria-hidden="true"></span><span>${escapeHtml(source.title)}</span></div><button type="button" class="library-activity-button" data-ui-action="open-activity-center" aria-expanded="${snapshot.activityOpen}" aria-label="Open activity and device center${activityAttention ? `, ${activityAttention} items need attention` : ""}"><span class="library-source-dot" data-status="${escapeHtml(activityStatus.phase)}"></span><span><strong>${escapeHtml(activityLabel)}</strong><small>Activity${activityAttention ? ` · ${activityAttention}` : ""}</small></span></button><button type="button" class="library-queue-button" data-ui-action="open-send-queue" aria-label="Open Send later queue">${libraryIcon("queue")}<strong>${snapshot.sendQueue?.total ?? 0}</strong><small>Send later</small></button><button type="button" class="library-device-button${connected ? " connected" : ""}" data-ui-action="${connected ? "show-kindle" : "connect-catalog-device"}"${connecting || disconnecting || (!connected && !webUsbUsable) ? " disabled" : ""}><span class="library-device-icon" aria-hidden="true">${libraryIcon("device")}</span><span><strong>${deviceTitle}</strong><small>${deviceDetail}</small></span></button></header>
     ${visibleTopAlerts ? `<div class="library-global-alerts">${visibleTopAlerts}</div>` : ""}
-    <div class="library-layout" data-density="${escapeHtml(snapshot.density ?? "comfortable")}"><aside class="library-sidebar" aria-label="Library profiles and views"><a class="library-brand" href="#library" aria-label="ShelfSend library home"><span class="library-brand-mark" aria-hidden="true">${libraryIcon("shelfSend")}</span><span><strong>ShelfSend</strong><small>Browser to reader</small></span></a><div class="library-sidebar-label">Household</div><div class="library-profile-list">${renderProfileRail(snapshot)}</div><div class="library-sidebar-label library-views-label">Browse</div><nav class="library-nav" aria-label="Library views">${renderLibraryNav(snapshot)}</nav>${renderSmartShelfRail(snapshot)}<div class="library-sidebar-bottom"><button type="button" class="library-nav-item settings${snapshot.filters.view === "settings" ? " active" : ""}" data-ui-view="settings"${snapshot.filters.view === "settings" ? ' aria-current="page"' : ""}>${libraryIcon("settings")}<span>Settings</span></button><div class="library-source-card"><div class="library-source-card-head"><span class="library-source-icon" aria-hidden="true">⇄</span><span><strong>Container folders</strong><small>${sourceCardDetail}</small></span></div><div class="library-source-progress"><span style="width:${enabledRoots.length ? Math.round(100 * (profile?.availableRootCount ?? 0) / enabledRoots.length) : 0}%"></span></div><p><span>${profile?.bookCount ?? 0} indexed</span><span>${profile ? `${profile.availableRootCount}/${enabledRoots.length} enabled available · ${profile.rootCount} configured` : "Not configured"}</span></p></div><p class="library-profile-note">No sign-in required. Profiles organize views; they are not access controls.</p><div class="library-sidebar-sync" data-status="${source.tone}"><span class="library-source-dot"></span><span>${escapeHtml(source.title)}<small>${escapeHtml(source.detail)}</small></span></div></div></aside>
-    <main class="library-main" id="library">${renderOnboarding(snapshot, state)}${snapshot.loadState === "error" && snapshot.profiles.length === 0 ? `<div class="library-empty-state library-error-state" role="alert"><span aria-hidden="true">!</span><h1>Catalog service unavailable</h1><p>${escapeHtml(snapshot.error ?? "ShelfSend could not reach its catalog service.")}</p><button type="button" data-ui-action="retry-catalog">Try again</button></div>` : snapshot.filters.view === "settings" ? renderLibrarySettings(snapshot) : snapshot.filters.view === "series" ? renderSeriesBrowser(snapshot, state) : snapshot.filters.view === "attention" ? renderNeedsAttention(snapshot) : `${renderActiveShelf(snapshot)}<section class="library-hero" aria-labelledby="library-heading"><div><div class="library-eyebrow">${escapeHtml(profile?.description ?? "A space for your stories")}</div><h1 id="library-heading">${escapeHtml(heading)}</h1><p>${profile?.bookCount ?? 0} books from <strong>${escapeHtml(profile?.sourceLabel ?? "configured sources")}</strong></p></div><div class="library-stat-row" aria-label="Library summary"><span><strong>${counts.onKindle}</strong> matched here</span><span><strong>${counts.possible}</strong> possible</span><span>${sendSummary}</span></div></section>${snapshot.filters.view === "on-kindle" ? `<section class="library-kindle-summary" aria-label="Kindle summary"><span class="library-kindle-summary-icon" aria-hidden="true">▯</span><div><strong>${disconnecting ? "Disconnecting Kindle" : connected ? "Kindle connected" : "Kindle not connected"}</strong><span>${kindleSummaryDetail}</span></div><div class="library-kindle-summary-stats"><span><strong>${counts.onKindle}</strong> confirmed</span><span><strong>${counts.possible}</strong> possible</span></div>${kindleConnectionButton}</section>` : ""}${renderToolbar(snapshot)}<section class="library-results" aria-live="polite">${renderLibraryResults(state, snapshot)}</section>${snapshot.filters.view === "on-kindle" ? renderKindleDeviceContents(snapshot, connected, state.catalogInventoryState) : ""}`}${snapshot.announcement ? `<div class="library-toast" role="status"><span class="library-toast-check">✓</span><span>${escapeHtml(snapshot.announcement)}</span><button type="button" data-ui-action="dismiss-announcement" aria-label="Dismiss notification">×</button></div>` : ""}${renderSendPreview(state, snapshot)}${renderRemovalConfirmation(snapshot)}${renderUpdateConfirmation(snapshot)}${renderMetadataEditor(snapshot, state)}${renderBookDetails(snapshot, state)}${renderMatchReview(snapshot, state)}${renderSendQueue(snapshot, state)}${renderShelfManager(snapshot)}${renderActivityCenter(state, snapshot)}</main></div></div>`;
+    <div class="library-layout" data-density="${escapeHtml(snapshot.density ?? "comfortable")}"><aside class="library-sidebar" aria-label="Library profiles and views"><a class="library-brand" href="#library" aria-label="ShelfSend library home"><span class="library-brand-mark" aria-hidden="true">${libraryIcon("shelfSend")}</span><span><strong>ShelfSend</strong><small>Browser to reader</small></span></a><div class="library-sidebar-label">Libraries</div><div class="library-profile-list">${renderProfileRail(snapshot)}</div><div class="library-sidebar-label library-views-label">Browse</div><nav class="library-nav" aria-label="Library views">${renderLibraryNav(snapshot, connected)}</nav>${renderSmartShelfRail(snapshot)}<div class="library-sidebar-bottom"><button type="button" class="library-nav-item settings${snapshot.filters.view === "settings" ? " active" : ""}" data-ui-view="settings"${snapshot.filters.view === "settings" ? ' aria-current="page"' : ""}>${libraryIcon("settings")}<span>Settings</span></button></div></aside>
+    <main class="library-main" id="library">${renderOnboarding(snapshot, state)}${snapshot.loadState === "error" && snapshot.profiles.length === 0 ? `<div class="library-empty-state library-error-state" role="alert"><span aria-hidden="true">!</span><h1>Catalog service unavailable</h1><p>${escapeHtml(snapshot.error ?? "ShelfSend could not reach its catalog service.")}</p><button type="button" data-ui-action="retry-catalog">Try again</button></div>` : snapshot.filters.view === "settings" ? `${renderLibrarySettings(snapshot)}${settingsDiagnosticsHtml}` : snapshot.filters.view === "series" ? renderSeriesBrowser(snapshot, state) : snapshot.filters.view === "attention" ? renderNeedsAttention(snapshot) : `${renderActiveShelf(snapshot)}<section class="library-hero" aria-labelledby="library-heading"><div><div class="library-eyebrow">${escapeHtml(profile?.description && !/^household collection$/iu.test(profile.description) ? profile.description : "Library")}</div><h1 id="library-heading">${escapeHtml(heading)}</h1><p>${profile?.bookCount ?? 0} books from <strong>${escapeHtml(profile?.sourceLabel ?? "configured sources")}</strong></p></div><div class="library-stat-row" aria-label="Library summary">${summary}</div></section>${snapshot.filters.view === "on-kindle" ? `<section class="library-kindle-summary" aria-label="Kindle summary"><span class="library-kindle-summary-icon" aria-hidden="true">▯</span><div><strong>${disconnecting ? "Disconnecting Kindle" : connected ? "Kindle connected" : "Kindle not connected"}</strong><span>${kindleSummaryDetail}</span></div><div class="library-kindle-summary-stats"><span><strong>${counts.onKindle}</strong> confirmed</span><span><strong>${counts.possible}</strong> possible</span></div>${kindleConnectionButton}</section>` : ""}${renderToolbar(snapshot)}<section class="library-results" aria-live="polite">${renderLibraryResults(state, snapshot)}</section>`}${snapshot.announcement ? `<div class="library-toast" role="status"><span class="library-toast-check">✓</span><span>${escapeHtml(snapshot.announcement)}</span><button type="button" data-ui-action="dismiss-announcement" aria-label="Dismiss notification">×</button></div>` : ""}${renderSendPreview(state, snapshot)}${renderRemovalConfirmation(snapshot)}${renderUpdateConfirmation(snapshot)}${renderMetadataEditor(snapshot, state)}${renderBookDetails(snapshot, state)}${renderMatchReview(snapshot, state)}${renderSendQueue(snapshot, state)}${renderShelfManager(snapshot)}${renderActivityCenter(state, snapshot)}</main></div></div>`;
 }
