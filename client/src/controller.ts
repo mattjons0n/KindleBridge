@@ -1804,6 +1804,7 @@ export class AppController {
             this.#dependencies.postUploadInventoryTimeoutMs ?? DEFAULT_POST_UPLOAD_INVENTORY_TIMEOUT_MS,
           deviceMetadataCache: "read-write",
           readingSidecars: ACCEPTED_KINDLE_READING_SIDECARS,
+          recordedReadingData: true,
           onObjectState: this.#objectStateHandler("metadata-cache", undefined, connection.details),
         },
         replacementCleanupStorage: this.#dependencies.replacementCleanupStorage,
@@ -2259,6 +2260,7 @@ export class AppController {
             this.#dependencies.postUploadInventoryTimeoutMs ?? DEFAULT_POST_UPLOAD_INVENTORY_TIMEOUT_MS,
           deviceMetadataCache: "read-write",
           onObjectState: this.#objectStateHandler("metadata-cache", undefined, connection.details),
+          recordedReadingData: true,
         },
       );
       if (sent.inventory !== undefined && request.batch === undefined) {
@@ -2648,6 +2650,7 @@ export class AppController {
             ?? DEFAULT_POST_UPLOAD_INVENTORY_TIMEOUT_MS,
           deviceMetadataCache: "read-write",
           onObjectState: this.#objectStateHandler("metadata-cache", undefined, connection.details),
+          recordedReadingData: true,
         },
       );
       const removedHandles = new Set(result.removals.map((removal) => removal.handle));
@@ -2877,6 +2880,7 @@ export class AppController {
           aggregateTimeoutMs: this.#dependencies.postUploadInventoryTimeoutMs
             ?? DEFAULT_POST_UPLOAD_INVENTORY_TIMEOUT_MS,
           deviceMetadataCache: "read-only",
+          recordedReadingData: true,
         },
       });
       this.#assertConnectionCurrent(epoch, connection, signal);
@@ -3150,6 +3154,7 @@ export class AppController {
             this.#dependencies.connectInventoryTimeoutMs ?? DEFAULT_CONNECT_INVENTORY_TIMEOUT_MS,
           deviceMetadataCache: "read-write",
           onObjectState: this.#objectStateHandler("metadata-cache", undefined, connection.details),
+          recordedReadingData: true,
         });
       } catch (inventoryError) {
         if (isFatalInventoryError(inventoryError)) throw inventoryError;

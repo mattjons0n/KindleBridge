@@ -328,3 +328,8 @@ body { background: var(--page); }
   .library-book-card .library-cover { transition: none; }
   .library-book-cover-trigger:hover .library-cover { transform: none; }
 }
+/* Read-only sidecar observations in the existing details drawer. */
+.kindle-recorded-data article { border-top: 1px solid var(--library-border, #d8e2dc); padding-block: 12px; }
+.kindle-recorded-data h4 { overflow-wrap: anywhere; font-size: .8rem; }
+.kindle-recorded-data pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 320px; overflow: auto; font-size: .75rem; }
+.kindle-recorded-data dd { overflow-wrap: anywhere; }

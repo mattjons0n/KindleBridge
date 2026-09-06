@@ -54,6 +54,7 @@ import {
 } from "./mtp";
 import type { DeviceDetails } from "./state";
 import { isFatalTransportFailure } from "./error-diagnostics";
+import { collectReadingDiagnostic, type ReadingDiagnosticReport } from "./kindle/reading-diagnostic";
 import {
   WebUsbBulkTransport,
   captureDescriptorSnapshot,
@@ -491,6 +492,19 @@ export class ConnectedKindle {
 
   get successfulSelfTest(): KindleSelfTestResult | undefined {
     return this.#selfTestResult;
+  }
+
+  /** Local Vite development page only; no self-test or cache writes are needed for read-only collection. */
+  collectDevelopmentReadingDiagnostic(
+    progress: (message: string) => void,
+    options: SendBookOptions = {},
+  ): Promise<ReadingDiagnosticReport> {
+    return this.#runExclusive(async () => {
+      if (!import.meta.env.DEV) throw new Error("Reading diagnostic is available only in local development.");
+      const target = await this.#kindle.inspect(0, options);
+      return operationWithAggregateDeadline("Reading diagnostic", { aggregateTimeoutMs: 300_000, ...options },
+        (operationOptions) => collectReadingDiagnostic(this.#kindle.store, target.storageId, target.documentsHandle, operationOptions, progress));
+    });
   }
 
   async runSelfTest(options: SendBookOptions = {}): Promise<KindleSelfTestResult> {

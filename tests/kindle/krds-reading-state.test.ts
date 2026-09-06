@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   KindleKrdsReadingError,
+  decodeKindleKrdsDiagnostic,
   parseKindleKrdsReadingEvidence,
 } from "../../client/src/kindle/krds-reading-state";
 import { concatBytes } from "./kfx-fixtures";
@@ -27,6 +28,24 @@ function expectCode(action: () => unknown, code: string): void {
 }
 
 describe("bounded KRDS reading evidence", () => {
+  it("accepts the physically observed long container, zero timer version and byte lpr version", () => {
+    // Reconstructed wire shapes from the real Kindle capture; no personal sidecar payload in the repo.
+    const signature = Uint8Array.of(0, 0, 0, 0, 0, 0x1a, 0xb1, 0x26);
+    const timer = krdsObject("timer.model", krdsLong(0), krdsLong(6_329_336),
+      krdsLong(13_994), krdsDouble(0.10374964758951226),
+      krdsObject("timer.average.calculator", krdsInt(0), krdsInt(0), krdsInt(0), krdsInt(0)));
+    const position = krdsObject("lpr", Uint8Array.of(7, 2), krdsString("132487"), krdsLong(1_787_921_252_850));
+    const fixture = concatBytes(signature, krdsLong(1), krdsInt(2), timer, position);
+    expect(parseKindleKrdsReadingEvidence(fixture, "azw3f")).toMatchObject({
+      progressPercent: 10.37, lastReadAt: new Date(1_787_921_252_850).toISOString(), explicitState: false,
+    });
+    expect(decodeKindleKrdsDiagnostic(fixture)).toHaveLength(2);
+    expectCode(() => parseKindleKrdsReadingEvidence(
+      concatBytes(signature, krdsLong(2), krdsInt(0)), "azw3f"), "KRDS_READING_UNSUPPORTED_VERSION");
+    expectCode(() => parseKindleKrdsReadingEvidence(krdsContainer(krdsObject("lpr",
+      Uint8Array.of(7, 3), krdsString("123"), krdsLong(1))), "azw3f"), "KRDS_READING_UNSUPPORTED_VERSION");
+    expectCode(() => decodeKindleKrdsDiagnostic(fixture, { maxInputBytes: 8 }), "KRDS_READING_INPUT_LIMIT");
+  });
   it("extracts documented timer percentage and lpr time without asserting Read/Unread", () => {
     expect(parseKindleKrdsReadingEvidence(readingKrdsFixture(), "azw3f")).toEqual({
       status: "in-progress",

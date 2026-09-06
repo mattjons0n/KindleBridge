@@ -1,6 +1,6 @@
 # Kindle Bridge — Project Handoff
 
-Last updated: 2026-09-05
+Last updated: 2026-09-06
 
 ## Status
 
@@ -13,6 +13,12 @@ Before calling this candidate household-ready, repeat the consolidated queue/mat
 [`BACKLOG.md`](BACKLOG.md) is the implementation-and-acceptance ledger; the current [`backlog build plan`](outputs/kindle-bridge-backlog-build-plan.md) and [`release-candidate omission audit`](outputs/kindle-bridge-backlog-feature-audit.md) hold the detailed requirement map and final evidence. Together they distinguish shipped software, deliberately disabled experiments, and evidence that can only be collected on the real deployment or physical Kindle.
 
 ## Implemented product
+
+### Recorded Kindle reading data
+
+The existing book-details drawer now includes read-only **Kindle reading data** for one confirmed device copy. Normal post-self-test inventory and post-mutation refreshes collect bounded direct KRDS sidecars via `recordedReadingData: true`. This observation-only path never produces semantic reading evidence, changes matching, or adds Read-books membership. Summaries include recorded time/words, saved positions/timestamps, timer activity fraction (explicitly not completion), available reader metadata, and bounded expandable technical details. Errors, missing data, ambiguous matches and last-seen snapshots are distinguished. No raw observations are sent to the server or persisted as durable history.
+
+Physical capture proved the LONG container version 1, timer version 0 and BYTE last-position version 2 shapes. All 32 captured reading files decode after the parser fixes, but user comparison disproved the timer fraction as actual device percentage/completion. Automatic reading status and its UI gate remain disabled. See [the capture and parser notes](outputs/reading-diagnostic-local.md). Deployment of this drawer still needs the server operator's gate and an integrated physical connection check.
 
 ### Docker catalog service
 

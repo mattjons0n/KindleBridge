@@ -347,7 +347,8 @@ function parseContainer(bytes: Uint8Array, limits: ResolvedLimits): readonly Krd
   const reader = new Reader(bytes, budget);
   reader.signature();
   const version = reader.value();
-  if (!isInt(version, SUPPORTED_CONTAINER_VERSION)) {
+  if (!isInt(version, SUPPORTED_CONTAINER_VERSION)
+      && !(version.kind === "long" && version.value === BigInt(SUPPORTED_CONTAINER_VERSION))) {
     fail("KRDS_READING_UNSUPPORTED_VERSION", "KRDS container version is not supported.");
   }
   const count = reader.value();
@@ -367,12 +368,20 @@ function parseContainer(bytes: Uint8Array, limits: ResolvedLimits): readonly Krd
   return Object.freeze(values);
 }
 
+/** Bounded raw structure for offline development inspection; no semantic state claims. */
+export function decodeKindleKrdsDiagnostic(
+  bytes: Uint8Array,
+  options: KindleKrdsReadingParserOptions = {},
+): readonly KrdsValue[] {
+  return parseContainer(bytes, resolveLimits(options));
+}
+
 function progressFromTimerModel(object: KrdsObject): number | undefined {
   if (object.values.length < 5) fail("KRDS_READING_TYPE_INVALID", "KRDS timer.model is truncated.");
   const [version, totalTime, totalWords, totalPercent, averageCalculator] = object.values;
   if (
     version?.kind !== "long"
-    || (version.value !== 1n && version.value !== 2n)
+    || (version.value !== 0n && version.value !== 1n && version.value !== 2n)
     || totalTime?.kind !== "long"
     || totalTime.value < 0n
     || totalWords?.kind !== "long"
@@ -389,7 +398,7 @@ function progressFromTimerModel(object: KrdsObject): number | undefined {
 }
 
 function versionNumber(value: KrdsValue | undefined): number | undefined {
-  if (value?.kind === "int") return value.value;
+  if (value?.kind === "int" || value?.kind === "byte") return value.value;
   if (value?.kind !== "long" || value.value < 0n || value.value > 2n) return undefined;
   return Number(value.value);
 }

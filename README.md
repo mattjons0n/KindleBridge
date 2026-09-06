@@ -20,7 +20,7 @@ The repository now contains the implemented household-library flow:
 - coherent multi-book Send feedback with `Book X of Y`, combined batch/current-book progress, per-title verification, exact partial-failure retry selection, and one final catalog reconciliation;
 - explicitly confirmed single/bulk **Remove from Kindle** for exact current-device matches, including removal-only prior KindleBridge presentations after an edit, with exact-handle revalidation and one post-removal inventory refresh;
 - guarded one-click **Update Kindle copy** for edited EPUBs with one exact stale KindleBridge-managed presentation, using upload → verify → durable record → exact old-copy deletion rather than overwrite or delete-first replacement;
-- default-off, bounded engineering foundations for a physical `GetPartialObject` capability probe, exact KFX/AZW8 metadata sidecars, and browser-only reading evidence; none alters normal inventory until its physical gate passes;
+- default-off engineering foundations for a physical `GetPartialObject` probe, KFX/AZW8 book metadata, and semantic reading status; separate bounded, read-only sidecar observations are available in book details;
 - a hardened, non-root Docker/OCI image and Compose deployment using ordinary read-only library mounts plus persistent `/data` and rebuildable `/cache` volumes.
 
 The original transfer engine was physically validated on an MTP Kindle with USB IDs `0x1949 / 0x9981`: conversion, MTP connection, exact-byte self-test, transfer, opening, chapter navigation, and library-cover display all succeeded. The expanded integrated catalog/inventory/Send/removal journey still requires a fresh physical Kindle run and acceptance against the real household mounts and intended HTTPS LAN/VPN origin. Automated tests do not replace those checks.
@@ -35,7 +35,9 @@ The approved modern design is integrated with the real catalog: a softer sidebar
 
 The **Read books** smart shelf is durable per-profile completion history. Only a unique, current, explicitly Read device observation may automatically add a book. Disconnecting or removing the Kindle copy never removes shelf membership. The server stores only the opaque profile/book membership flag; raw sidecars, percentages, positions, device identity and Kindle timestamps remain browser-local.
 
-Reading progress/status UI, filtering and completion recording are wired behind the existing default-off physical acceptance gates. **Automatic reading detection is not yet enabled:** the current KRDS parser supplies percentage/time evidence, not a proven Kindle Read/Unread flag. Neither 100% progress nor missing data is converted to a completion claim. Physical state/format validation remains necessary before activation. See [the build plan and acceptance status](outputs/onboarding-reading-build-plan.md).
+Click a book cover or title to open **Kindle reading data** in its details drawer. After a normal Kindle connection, the browser reads bounded direct reading sidecars for inventory books and shows recorded reading time, counted words, saved positions, timestamps, available reader metadata, and expandable technical details for a single confirmed copy. Missing or unreadable data is explained. Observations stay in the browser session and never modify the Kindle or source books. Last-seen snapshots are labelled as such; no durable reading-data history is promised.
+
+**Automatic reading progress/status remains disabled.** Physical comparison showed that the timer fraction does not equal the Kindle's displayed percentage or Read status. The new details section labels it recorded activity, not completion, and never feeds status filters or Read-books membership. See [captured evidence and limitations](outputs/reading-diagnostic-local.md).
 
 ## Architecture
 

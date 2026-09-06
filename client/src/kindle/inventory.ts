@@ -37,6 +37,7 @@ import {
   type KindleReadingSidecarOptions,
 } from "./reading-sidecars";
 import type { KindleReadingEvidence } from "./reading-state";
+import type { KindleRecordedReadingFile } from "./recorded-reading-data";
 
 const UINT32_MAX = 0xffff_ffff;
 const DEFAULT_MAX_OBJECTS = 10_000;
@@ -124,6 +125,7 @@ export interface KindleInventoryObject {
   readonly bookMetadataState?: KindleInventoryObjectMetadataState;
   /** Browser-only read-side evidence; never serialized to the catalog service. */
   readonly readingEvidence?: KindleReadingEvidence;
+  readonly recordedReadingData?: readonly KindleRecordedReadingFile[];
 }
 
 export type KindleInventoryObjectMetadataState =
@@ -366,6 +368,8 @@ export interface KindleInventoryOptions extends KindleOperationOptions {
   readonly kfxSidecarMetadata?: false | KindleKfxSidecarMetadataOptions;
   /** Internal default-off gate pending controlled physical KRDS fixtures. */
   readonly readingSidecars?: false | KindleReadingSidecarOptions;
+  /** Raw reading observations only, independent of the disabled semantic status gate. */
+  readonly recordedReadingData?: boolean;
   /**
    * Portable cache reads are enabled by default. A write request is honored
    * only after this KindleDevice instance has passed its exact-byte self-test.
@@ -1501,7 +1505,9 @@ export async function buildKindleInventory(
       }, operationOptions)
     : undefined;
 
-  const readingSidecars = limits.readingSidecars === false
+  const readingSidecars = options.recordedReadingData
+    ? await readKindleReadingSidecars(store, objects, { recordedOnly: true }, operationOptions)
+    : limits.readingSidecars === false
     ? undefined
     : await readKindleReadingSidecars(store, objects, limits.readingSidecars, operationOptions);
 
@@ -1524,9 +1530,10 @@ export async function buildKindleInventory(
     ? enrichment.objects
     : Object.freeze(enrichment.objects.map((object) => {
         const readingEvidence = readingSidecars.evidenceByBookHandle.get(object.handle);
-        return readingEvidence === undefined
+        const recordedReadingData = readingSidecars.recordedByBookHandle.get(object.handle);
+        return readingEvidence === undefined && recordedReadingData === undefined
           ? object
-          : Object.freeze({ ...object, readingEvidence });
+          : Object.freeze({ ...object, ...(readingEvidence ? { readingEvidence } : {}), ...(recordedReadingData ? { recordedReadingData } : {}) });
       }));
   const inventory: KindleInventorySnapshot = Object.freeze({
     status: issueCount === 0 ? "complete" : "partial",

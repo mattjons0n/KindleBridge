@@ -307,6 +307,7 @@ export interface CatalogSendBatchResult {
 export type KindleInventoryCompleteness = "complete" | "partial" | "last-seen";
 
 export interface CatalogKindleInventoryItem {
+  readonly recordedReadingData?: readonly import("./kindle/recorded-reading-data").KindleRecordedReadingFile[];
   readonly readingEvidence?: KindleReadingEvidence;
   readonly id: string;
   readonly filename: string;

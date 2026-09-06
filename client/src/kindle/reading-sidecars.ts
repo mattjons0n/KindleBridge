@@ -1,4 +1,5 @@
 import { isFatalTransportFailure } from "../error-diagnostics";
+import { parseRecordedKindleReadingFile, type KindleRecordedReadingFile } from "./recorded-reading-data";
 import type { KindleObjectStore, KindleOperationOptions, KindleStoredObjectInfo } from "./contracts";
 import type { KindleInventoryObject } from "./inventory";
 import {
@@ -44,6 +45,8 @@ const PROVENANCE_ORDER: readonly KindleReadingSidecarFormat[] = Object.freeze([
 const ALL_SIDECAR_FORMATS = new Set<KindleReadingSidecarFormat>(PROVENANCE_ORDER);
 
 export interface KindleReadingSidecarOptions {
+  /** Read-only observations for the details drawer; never creates semantic reading evidence. */
+  readonly recordedOnly?: boolean;
   /** Optional narrower format gate so physical acceptance can happen format by format. */
   readonly formats?: readonly KindleReadingSidecarFormat[];
   readonly maxBooks?: number;
@@ -58,6 +61,7 @@ export interface KindleReadingSidecarOptions {
 
 export interface KindleReadingSidecarResult {
   readonly evidenceByBookHandle: ReadonlyMap<number, KindleReadingEvidence>;
+  readonly recordedByBookHandle: ReadonlyMap<number, readonly KindleRecordedReadingFile[]>;
 }
 
 interface ResolvedLimits {
@@ -207,6 +211,7 @@ export async function readKindleReadingSidecars(
 ): Promise<KindleReadingSidecarResult> {
   const limits = resolveLimits(options);
   const evidenceByBookHandle = new Map<number, KindleReadingEvidence>();
+  const recordedByBookHandle = new Map<number, readonly KindleRecordedReadingFile[]>();
   let inspectedBooks = 0;
   let sidecarObjects = 0;
   let totalBytes = 0;
@@ -256,7 +261,24 @@ export async function readKindleReadingSidecars(
       totalBytes += bookBytes;
 
       const parsed: KindleReadingEvidence[] = [];
+      const recorded: KindleRecordedReadingFile[] = [];
       for (const { info, format } of candidates) {
+        if (options.recordedOnly) {
+          try {
+            const before = await store.getObjectInfo(info.handle, operationOptions);
+            if (JSON.stringify(before) !== JSON.stringify(info)) throw new Error("Sidecar changed before reading");
+            const bytes = await store.readObject(info.handle, { ...operationOptions, maxBytes: info.compressedSize });
+            if (bytes.byteLength !== info.compressedSize) throw new Error("Sidecar size changed while reading");
+            const after = await store.getObjectInfo(info.handle, operationOptions);
+            if (JSON.stringify(after) !== JSON.stringify(info)) throw new Error("Sidecar changed during reading");
+            recorded.push(parseRecordedKindleReadingFile(bytes, `${sidecar.relativePath}/${info.filename}`, limits.parser));
+          } catch (error) {
+            if (isAbort(error, operationOptions.signal) || isFatalTransportFailure(error)) throw error;
+            recorded.push({ filename: `${sidecar.relativePath}/${info.filename}`, size: info.compressedSize, fields: [],
+              error: error instanceof Error ? error.message.slice(0, 512) : "Could not decode this sidecar" });
+          }
+          continue;
+        }
         const bytes = await store.readObject(info.handle, {
           ...operationOptions,
           maxBytes: info.compressedSize,
@@ -268,6 +290,7 @@ export async function readKindleReadingSidecars(
       }
       const combined = combineEvidence(parsed);
       if (combined !== undefined) evidenceByBookHandle.set(book.handle, combined);
+      if (recorded.length) recordedByBookHandle.set(book.handle, Object.freeze(recorded));
     } catch (error) {
       if (isAbort(error, operationOptions.signal)) throw error;
       if (isFatalTransportFailure(error)) throw error;
@@ -276,5 +299,5 @@ export async function readKindleReadingSidecars(
     }
   }
 
-  return Object.freeze({ evidenceByBookHandle });
+  return Object.freeze({ evidenceByBookHandle, recordedByBookHandle });
 }

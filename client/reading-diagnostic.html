@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Kindle reading diagnostic</title>
+<style>body{font:16px system-ui;background:#f5f7f6;color:#183c30;max-width:900px;margin:60px auto;padding:24px}button,a{padding:12px;margin:8px 8px 8px 0}textarea{display:block;width:95%;min-height:100px;margin:12px 0;padding:12px}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:white;padding:20px;border-radius:12px}button{cursor:pointer}#download[hidden]{display:none}</style></head>
+<body><h1>Kindle reading diagnostic</h1>
+<p>Local development tool. Reads device files only: no book changes, cache writes, self-test writes, or server uploads. Normal reading detection remains disabled.</p>
+<ol><li>Disconnect Kindle in any other Kindle Bridge tab first.</li><li>Before plugging it in, note examples that your Kindle shows as unread, partly read (with percentage), and read. Add their titles below.</li><li>Connect and collect once. Download the report and attach it in our conversation.</li></ol>
+<label for="notes">Known book states, Kindle model/firmware, and any relevant notes</label>
+<textarea id="notes" placeholder="Title — unread / 37% / read"></textarea>
+<p>The report contains exact filenames, raw sidecar bytes, checksums, and parse errors, including unsupported sidecar files. It does not download the book files. Limits and any skipped files are included.</p>
+<button id="collect">Connect and collect reading data</button><button id="cancel" disabled>Cancel</button>
+<a id="download" hidden>Download diagnostic report</a>
+<pre id="status" role="status">Ready. Chrome must run on the computer connected to the Kindle by USB.</pre>
+<script type="module" src="/src/reading-diagnostic-page.ts"></script></body></html>
