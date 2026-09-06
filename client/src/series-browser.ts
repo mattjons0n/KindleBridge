@@ -25,7 +25,7 @@ export function canonicalSeriesKey(value: string | undefined): string {
 export function usableSeriesIndex(value: number | undefined): number | undefined {
   return value !== undefined
     && Number.isFinite(value)
-    && value > 0
+    && value >= 0
     && value <= MAX_SERIES_INDEX
     ? value
     : undefined;

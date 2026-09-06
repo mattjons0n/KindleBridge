@@ -6,6 +6,22 @@ import { describe, expect, it } from "vitest";
 const css = readFileSync(new NodeURL("../../client/src/library-modern.css", import.meta.url), "utf8");
 
 describe("ShelfSend charcoal presentation", () => {
+  it("keeps the modal backdrop as a full-screen transparent blur", () => {
+    const style = document.createElement("style");
+    style.textContent = readFileSync(new NodeURL("../../client/src/styles.css", import.meta.url), "utf8");
+    document.head.append(style);
+    try {
+      const rules = [...style.sheet!.cssRules] as CSSStyleRule[];
+      const backdrop = rules.find((entry) => entry.selectorText === ".library-modal-backdrop")!.style;
+      expect(backdrop.getPropertyValue("background")).toBe("transparent");
+      expect(backdrop.getPropertyValue("backdrop-filter")).toBe("blur(3px)");
+      expect(backdrop.getPropertyValue("position")).toBe("fixed");
+      expect(backdrop.getPropertyValue("inset")).toBe("0px");
+    } finally {
+      style.remove();
+    }
+  });
+
   it("parses the theme with neutral light/dark surfaces and non-clipping grid cards", () => {
     const style = document.createElement("style");
     style.textContent = css;

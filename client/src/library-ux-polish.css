@@ -131,6 +131,71 @@
 .settings-diagnostics .kv { color: var(--muted); }
 .settings-diagnostics .kv strong { color: var(--text); }
 .activity-diagnostics-link { border-top: 1px solid var(--border); padding-top: 18px; }
+/* Book comparisons keep each field, both values and its result on one row. */
+.library-app-shell .library-match-review-sheet {
+  inset-inline: max(20px, calc((100vw - 1000px) / 2));
+  padding: 28px;
+  border: 1px solid var(--border);
+  scrollbar-gutter: stable;
+}
+.library-match-review-sheet > header h2 { margin: 8px 0; font: 650 24px/1.3 system-ui, sans-serif; letter-spacing: -.5px; }
+.library-match-review-sheet > header p { margin-bottom: 24px; font-size: 13px; line-height: 1.6; }
+.library-app-shell .match-review-device,
+.library-app-shell .match-review-candidate { padding: 20px; margin-top: 16px; }
+.library-match-review-sheet :is(.match-review-device, .match-review-candidate) h3 { margin: 8px 0 4px; font-size: 16px; line-height: 1.45; overflow-wrap: anywhere; }
+.library-match-review-sheet :is(.match-review-device, .match-review-candidate) > div > p,
+.library-match-review-sheet .match-review-device > p { margin: 4px 0 12px; font-size: 13px; }
+.library-app-shell .match-review-evidence { margin-top: 16px; background: none; }
+.match-review-comparison { width: 100%; table-layout: fixed; border-collapse: separate; border-spacing: 0; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+.match-review-comparison .match-field-column { width: 100px; }
+.match-review-comparison .match-result-column { width: 130px; }
+.library-app-shell .match-review-comparison thead th { padding: 12px; background: var(--surface-raised); color: var(--muted); font-size: 11px; font-weight: 600; text-align: left; }
+.match-review-comparison :is(th, td) { padding: 14px 12px; text-align: left; vertical-align: top; overflow-wrap: anywhere; line-height: 1.6; font-size: 12px; }
+.match-review-comparison tbody tr + tr > :is(th, td) { border-top: 1px solid var(--border); }
+.match-review-comparison tbody tr:nth-child(even) { background: var(--surface-soft); }
+.library-app-shell .match-review-comparison tbody th { color: var(--text); font-weight: 600; }
+.match-review-comparison td + td { border-left: 1px solid var(--border); }
+.library-app-shell .match-comparison-values { list-style: none; padding: 0; margin: 0; color: var(--text); }
+.match-comparison-values li + li { margin-top: 5px; }
+.library-app-shell .match-comparison-missing { color: var(--muted); font-size: 12px; }
+.match-comparison-badge { display: inline-flex; align-items: center; gap: 6px; padding: 4px 8px; border-radius: 6px; white-space: nowrap; font-size: 11px; font-weight: 650; background: var(--surface-raised); color: var(--muted); }
+.match-comparison-badge[data-comparison="match"] { background: var(--green-soft); color: var(--green); }
+.match-comparison-badge[data-comparison="different"] { background: light-dark(#fff0d6, #49381e); color: light-dark(#7b5109, #f5d08c); }
+.library-app-shell .match-comparison-note { margin: 10px 0 18px; font-size: 11px; line-height: 1.6; color: var(--muted); }
+.match-review-explanation { padding: 14px 16px; border-left: 3px solid light-dark(#ae781b, #dcb164); border-radius: 0 8px 8px 0; background: var(--surface-soft); }
+.match-review-explanation strong { display: block; font-size: 12px; font-weight: 650; }
+.library-app-shell .match-review-explanation p { margin: 5px 0 0; font-size: 12px; line-height: 1.65; }
+.match-review-evidence-details, .match-review-file-details { margin-top: 16px; }
+.library-app-shell :is(.match-review-evidence-details, .match-review-file-details, .match-review-technical) > summary { padding: 4px 0; font-size: 12px; font-weight: 550; color: var(--muted); cursor: pointer; }
+.library-app-shell :is(.match-review-evidence-details, .match-review-file-details, .match-review-technical) > summary:hover { color: var(--text); }
+.match-review-facts { display: grid; grid-template-columns: 1.5fr 1fr 1fr; gap: 16px; padding: 16px; margin: 10px 0 0; border: 1px solid var(--border); border-radius: 8px; }
+.match-review-facts > div { min-width: 0; }
+.match-review-facts dt { margin: 0 0 6px; font-size: 11px; }
+.match-review-facts dd { margin: 0; font-size: 12px; overflow-wrap: anywhere; }
+.match-review-technical { margin-top: 22px; padding-top: 16px; border-top: 1px solid var(--border); }
+.match-review-actions { padding-top: 18px; margin-top: 18px; border-top: 1px solid var(--border); }
+.match-review-actions button, .match-review-decision button, .library-match-review-sheet > footer button { min-height: 40px; padding: 10px 16px; font-size: 13px; }
+.match-review-decision { margin-top: 18px; padding-top: 18px; }
+.library-match-review-sheet > footer { gap: 20px; padding-top: 20px; border-top: 1px solid var(--border); line-height: 1.6; }
+@media (max-width: 680px) {
+  .library-app-shell .library-match-review-sheet { inset: 0; max-height: 100dvh; padding: 20px 14px; border-radius: 0; }
+  .library-app-shell .match-review-device,
+  .library-app-shell .match-review-candidate { padding: 16px 12px; }
+  .match-review-comparison { display: block; }
+  .match-review-comparison colgroup { display: none; }
+  .match-review-comparison thead { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .match-review-comparison tbody { display: block; }
+  .match-review-comparison tbody tr { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; padding: 14px 12px; }
+  .match-review-comparison tbody tr + tr { border-top: 1px solid var(--border); }
+  .library-app-shell .match-review-comparison tbody tr > :is(th, td) { display: block; border: 0; padding: 0; min-width: 0; }
+  .match-review-comparison tbody th { grid-column: 1; grid-row: 1; align-self: center; }
+  .match-review-comparison td[data-label] { grid-row: 2; }
+  .match-review-comparison td[data-label]::before { content: attr(data-label); display: block; margin-bottom: 5px; color: var(--muted); font-size: 10px; font-weight: 600; }
+  .match-review-comparison .match-comparison-result { grid-column: 2; grid-row: 1; justify-self: end; }
+  .match-review-facts { grid-template-columns: 1fr; gap: 14px; }
+  .match-review-actions { flex-wrap: wrap; }
+  .match-review-actions button { flex: 1; }
+}
 @media (max-width: 1250px) {
   .library-breadcrumb { display: none; }
   .library-topbar-status { margin-left: 0; }
@@ -141,4 +206,51 @@
   .library-stat-row > button { flex: 1; min-width: 90px; padding: 12px; }
   .settings-diagnostics .poc-lab-content { padding: 0 14px 14px; }
   .settings-diagnostics > details > summary { padding: 18px 14px; }
+}
+.library-app-shell .metadata-candidate-series { display: block; overflow-wrap: anywhere; font-size: .76rem; font-weight: 650; line-height: 1.45; color: var(--text); }
+.library-app-shell .hardcover-series-choice { display: grid; gap: 10px; flex-basis: 100%; width: 100%; min-width: 0; padding-block: 8px; }
+.library-app-shell .hardcover-series-choice > label { display: grid; gap: 6px; min-width: 0; }
+.library-app-shell .hardcover-series-choice select { width: 100%; min-width: 0; max-width: 100%; }
+.library-app-shell .hardcover-current-series { font-size: .8rem; color: var(--text); }
+.library-app-shell .hardcover-series-choice .hardcover-replace-choice { display: flex; align-items: center; gap: 8px; }
+.library-app-shell .hardcover-replace-choice input { width: 16px; height: 16px; margin: 0; }
+.library-app-shell .hardcover-replace-choice span { display: grid; gap: 2px; }
+.library-app-shell .hardcover-replace-choice small { color: var(--muted); }
+.library-app-shell .metadata-job-entries li:has(.hardcover-series-choice) { flex-wrap: wrap; }
+.library-app-shell .metadata-job-entries li:has(.hardcover-series-choice) > span { flex: 1 1 180px; }
+.library-app-shell .hardcover-series-choice { order: 3; }
+.library-app-shell .hardcover-bulk-apply { display: flex; align-items: center; flex-wrap: wrap; gap: 16px; border-top: 1px solid var(--border); margin-top: 16px; padding-top: 16px; }
+.library-app-shell .hardcover-bulk-apply > div { flex: 1 1 260px; }
+.library-app-shell .hardcover-bulk-apply p { font-size: .8rem; line-height: 1.5; }
+
+/* Reviewed metadata stays legible in either theme, including within the
+   narrower left column of the editor rather than only full-width pages. */
+.library-app-shell :is(.metadata-panel-actions, .metadata-candidate-discovery, .metadata-candidate-review) { background: var(--surface); color: var(--text); border-color: var(--border); }
+.library-app-shell .metadata-candidate-body { border-color: var(--border); gap: 16px; }
+.library-app-shell :is(.metadata-provider-note, .metadata-candidate-status, .metadata-candidate-cover-choice) { background: var(--surface-soft); color: var(--muted); font-size: 12px; line-height: 1.6; }
+.library-app-shell .metadata-provider-note { display: grid; gap: 4px; }
+.library-app-shell .metadata-candidate-discovery :is(strong, h4, label) { color: var(--text); }
+.library-app-shell .metadata-candidate-discovery :is(small, header p, header > span) { color: var(--muted); }
+.library-app-shell .metadata-candidate-controls { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.library-app-shell .metadata-candidate-controls label { font-size: 12px; }
+.library-app-shell .metadata-candidate-controls button { grid-column: 1 / -1; justify-self: end; }
+.library-app-shell .metadata-candidate-controls :is(input, select) { font-size: 12px; }
+.library-app-shell .metadata-candidate-list { grid-template-columns: 1fr; gap: 10px; }
+.library-app-shell .metadata-candidate-card { padding: 14px; }
+.library-app-shell .metadata-candidate-card.selected { border-color: var(--green); box-shadow: inset 3px 0 0 var(--green); }
+.library-app-shell .metadata-candidate-card :is(strong, small) { white-space: normal; overflow-wrap: anywhere; }
+.library-app-shell .metadata-candidate-card strong { font-size: 13px; }
+.library-app-shell .metadata-candidate-card small { font-size: 12px; }
+.library-app-shell .metadata-candidate-review header > span { flex-shrink: 0; }
+.library-app-shell .metadata-candidate-review header p { font-size: 12px; line-height: 1.6; }
+.library-app-shell .metadata-candidate-diff { border-color: var(--border); }
+.library-app-shell :is(.metadata-candidate-diff-head, .metadata-candidate-diff > label) { min-width: 0; grid-template-columns: 22px minmax(66px, .65fr) repeat(2, minmax(0, 1fr)); padding: 12px 8px; gap: 8px; }
+.library-app-shell .metadata-candidate-diff > label { color: var(--text); font-size: 12px; }
+.library-app-shell .metadata-candidate-diff > label + label { border-color: var(--border); }
+.library-app-shell .metadata-candidate-diff > label.changed { background: var(--green-soft); }
+.library-app-shell .metadata-candidate-diff input[type="checkbox"] { width: 18px; height: 18px; min-height: 18px; margin: 0; padding: 0; }
+.library-app-shell .metadata-candidate-status.error { background: light-dark(#fbeaea, #3b2020); color: light-dark(#8b3030, #ffb4b4); }
+@media (max-width: 480px) {
+  .library-app-shell .metadata-candidate-controls { grid-template-columns: 1fr; }
+  .library-app-shell .metadata-candidate-card { align-items: flex-start; flex-direction: column; }
 }

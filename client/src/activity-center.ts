@@ -79,7 +79,7 @@ export interface KindleBridgeActivityCenterStatus {
    */
   readonly metadataLookupJob?: {
     readonly id: string;
-    readonly provider: "open-library" | "google-books";
+    readonly provider: "open-library" | "google-books" | "hardcover";
     readonly status: "queued" | "running" | "paused";
     readonly total: number;
     readonly pending: number;

@@ -786,6 +786,15 @@ export class AppView {
       if (action === "resume" || action === "pause" || action === "cancel" || action === "retry") void this.#catalog.controlMetadataLookupJob(action);
     }));
     this.#root.querySelector<HTMLButtonElement>('[data-ui-action="run-metadata-job"]')?.addEventListener("click", () => { void this.#catalog.runMetadataLookupJobStep(); });
+    this.#root.querySelectorAll<HTMLSelectElement>('[data-ui-action="select-hardcover-bulk-series"]').forEach((select) => select.addEventListener("change", () => {
+      if (select.dataset.bookId) this.#catalog.selectHardcoverBulkSeries(select.dataset.bookId, select.value);
+    }));
+    this.#root.querySelectorAll<HTMLInputElement>('[data-ui-action="replace-hardcover-bulk-series"]').forEach((input) => input.addEventListener("change", () => {
+      const bookId = input.dataset.bookId;
+      const choice = bookId ? this.#catalog.snapshot.hardcoverBulkReview?.selections.get(bookId) : undefined;
+      if (bookId && choice) this.#catalog.selectHardcoverBulkSeries(bookId, choice.candidateId, input.checked);
+    }));
+    this.#root.querySelector<HTMLButtonElement>('[data-ui-action="apply-hardcover-bulk-series"]')?.addEventListener("click", () => { void this.#catalog.applyHardcoverBulkSeries(); });
     this.#root.querySelectorAll<HTMLButtonElement>('[data-ui-action="review-metadata-job-candidate"]').forEach((button) => button.addEventListener("click", () => {
       const { jobId, bookId, candidateId } = button.dataset;
       if (jobId && bookId && candidateId) void this.#catalog.reviewMetadataLookupCandidate(jobId, bookId, candidateId);
@@ -947,6 +956,27 @@ export class AppView {
       if (typeof window.confirm === "function" && !window.confirm("Remove the saved Google Books API key?")) return;
       void this.#catalog.removeGoogleBooksCredential();
     });
+    this.#root.querySelector<HTMLButtonElement>('[data-ui-action="edit-hardcover-token"]')?.addEventListener("click", () => {
+      this.#catalog.editProviderCredential("hardcover");
+      window.queueMicrotask(() => this.#root.querySelector<HTMLInputElement>("#settings-hardcover-token")?.focus());
+    });
+    this.#root.querySelector<HTMLButtonElement>('[data-ui-action="cancel-hardcover-token"]')?.addEventListener("click", () => {
+      const input = this.#root.querySelector<HTMLInputElement>("#settings-hardcover-token");
+      if (input) input.value = "";
+      this.#catalog.cancelGoogleBooksCredentialEdit();
+    });
+    this.#root.querySelector<HTMLButtonElement>('[data-ui-action="save-test-hardcover-token"]')?.addEventListener("click", () => {
+      const input = this.#root.querySelector<HTMLInputElement>("#settings-hardcover-token");
+      const token = input?.value ?? "";
+      if (input) input.value = "";
+      void this.#catalog.saveAndTestProviderCredential("hardcover", token);
+    });
+    this.#root.querySelector<HTMLButtonElement>('[data-ui-action="remove-hardcover-token"]')?.addEventListener("click", () => {
+      const input = this.#root.querySelector<HTMLInputElement>("#settings-hardcover-token");
+      if (input) input.value = "";
+      if (typeof window.confirm === "function" && !window.confirm("Remove the saved Hardcover API token?")) return;
+      void this.#catalog.removeProviderCredential("hardcover");
+    });
     this.#activateDeleteDialog();
   }
 
@@ -1092,7 +1122,7 @@ export class AppView {
     scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="bulk-add-to-queue"]').forEach((button) => button.addEventListener("click", () => { void this.#catalog.addSelectedBooksToSendQueue(); }));
     scope.querySelectorAll<HTMLButtonElement>('button[data-ui-action="bulk-find-metadata"]').forEach((button) => button.addEventListener("click", () => {
       const provider = scope.querySelector<HTMLSelectElement>("#bulk-metadata-provider")?.value;
-      if (provider !== "open-library" && provider !== "google-books") return;
+      if (provider !== "open-library" && provider !== "google-books" && provider !== "hardcover") return;
       void this.#catalog.createMetadataLookupJob(provider).then(() => this.#catalog.setView("attention"))
         .then(() => this.#writeCatalogRoute({ bookId: null, matchItemId: null, matchBookId: null, seriesKey: null }, "replace"));
     }));
@@ -1281,7 +1311,7 @@ export class AppView {
     const searchMetadata = (): void => {
       if (!this.#captureMetadataEditorForm()) return;
       const provider = scope.querySelector<HTMLSelectElement>("#metadata-candidate-provider")?.value;
-      if (provider !== "google-books" && provider !== "open-library") return;
+      if (provider !== "google-books" && provider !== "open-library" && provider !== "hardcover") return;
       void this.#catalog.searchBookMetadata(provider, {
         title: scope.querySelector<HTMLInputElement>("#metadata-candidate-title")?.value.trim() || undefined,
         author: scope.querySelector<HTMLInputElement>("#metadata-candidate-author")?.value.trim() || undefined,
@@ -1303,6 +1333,9 @@ export class AppView {
       const field = input.dataset.field;
       if (field) this.#catalog.setMetadataCandidateField(field as never, input.checked);
     }));
+    scope.querySelector<HTMLButtonElement>('[data-ui-action="select-missing-metadata-fields"]')?.addEventListener("click", () => {
+      if (this.#captureMetadataEditorForm()) this.#catalog.selectMissingMetadataCandidateFields();
+    });
     scope.querySelector<HTMLInputElement>('[data-ui-action="toggle-metadata-candidate-cover"]')?.addEventListener("change", (event) => {
       this.#catalog.setMetadataCandidateCover((event.currentTarget as HTMLInputElement).checked);
     });

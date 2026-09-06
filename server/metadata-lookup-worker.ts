@@ -105,6 +105,12 @@ function durableLookupFailure(error: unknown): { code: MetadataLookupErrorCode; 
       return { code: "provider-unavailable", retryable: true };
     case "provider_not_configured":
       return { code: "provider-not-configured", retryable: false };
+    case "provider_invalid_token":
+      return { code: "provider-unauthorized", retryable: false };
+    case "provider_insufficient_permissions":
+      return { code: "provider-forbidden", retryable: false };
+    case "provider_rate_limited":
+      return { code: "provider-rate-limited", retryable: false };
     case "provider_response_too_large":
       return { code: "provider-response-too-large", retryable: false };
     case "invalid_provider":

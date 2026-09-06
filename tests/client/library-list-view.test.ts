@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { describe, expect, it } from "vitest";
-import type { CatalogBrowserSnapshot, CatalogKindleInventory } from "../../client/src/catalog-browser";
+import type { CatalogBrowserSnapshot, CatalogKindleInventory, CatalogMatchEvidenceBreakdown } from "../../client/src/catalog-browser";
 import type { CatalogBook, CatalogProfile, CatalogRoot } from "../../client/src/catalog-client";
 import { EMPTY_CATALOG_FILTERS, initialLibraryFilters } from "../../client/src/library-prototype";
 import { renderLibraryPrototype, renderLibraryResults } from "../../client/src/library-prototype-view";
@@ -136,6 +136,18 @@ function render(html: string): HTMLElement {
   return root;
 }
 
+function comparisonEvidence(overrides: Partial<CatalogMatchEvidenceBreakdown> = {}): CatalogMatchEvidenceBreakdown {
+  return {
+    tier: "title-author",
+    inventoryCompleteness: "complete",
+    ambiguous: false,
+    candidateCount: 1,
+    comparisons: { title: "match", authors: "match", identifiers: "different", filename: "different", size: "different" },
+    strongerProofUnavailable: "The title and authors agree, but an exact file association has not been established.",
+    ...overrides,
+  };
+}
+
 describe("library list view and Kindle actions", () => {
   it("explains that a disconnected Kindle-dependent shelf needs a fresh comparison", () => {
     const root = render(renderLibraryResults(initialAppState(), snapshot({
@@ -258,6 +270,154 @@ describe("library list view and Kindle actions", () => {
       .toContain("Possible catalog source: Possible book");
     expect(possible.querySelector<HTMLButtonElement>('.match-review-source-removal [data-ui-action="remove-book-from-kindle"]')?.disabled)
       .toBe(true);
+  });
+
+  it("renders match comparison as an accessible side-by-side table with separate evidence and closed technical details", () => {
+    const libraryBook = {
+      ...POSSIBLE,
+      title: "The Last Question",
+      authors: ["First Author", "Second Author"],
+      identifiers: ["isbn:9781234567897", "asin:CATALOG123"],
+      sourceFilename: "The Last Question.epub",
+      size: 42,
+    };
+    const evidence = comparisonEvidence();
+    const item = {
+      ...INVENTORY.items[1]!,
+      title: "THE LAST QUESTION",
+      author: "Legacy joined author display",
+      authors: ["First Author", "Second Author"],
+      identifiers: ["isbn:9789876543210", "asin:KINDLE456"],
+      filename: "Last Question - device.azw3",
+      path: "Documents/Fiction/Last Question - device.azw3",
+      size: 61,
+      format: "azw3",
+      objectFormat: 0x3000,
+      modificationDate: "20260906T120000",
+      candidates: [{ profileId: PROFILE.id, bookId: libraryBook.id, reason: "Title and author comparison", evidence }],
+    };
+    const root = render(renderLibraryPrototype(readyState(), snapshot({
+      kindleInventory: { ...INVENTORY, total: 1, items: [item] },
+      matchReview: { itemId: item.id, requestedBookId: libraryBook.id, loadState: "ready", books: new Map([[libraryBook.id, libraryBook]]), busy: false },
+    })));
+    const table = root.querySelector<HTMLTableElement>("table.match-review-comparison");
+    expect(table).not.toBeNull();
+    expect(Array.from(table!.querySelectorAll('thead th[scope="col"]'), (header) => header.textContent?.trim()))
+      .toEqual(["Field", "In your library", "On your Kindle", "Result"]);
+    expect(Array.from(table!.querySelectorAll("tbody tr"), (row) => (row as HTMLElement).dataset.field))
+      .toEqual(["title", "authors", "identifiers", "filename", "size"]);
+    for (const row of table!.querySelectorAll("tbody tr")) {
+      expect(row.querySelector('th[scope="row"]')?.textContent?.trim()).toBeTruthy();
+      expect(row.querySelectorAll("td")).toHaveLength(3);
+    }
+    const cells = (field: string) => table!.querySelectorAll<HTMLTableCellElement>(`tbody tr[data-field="${field}"] td`);
+    expect(cells("title")[0]?.textContent).toContain(libraryBook.title);
+    expect(cells("title")[1]?.textContent).toContain(item.title);
+    for (const [column, metadata] of [libraryBook, item].entries()) {
+      for (const field of ["authors", "identifiers"] as const) {
+        const displayedEntries = Array.from(cells(field)[column]!.querySelectorAll("*"), (entry) => entry.textContent?.trim());
+        expect(displayedEntries).toEqual(expect.arrayContaining(metadata[field]));
+      }
+    }
+    expect(cells("authors")[1]?.textContent).not.toContain(item.author);
+    expect(cells("filename")[0]?.textContent).toContain(libraryBook.sourceFilename);
+    expect(cells("filename")[1]?.textContent).toContain(item.filename);
+    expect(cells("size")[0]?.textContent).toContain("42");
+    expect(cells("size")[1]?.textContent).toContain("61");
+    for (const [field, result] of Object.entries(evidence.comparisons)) {
+      expect(cells(field)[2]?.querySelector(`.match-comparison-badge[data-comparison="${result}"]`)?.textContent)
+        .toContain(result === "match" ? "Matches" : "Different");
+    }
+    const facts = root.querySelector("dl.match-review-facts");
+    expect(facts?.textContent).toContain("1 device candidate");
+    expect(facts?.closest("table")).toBeNull();
+    expect(root.querySelector(".match-review-explanation")?.textContent).toContain(evidence.strongerProofUnavailable);
+    const fileDetails = root.querySelector<HTMLDetailsElement>("details.match-review-file-details");
+    expect(fileDetails?.open).toBe(false);
+    expect(fileDetails?.textContent).toContain(item.path);
+    expect(fileDetails?.textContent).toContain("0x3000");
+    expect(fileDetails?.textContent).toContain(item.modificationDate);
+    const technical = root.querySelector<HTMLDetailsElement>("details.match-review-technical");
+    expect(technical?.open).toBe(false);
+    expect(technical?.querySelector(".match-review-source-removal")).not.toBeNull();
+    expect(technical?.querySelector<HTMLButtonElement>('[data-ui-action="remove-book-from-kindle"]')?.disabled).toBe(true);
+  });
+
+  it("renders match comparison metadata as escaped text without inventing unavailable device values", () => {
+    const libraryBook = {
+      ...POSSIBLE,
+      title: '<img src=x onerror="alert(1)"> Library title',
+      authors: ["<script>alert(2)</script>", "Second & Author"],
+      identifiers: ['<svg onload="alert(3)">', 'isbn:"<&>'],
+      sourceFilename: '<source & "original">.epub',
+    };
+    const item = {
+      ...INVENTORY.items[1]!,
+      filename: '<img src=x onerror="alert(4)">.azw3',
+      path: 'Documents/<script>alert(5)</script>.azw3',
+      candidates: [{
+        profileId: PROFILE.id,
+        bookId: libraryBook.id,
+        reason: "A filename candidate without parsed metadata",
+        evidence: comparisonEvidence({ comparisons: { title: "unavailable", authors: "unavailable", identifiers: "unavailable", filename: "match", size: "different" } }),
+      }],
+    };
+    const root = render(renderLibraryPrototype(readyState(), snapshot({
+      kindleInventory: { ...INVENTORY, total: 1, items: [item] },
+      matchReview: { itemId: item.id, requestedBookId: libraryBook.id, loadState: "ready", books: new Map([[libraryBook.id, libraryBook]]), busy: false },
+    })));
+    const dialog = root.querySelector(".library-match-review-sheet")!;
+    const table = dialog.querySelector("table.match-review-comparison")!;
+    expect(table).not.toBeNull();
+    expect(dialog.querySelector("script, img, svg, [onerror], [onload]")).toBeNull();
+    const cells = (field: string) => table.querySelectorAll(`tbody tr[data-field="${field}"] td`);
+    expect(cells("title")[0]?.textContent).toContain(libraryBook.title);
+    expect(cells("filename")[0]?.textContent).toContain(libraryBook.sourceFilename);
+    expect(cells("filename")[1]?.textContent).toContain(item.filename);
+    for (const field of ["authors", "identifiers"] as const) {
+      for (const value of libraryBook[field]) expect(cells(field)[0]?.textContent).toContain(value);
+    }
+    for (const field of ["title", "authors", "identifiers"]) {
+      expect(cells(field)[1]?.textContent).toMatch(/unavailable|not available|not supplied/i);
+      expect(cells(field)[1]?.textContent).not.toContain(item.filename);
+      expect(cells(field)[2]?.querySelector('.match-comparison-badge[data-comparison="unavailable"]')?.textContent)
+        .toContain("Unavailable");
+    }
+    expect(dialog.querySelector("details.match-review-file-details")?.textContent).toContain(item.path);
+  });
+
+  it("renders match comparison for an incomplete scan without an exact device file or manual choices", () => {
+    const explanation = {
+      profileId: PROFILE.id,
+      bookId: POSSIBLE.id,
+      reason: "The Kindle scan was incomplete, so this possible match cannot be confirmed.",
+      evidence: comparisonEvidence({
+        tier: "inventory-partial",
+        inventoryCompleteness: "partial",
+        candidateCount: 0,
+        ambiguous: true,
+        comparisons: { title: "not-compared", authors: "not-compared", identifiers: "not-compared", filename: "not-compared", size: "not-compared" },
+        strongerProofUnavailable: "No exact device file was identified in the incomplete inventory.",
+      }),
+    };
+    const root = render(renderLibraryPrototype(readyState(), snapshot({
+      kindleInventory: { ...INVENTORY, completeness: "partial", total: 0, items: [], possibleMatches: [explanation] },
+      matchReview: { itemId: `catalog-possible:${POSSIBLE.id}`, explanation, loadState: "ready", books: new Map([[POSSIBLE.id, POSSIBLE]]), busy: false },
+    })));
+    const dialog = root.querySelector(".library-match-review-sheet")!;
+    expect(dialog.textContent).toContain("No exact Kindle file identified");
+    const rows = dialog.querySelectorAll("table.match-review-comparison tbody tr");
+    expect(rows).toHaveLength(5);
+    for (const row of rows) {
+      const cells = row.querySelectorAll("td");
+      expect(cells[1]?.textContent).toMatch(/unavailable|not available|no exact kindle file|not supplied/i);
+      expect(cells[2]?.querySelector('.match-comparison-badge[data-comparison="not-compared"]')?.textContent)
+        .toContain("Not compared");
+    }
+    expect(dialog.querySelector("dl.match-review-facts")?.textContent).toContain("No exact device candidate");
+    expect(dialog.querySelector(".match-review-explanation")?.textContent).toContain(explanation.evidence.strongerProofUnavailable);
+    expect(dialog.querySelector('[data-ui-action="manual-match-decision"]')).toBeNull();
+    expect(dialog.querySelector('[data-ui-action="remove-book-from-kindle"]')).toBeNull();
   });
 
   it("offers an accessible grid/list toggle and keeps selection controls list-only", () => {

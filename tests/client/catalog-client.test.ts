@@ -19,6 +19,21 @@ function jsonResponse(body: unknown, status = 200): Response {
 }
 
 describe("HttpCatalogClient", () => {
+  it("retains Hardcover series suggestions, fractional positions, sanitized credentials and durable provider errors", async () => {
+    const candidate = { provider: "hardcover", candidateId: "hc:42:7", confidence: "high", metadata: { title: "Book", series: "Series", seriesIndex: 1.5 } };
+    const fetch = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({ provider: "hardcover", items: [candidate] }))
+      .mockResolvedValueOnce(jsonResponse({ items: [{ provider: "hardcover", configured: true, revision: 2, status: "error", errorCode: "invalid-or-expired-token", apiKey: "never-returned", maskedKey: "not-trusted" }] }))
+      .mockResolvedValueOnce(jsonResponse({ id: "job", provider: "hardcover", status: "completed", entries: [{ status: "failed", errorCode: "provider-rate-limited", candidates: [candidate] }] }));
+    const client = new HttpCatalogClient({ fetch });
+    expect(await client.searchBookMetadata("profile", "book", "hardcover", { identifier: "9780000000002" })).toEqual({ provider: "hardcover", items: [candidate] });
+    expect(fetch.mock.calls[0]?.[0]).toContain("provider=hardcover");
+    const credentials = await client.listCoverProviderCredentials();
+    expect(credentials[0]).toMatchObject({ provider: "hardcover", maskedKey: "••••••••", errorCode: "invalid-or-expired-token" });
+    expect(JSON.stringify(credentials)).not.toContain("never-returned");
+    expect(await client.getMetadataLookupJob("profile", "job")).toMatchObject({ provider: "hardcover", entries: [{ errorCode: "provider-rate-limited", candidates: [candidate] }] });
+  });
+
   it("replaces an unopened event stream and renews a finite stream lease independently of request deadlines", async () => {
     vi.useFakeTimers();
     const streams: Array<{

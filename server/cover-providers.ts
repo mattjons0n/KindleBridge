@@ -5,7 +5,9 @@ import type {
   CoverSearchCandidate,
   EditableBookMetadata,
   MetadataCandidateSearchTerms,
+  MetadataProvider,
 } from "../shared/catalog-contracts.js";
+import { HARDCOVER_BOOKS_QUERY, HARDCOVER_ISBN_QUERY, HARDCOVER_SEARCH_QUERY, hardcoverBookIds, hardcoverIsbn, hardcoverMetadataCandidates } from "./hardcover-provider.js";
 import { normalizeKindleMetadataIdentifier, normalizeKindleMetadataWords } from "../shared/kindle-metadata-normalization.js";
 import {
   MAX_METADATA_COVER_BYTES,
@@ -40,6 +42,9 @@ export class CoverProviderError extends Error {
       | "provider_not_configured"
       | "provider_unavailable"
       | "provider_timeout"
+      | "provider_rate_limited"
+      | "provider_invalid_token"
+      | "provider_insufficient_permissions"
       | "provider_response_too_large",
     message: string,
   ) {
@@ -49,10 +54,15 @@ export class CoverProviderError extends Error {
 }
 
 export class CoverProviderClient {
+  private hardcoverQueue: Promise<void> = Promise.resolve();
+  private hardcoverNextRequestAt = 0;
+  private hardcoverCooldownUntil = 0;
+
   constructor(
     private readonly fetchImplementation: typeof fetch = fetch,
     private readonly googleBooksApiKeySource?: GoogleBooksApiKeySource,
     private readonly timeoutMs = 12_000,
+    private readonly hardcoverTokenSource?: GoogleBooksApiKeySource,
   ) {}
 
   async search(
@@ -71,7 +81,7 @@ export class CoverProviderClient {
    * are sent to fixed provider endpoints; no book bytes, paths, or URLs enter
    * this adapter. */
   async searchMetadata(
-    provider: CoverProvider,
+    provider: MetadataProvider,
     terms: MetadataCandidateSearchTerms,
     limit: number,
     signal?: AbortSignal,
@@ -80,7 +90,117 @@ export class CoverProviderClient {
     const normalized = normalizedMetadataTerms(terms);
     if (provider === "google-books") return this.searchGoogleBooksMetadata(normalized, boundedLimit, signal);
     if (provider === "open-library") return this.searchOpenLibraryMetadata(normalized, boundedLimit, signal);
+    if (provider === "hardcover") return this.searchHardcoverMetadata(normalized, boundedLimit, signal);
     throw new CoverProviderError("invalid_provider", "Metadata provider is not supported.");
+  }
+
+  private async searchHardcoverMetadata(
+    terms: MetadataCandidateSearchTerms,
+    limit: number,
+    signal?: AbortSignal,
+  ): Promise<CatalogMetadataCandidate[]> {
+    const isbn = hardcoverIsbn(terms.identifier);
+    if (isbn) {
+      const data = await this.hardcoverRequest(HARDCOVER_ISBN_QUERY, { isbn, limit }, signal);
+      if (!Array.isArray(data.editions)) throw hardcoverMalformedResponse();
+      if (data.editions.length) return hardcoverMetadataCandidates(data.editions, terms, limit, true);
+    }
+    const query = [terms.title, terms.author].filter(Boolean).join(" ");
+    if (!query) return [];
+    const search = await this.hardcoverRequest(HARDCOVER_SEARCH_QUERY, { query, limit }, signal);
+    if (!isRecord(search.search) || search.search.error || !Array.isArray(search.search.ids)) throw hardcoverMalformedResponse();
+    const ids = hardcoverBookIds(search.search.ids, limit);
+    if (!ids.length) return [];
+    const data = await this.hardcoverRequest(HARDCOVER_BOOKS_QUERY, { ids, limit }, signal);
+    if (!Array.isArray(data.books)) throw hardcoverMalformedResponse();
+    // Restore relevance order after the relational query and discard unrequested IDs.
+    const books = ids.flatMap((id) => data.books instanceof Array ? data.books.filter((book) => isRecord(book) && book.id === id) : []);
+    return hardcoverMetadataCandidates(books, terms, limit);
+  }
+
+  async testHardcoverCredential(apiKey?: string, signal?: AbortSignal): Promise<CoverProviderCredentialErrorCode | null> {
+    try {
+      const data = await this.hardcoverRequest(HARDCOVER_ISBN_QUERY, { isbn: "9780140328721", limit: 1 }, signal, apiKey);
+      if (!Array.isArray(data.editions)) throw hardcoverMalformedResponse();
+      const search = await this.hardcoverRequest(HARDCOVER_SEARCH_QUERY, { query: "Matilda", limit: 1 }, signal, apiKey);
+      if (!isRecord(search.search) || search.search.error || !Array.isArray(search.search.ids)) throw hardcoverMalformedResponse();
+      return null;
+    } catch (error) {
+      if (signal?.aborted) throw signal.reason;
+      if (error instanceof CoverProviderError) {
+        if (error.code === "provider_not_configured") throw error;
+        if (error.code === "provider_invalid_token") return "invalid-or-expired-token";
+        if (error.code === "provider_insufficient_permissions") return "insufficient-permissions";
+        if (error.code === "provider_rate_limited") return "quota-exhausted";
+        if (error.code === "provider_timeout") return "timeout";
+      }
+      return "provider-unavailable";
+    }
+  }
+
+  private hardcoverRequest(
+    query: string,
+    variables: Record<string, unknown>,
+    signal?: AbortSignal,
+    tokenOverride?: string,
+  ): Promise<Record<string, unknown>> {
+    // All requests share one provider lane, including searches, jobs and token tests.
+    // Cooldowns fail promptly so an exhausted daily quota cannot hold an HTTP request open.
+    const operation = this.hardcoverQueue.then(async () => {
+      signal?.throwIfAborted();
+      if (Date.now() < this.hardcoverCooldownUntil) throw hardcoverQuotaError();
+      const remaining = this.hardcoverNextRequestAt - Date.now();
+      if (remaining > 0) await providerDelay(remaining, signal);
+      signal?.throwIfAborted();
+      const token = tokenOverride ?? (typeof this.hardcoverTokenSource === "function" ? this.hardcoverTokenSource() : this.hardcoverTokenSource);
+      if (!token?.trim()) throw new CoverProviderError("provider_not_configured", "Add a Hardcover API token in Settings before looking up series.");
+      this.hardcoverNextRequestAt = Date.now() + 1_000;
+      const timed = await this.fetchWithDeadline(new URL("https://api.hardcover.app/v1/graphql"), {
+        method: "POST",
+        redirect: "error",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+          Authorization: `Bearer ${token.trim().replace(/^Bearer\s+/iu, "")}`,
+          "User-Agent": "ShelfSend self-hosted series lookup",
+        },
+        body: JSON.stringify({ query, variables }),
+      }, signal);
+      const response = timed.response;
+      this.recordHardcoverRateLimit(response);
+      if (response.status === 401) throw hardcoverTokenError();
+      if (response.status === 403) throw hardcoverPermissionsError();
+      if (response.status === 429) throw hardcoverQuotaError();
+      if (response.status === 408) throw new CoverProviderError("provider_timeout", "Hardcover took too long to respond. Try again shortly.");
+      if (!response.ok) throw new CoverProviderError("provider_unavailable", "Hardcover could not complete the lookup. Try again later.");
+      const value = parseProviderJson(await timed.readBody(MAX_PROVIDER_JSON_BYTES));
+      if (Array.isArray(value.errors) && value.errors.length) {
+        const codes = value.errors.flatMap((error) => isRecord(error) && isRecord(error.extensions) && typeof error.extensions.code === "string" ? [error.extensions.code.toLowerCase()] : []);
+        if (codes.some((code) => ["invalid-jwt", "jwt-expired", "invalid_token", "unauthenticated"].includes(code))) throw hardcoverTokenError();
+        if (codes.some((code) => ["access-denied", "permission-error", "insufficient_scope", "forbidden"].includes(code))) throw hardcoverPermissionsError();
+        throw hardcoverMalformedResponse();
+      }
+      if (!isRecord(value.data)) throw hardcoverMalformedResponse();
+      return value.data;
+    });
+    this.hardcoverQueue = operation.then(() => undefined, () => undefined);
+    return abortableProviderWait(operation, signal);
+  }
+
+  private recordHardcoverRateLimit(response: Response): void {
+    const now = Date.now();
+    const retryAfter = response.headers.get("retry-after");
+    if (response.status === 429) {
+      const seconds = retryAfter && /^\d+(?:\.\d+)?$/u.test(retryAfter) ? Number(retryAfter) : null;
+      const date = retryAfter ? Date.parse(retryAfter) : NaN;
+      const waitMs = seconds !== null ? seconds * 1_000 : Number.isFinite(date) ? date - now : 60_000;
+      this.hardcoverCooldownUntil = Math.max(this.hardcoverCooldownUntil, now + Math.max(1_000, Math.min(waitMs, 86_400_000)));
+    }
+    for (const bucket of (response.headers.get("ratelimit") ?? "").split(",")) {
+      const remaining = /(?:^|;)\s*r=(\d+)(?:;|$)/u.exec(bucket)?.[1];
+      const reset = /(?:^|;)\s*t=(\d+)(?:;|$)/u.exec(bucket)?.[1];
+      if (remaining === "0" && reset) this.hardcoverCooldownUntil = Math.max(this.hardcoverCooldownUntil, now + Math.min(Number(reset) * 1_000, 86_400_000));
+    }
   }
 
   async fetchCover(provider: CoverProvider, candidateId: string, signal?: AbortSignal): Promise<ProviderCoverBytes> {
@@ -555,6 +675,46 @@ function googleBooksSearchError(status: number): CoverProviderError {
     );
   }
   return new CoverProviderError("provider_unavailable", "Google Books cover search failed.");
+}
+
+function hardcoverTokenError(): CoverProviderError {
+  return new CoverProviderError("provider_invalid_token", "Hardcover rejected the token or it has expired. Replace it in Settings.");
+}
+
+function hardcoverPermissionsError(): CoverProviderError {
+  return new CoverProviderError("provider_insufficient_permissions", "Hardcover needs catalog data and search permissions. Check your token in Settings.");
+}
+
+function hardcoverQuotaError(): CoverProviderError {
+  return new CoverProviderError("provider_rate_limited", "Hardcover's request limit has been reached. Wait before retrying the lookup.");
+}
+
+function hardcoverMalformedResponse(): CoverProviderError {
+  return new CoverProviderError("provider_unavailable", "Hardcover returned an incomplete response. No suggestions were applied; try again later.");
+}
+
+async function abortableProviderWait<T>(operation: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return operation;
+  signal.throwIfAborted();
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([operation, aborted]);
+  } finally {
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+  }
+}
+
+async function providerDelay(milliseconds: number, signal?: AbortSignal): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await abortableProviderWait(new Promise<void>((resolve) => { timer = setTimeout(resolve, milliseconds); }), signal);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function imageMediaType(value: string | null): MetadataCoverMediaType | null {

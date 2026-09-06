@@ -219,6 +219,24 @@ describe("catalog/Kindle reconciliation", () => {
     ]));
   });
 
+  it("preserves parsed authors and identifiers for presentation without inventing absent metadata", async () => {
+    const snapshot = await inventory("book-1");
+    const authors = ["Marcus Aurelius", "Gregory Hays"];
+    const identifiers = ["isbn:9780000000001", "asin:B000TEST123"];
+    const result = await reconcileCatalogIndexes([index("book-1")], {
+      ...snapshot,
+      objects: [snapshot.objects[0]!, { ...snapshot.objects[1]!, authors, identifiers }],
+    }, { deviceLabel: "Kindle" });
+
+    expect(result.inventory.items[1]).toMatchObject({
+      author: "Marcus Aurelius, Gregory Hays",
+      authors,
+      identifiers,
+    });
+    expect(result.inventory.items[0]).not.toHaveProperty("authors");
+    expect(result.inventory.items[0]).not.toHaveProperty("identifiers");
+  });
+
   it.each(["kfx", "azw", "azw8", "prc"] as const)(
     "uses a unique managed .%s object as Kindle presence evidence",
     async (extension) => {

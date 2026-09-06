@@ -46,6 +46,7 @@ import {
   type CoverProviderCredentialErrorCode,
   type CoverProviderCredentialState,
   type CoverProvider,
+  type MetadataProvider,
   type DeliveryInput,
   type DeliveryRecord,
   type EditableBookMetadata,
@@ -206,7 +207,7 @@ export interface CatalogIssueMutationResult {
 
 interface MetadataLookupAcceptance {
   readonly jobId: string;
-  readonly provider: CoverProvider;
+  readonly provider: MetadataProvider;
   readonly candidateId: string;
 }
 
@@ -214,7 +215,7 @@ export interface MetadataLookupClaim {
   jobId: string;
   profileId: string;
   bookId: string;
-  provider: CoverProvider;
+  provider: MetadataProvider;
   terms: MetadataCandidateSearchTerms;
 }
 
@@ -406,11 +407,11 @@ function stringOrNull(value: unknown): string | null {
   return typeof value === "string" ? value : null;
 }
 
-function normalizedCoverProviderApiKey(value: string): string {
-  const normalized = value.trim();
+function normalizedCoverProviderApiKey(value: string, provider: ConfigurableCoverProvider = "google-books"): string {
+  const normalized = provider === "hardcover" ? value.trim().replace(/^Bearer\s+/iu, "") : value.trim();
   if (
     normalized.length === 0
-    || normalized.length > MAX_COVER_PROVIDER_API_KEY_LENGTH
+    || normalized.length > (provider === "hardcover" ? 4096 : MAX_COVER_PROVIDER_API_KEY_LENGTH)
     || /[\u0000-\u0020\u007f]/u.test(normalized)
   ) {
     throw new RangeError("Cover-provider API key is invalid.");
@@ -476,7 +477,7 @@ function parseMetadataCandidates(value: unknown): CatalogMetadataCandidate[] {
     return parsed.filter((candidate): candidate is CatalogMetadataCandidate => {
       if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return false;
       const item = candidate as Partial<CatalogMetadataCandidate>;
-      return (item.provider === "google-books" || item.provider === "open-library")
+      return (item.provider === "google-books" || item.provider === "open-library" || item.provider === "hardcover")
         && typeof item.candidateId === "string"
         && (item.confidence === "high" || item.confidence === "medium" || item.confidence === "low")
         && item.metadata !== null && typeof item.metadata === "object" && !Array.isArray(item.metadata);
@@ -818,7 +819,7 @@ export class CatalogDatabase {
   }
 
   listCoverProviderCredentialStates(): CoverProviderCredentialState[] {
-    return [this.getCoverProviderCredentialState("google-books")];
+    return [this.getCoverProviderCredentialState("google-books"), this.getCoverProviderCredentialState("hardcover")];
   }
 
   getCoverProviderCredentialState(provider: ConfigurableCoverProvider): CoverProviderCredentialState {
@@ -855,7 +856,7 @@ export class CatalogDatabase {
     expectedRevision: number,
     idempotencyKey?: string,
   ): CoverProviderCredentialState {
-    const normalized = normalizedCoverProviderApiKey(apiKey);
+    const normalized = normalizedCoverProviderApiKey(apiKey, provider);
     return this.transaction(() => {
       const requestHash = mutationRequestHash({ apiKey: normalized, expectedRevision });
       const replay = idempotencyKey
@@ -3814,7 +3815,7 @@ export class CatalogDatabase {
     return {
       id: String(row.id),
       profileId: String(row.profile_id),
-      provider: String(row.provider) as CoverProvider,
+      provider: String(row.provider) as MetadataProvider,
       status: String(row.status) as MetadataLookupJobStatus,
       revision: Number(row.revision),
       entriesIncluded: includeEntries,
@@ -3925,7 +3926,7 @@ export class CatalogDatabase {
           jobId,
           profileId,
           bookId,
-          provider: String(job.provider) as CoverProvider,
+          provider: String(job.provider) as MetadataProvider,
           terms: {
             title: book.title,
             ...(book.authors[0] ? { author: book.authors[0] } : {}),

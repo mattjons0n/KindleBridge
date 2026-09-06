@@ -58,6 +58,16 @@ describe("series browsing domain", () => {
     expect(group.unnumberedCount).toBe(2);
   });
 
+  it("keeps Hardcover volume zero and fractional prequels numbered", () => {
+    const group = buildCatalogSeriesGroups([
+      book("unknown", "Saga"), book("one", "Saga", 1),
+      book("half", "Saga", 0.5), book("zero", "Saga", 0),
+    ])[0]!;
+    expect(group.books.map(({ id }) => id)).toEqual(["zero", "half", "one", "unknown"]);
+    expect(group.unnumberedCount).toBe(1);
+    expect(group.missingIntegerIndices).toEqual([]);
+  });
+
   it("queues only books with authoritative current not-on-Kindle evidence", () => {
     const group = buildCatalogSeriesGroups([
       book("one", "Saga", 1),

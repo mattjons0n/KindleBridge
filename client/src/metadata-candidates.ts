@@ -1,12 +1,13 @@
-import type { BookMetadataOverrides, EditableBookMetadata } from "./catalog-client";
+import type { BookMetadataOverrides, EditableBookMetadata, MetadataProvider } from "./catalog-client";
 
 export const MAX_METADATA_CANDIDATES = 12;
 export const MAX_METADATA_IMPORT_FIELDS = 12;
 
 export type MetadataCandidateField = keyof EditableBookMetadata;
+type CurrentMetadataValues = Readonly<Partial<Record<MetadataCandidateField, unknown>>>;
 
 export interface CatalogMetadataCandidate {
-  readonly provider: "google-books" | "open-library";
+  readonly provider: MetadataProvider;
   readonly candidateId: string;
   readonly confidence: "high" | "medium" | "low";
   readonly metadata: Partial<EditableBookMetadata>;
@@ -28,6 +29,52 @@ const FIELDS = Object.freeze([
 
 function stable(value: unknown): string {
   return JSON.stringify(value ?? null);
+}
+
+export function metadataProviderLabel(provider: MetadataProvider): string {
+  return provider === "hardcover" ? "Hardcover" : provider === "google-books" ? "Google Books" : "Open Library";
+}
+
+/** A reviewed Hardcover suggestion starts with gaps only, never existing choices. */
+export function missingMetadataCandidateFields(
+  current: CurrentMetadataValues,
+  overrides: BookMetadataOverrides,
+  candidate: CatalogMetadataCandidate,
+): ReadonlySet<MetadataCandidateField> {
+  const empty = (value: unknown): boolean => value == null || value === "" || (Array.isArray(value) && value.length === 0);
+  const selected = new Set<MetadataCandidateField>();
+  for (const field of FIELDS) {
+    if (!Object.hasOwn(overrides, field) && empty(current[field]) && !empty(candidate.metadata[field])) selected.add(field);
+  }
+  // A volume number only makes sense within its own series. Preserve an
+  // explicitly cleared name/number, and do not pair a new name with an old number.
+  if (stable(current.series) !== stable(candidate.metadata.series)) {
+    if (selected.has("series") && !Object.hasOwn(overrides, "seriesIndex") && empty(current.seriesIndex)
+        && Object.hasOwn(candidate.metadata, "seriesIndex")) {
+      selected.add("seriesIndex");
+    } else {
+      selected.delete("series");
+      selected.delete("seriesIndex");
+    }
+  }
+  return selected;
+}
+
+export function reviewedMetadataCandidateFields(
+  current: CurrentMetadataValues,
+  candidate: CatalogMetadataCandidate,
+  fields: ReadonlySet<MetadataCandidateField>,
+  field: MetadataCandidateField,
+  selected: boolean,
+): ReadonlySet<MetadataCandidateField> {
+  const next = new Set(fields);
+  const pair = candidate.provider === "hardcover" && (field === "series" || field === "seriesIndex")
+    && stable(current.series) !== stable(candidate.metadata.series);
+  for (const key of pair ? ["series", "seriesIndex"] as const : [field]) {
+    if (selected && Object.hasOwn(candidate.metadata, key)) next.add(key);
+    else next.delete(key);
+  }
+  return next;
 }
 
 function boundedCandidateValue(
@@ -93,7 +140,7 @@ export function selectedMetadataCandidateOverrides(
 export function validateCatalogMetadataCandidate(value: unknown): CatalogMetadataCandidate | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   const item = value as Partial<CatalogMetadataCandidate>;
-  if ((item.provider !== "google-books" && item.provider !== "open-library")
+  if ((item.provider !== "google-books" && item.provider !== "open-library" && item.provider !== "hardcover")
       || typeof item.candidateId !== "string" || item.candidateId.length < 1 || item.candidateId.length > 512
       || (item.confidence !== "high" && item.confidence !== "medium" && item.confidence !== "low")
       || !item.metadata || typeof item.metadata !== "object" || Array.isArray(item.metadata)

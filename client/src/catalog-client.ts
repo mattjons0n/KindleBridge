@@ -16,6 +16,7 @@ import type {
   ConfigurableCoverProvider,
   CoverImportInput,
   CoverProvider,
+  MetadataProvider,
   CoverProviderCredentialInput,
   CoverProviderCredentialState,
   CoverProviderCredentialTestInput,
@@ -59,6 +60,7 @@ export type {
   ConfigurableCoverProvider,
   CoverImportInput,
   CoverProvider,
+  MetadataProvider,
   CoverProviderCredentialInput,
   CoverProviderCredentialState,
   CoverProviderCredentialTestInput,
@@ -592,7 +594,7 @@ export interface CatalogApi {
   searchBookMetadata?(
     profileId: string,
     bookId: string,
-    provider: CoverProvider,
+    provider: MetadataProvider,
     terms: MetadataCandidateSearchTerms,
     signal?: AbortSignal,
   ): Promise<MetadataCandidateSearchResult>;
@@ -1106,7 +1108,7 @@ function parseCoverSearchResult(value: unknown): CatalogCoverSearchResult {
 
 function parseMetadataCandidate(value: unknown): CatalogMetadataCandidate | null {
   const item = record(value);
-  const provider = item.provider === "google-books" || item.provider === "open-library" ? item.provider : null;
+  const provider = item.provider === "google-books" || item.provider === "open-library" || item.provider === "hardcover" ? item.provider : null;
   const candidateId = textValue(item.candidateId);
   const confidence = item.confidence === "high" || item.confidence === "medium" || item.confidence === "low"
     ? item.confidence
@@ -1125,7 +1127,7 @@ function parseMetadataCandidate(value: unknown): CatalogMetadataCandidate | null
 
 function parseMetadataCandidateSearchResult(value: unknown): MetadataCandidateSearchResult {
   const item = record(value);
-  const provider = item.provider === "open-library" ? "open-library" as const : "google-books" as const;
+  const provider = item.provider === "hardcover" ? "hardcover" as const : item.provider === "open-library" ? "open-library" as const : "google-books" as const;
   const items = Array.isArray(item.items)
     ? item.items.flatMap((entry) => {
         const candidate = parseMetadataCandidate(entry);
@@ -1137,13 +1139,16 @@ function parseMetadataCandidateSearchResult(value: unknown): MetadataCandidateSe
 
 function parseMetadataLookupJob(value: unknown): MetadataLookupJob {
   const item = record(value);
-  const provider = item.provider === "open-library" ? "open-library" as const : "google-books" as const;
+  const provider = item.provider === "hardcover" ? "hardcover" as const : item.provider === "open-library" ? "open-library" as const : "google-books" as const;
   const statuses = new Set(["queued", "running", "paused", "completed", "cancelled"]);
   const entryStatuses = new Set(["pending", "searching", "ready", "no-results", "failed", "cancelled"]);
   const errorCodes = new Set([
     "book-unavailable",
     "provider-unavailable",
     "provider-not-configured",
+    "provider-unauthorized",
+    "provider-forbidden",
+    "provider-rate-limited",
     "provider-response-too-large",
     "invalid-provider-response",
   ]);
@@ -1308,13 +1313,15 @@ function parseCoverProviderCredentialState(value: unknown): CoverProviderCredent
     ? item.status
     : configured ? "untested" : "not-configured";
   const errorCode = item.errorCode === "invalid-or-restricted-key"
+    || item.errorCode === "invalid-or-expired-token"
+    || item.errorCode === "insufficient-permissions"
     || item.errorCode === "quota-exhausted"
     || item.errorCode === "timeout"
     || item.errorCode === "provider-unavailable"
     ? item.errorCode
     : null;
   return {
-    provider: "google-books",
+    provider: item.provider === "hardcover" ? "hardcover" : "google-books",
     configured,
     maskedKey: configured ? "••••••••" : null,
     revision: Math.max(0, numberValue(item.revision)),
@@ -2217,7 +2224,7 @@ export class HttpCatalogClient implements CatalogApi {
   async searchBookMetadata(
     profileId: string,
     bookId: string,
-    provider: CoverProvider,
+    provider: MetadataProvider,
     terms: MetadataCandidateSearchTerms,
     signal?: AbortSignal,
   ): Promise<MetadataCandidateSearchResult> {

@@ -83,6 +83,7 @@ describe("catalog database", () => {
         (3, 'v3', '2025-01-01T00:00:00.000Z'),
         (4, 'v4', '2025-01-01T00:00:00.000Z'),
         (5, 'v5', '2025-01-01T00:00:00.000Z');
+      CREATE TABLE profiles(id TEXT PRIMARY KEY) STRICT;
       CREATE TABLE library_roots(id TEXT PRIMARY KEY) STRICT;
       INSERT INTO library_roots(id) VALUES ('root-retained');
       CREATE TABLE configuration_writes(

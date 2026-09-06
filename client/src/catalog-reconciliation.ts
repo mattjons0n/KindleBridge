@@ -515,6 +515,8 @@ export async function reconcileCatalogIndexes(
       path: object.relativePath,
       title: object.title,
       author: object.authors?.join(", "),
+      ...(object.authors === undefined ? {} : { authors: object.authors }),
+      ...(object.identifiers === undefined ? {} : { identifiers: object.identifiers }),
       managed: object.managedToken !== undefined,
       objectFormat: object.objectFormat,
       ...(object.readingEvidence ? { readingEvidence: object.readingEvidence } : {}),

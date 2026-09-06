@@ -6,7 +6,7 @@ interface Migration {
   sql: string;
 }
 
-export const CATALOG_SCHEMA_VERSION = 18;
+export const CATALOG_SCHEMA_VERSION = 19;
 /** Bounded replay window for Settings/configuration mutations per profile. */
 export const MAX_CONFIGURATION_WRITES_PER_PROFILE = 1_000;
 /** Unreferenced stable identities retained per root after confirmed scans. */
@@ -670,6 +670,105 @@ export const CATALOG_MIGRATIONS: readonly Migration[] = [
       INSERT INTO onboarding_state(id, dismissed) VALUES (1, 0);
       ALTER TABLE profile_book_annotations ADD COLUMN read_book INTEGER NOT NULL DEFAULT 0 CHECK(read_book IN (0, 1));
       CREATE INDEX profile_book_annotations_read_idx ON profile_book_annotations(profile_id, read_book, book_id);
+    `,
+  },
+  {
+    version: 19,
+    name: "Hardcover metadata provider and credentials",
+    sql: `
+      -- Rebuild constrained tables inside the migration transaction. Rename
+      -- the old parent first so its old children retain their own FK target;
+      -- copy into new tables before dropping any old rows.
+      ALTER TABLE cover_provider_credentials RENAME TO cover_provider_credentials_v18;
+      CREATE TABLE cover_provider_credentials (
+        provider TEXT PRIMARY KEY CHECK(provider IN ('google-books', 'hardcover')),
+        api_key TEXT,
+        configuration_state TEXT NOT NULL DEFAULT 'never-configured' CHECK(
+          configuration_state IN ('never-configured', 'configured', 'removed')
+        ),
+        revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
+        last_tested_at TEXT,
+        last_test_status TEXT CHECK(last_test_status IS NULL OR last_test_status IN ('working', 'error')),
+        last_test_error_code TEXT CHECK(last_test_error_code IS NULL OR last_test_error_code IN (
+          'invalid-or-restricted-key', 'invalid-or-expired-token', 'insufficient-permissions',
+          'quota-exhausted', 'timeout', 'provider-unavailable'
+        )),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        CHECK(
+          (configuration_state = 'configured' AND api_key IS NOT NULL)
+          OR (configuration_state IN ('never-configured', 'removed') AND api_key IS NULL
+            AND last_tested_at IS NULL AND last_test_status IS NULL AND last_test_error_code IS NULL)
+        )
+      ) STRICT;
+      INSERT INTO cover_provider_credentials SELECT * FROM cover_provider_credentials_v18;
+      DROP TABLE cover_provider_credentials_v18;
+
+      ALTER TABLE cover_provider_mutation_replays RENAME TO cover_provider_mutation_replays_v18;
+      CREATE TABLE cover_provider_mutation_replays (
+        provider TEXT NOT NULL CHECK(provider IN ('google-books', 'hardcover')),
+        operation TEXT NOT NULL CHECK(operation IN ('save', 'remove')),
+        idempotency_key TEXT NOT NULL,
+        request_hash TEXT NOT NULL,
+        result_revision INTEGER NOT NULL CHECK(result_revision > 0),
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(provider, operation, idempotency_key)
+      ) STRICT;
+      INSERT INTO cover_provider_mutation_replays SELECT * FROM cover_provider_mutation_replays_v18;
+      DROP TABLE cover_provider_mutation_replays_v18;
+      CREATE INDEX cover_provider_mutation_replays_retention_idx
+        ON cover_provider_mutation_replays(provider, created_at DESC, idempotency_key DESC);
+
+      ALTER TABLE metadata_lookup_jobs RENAME TO metadata_lookup_jobs_v18;
+      ALTER TABLE metadata_lookup_entries RENAME TO metadata_lookup_entries_v18;
+      ALTER TABLE metadata_lookup_job_replays RENAME TO metadata_lookup_job_replays_v18;
+      CREATE TABLE metadata_lookup_jobs (
+        id TEXT PRIMARY KEY,
+        profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+        provider TEXT NOT NULL CHECK(provider IN ('google-books', 'open-library', 'hardcover')),
+        status TEXT NOT NULL CHECK(status IN ('queued', 'running', 'paused', 'completed', 'cancelled')),
+        revision INTEGER NOT NULL CHECK(revision > 0),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      ) STRICT;
+      CREATE TABLE metadata_lookup_entries (
+        job_id TEXT NOT NULL REFERENCES metadata_lookup_jobs(id) ON DELETE CASCADE,
+        book_id TEXT NOT NULL,
+        rank INTEGER NOT NULL CHECK(rank >= 0),
+        status TEXT NOT NULL CHECK(status IN ('pending', 'searching', 'ready', 'no-results', 'failed', 'cancelled')),
+        attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+        candidates_json TEXT NOT NULL DEFAULT '[]' CHECK(
+          json_valid(candidates_json) AND json_type(candidates_json) = 'array'
+          AND length(CAST(candidates_json AS BLOB)) <= 2097152
+        ),
+        error_code TEXT CHECK(error_code IS NULL OR error_code IN (
+          'book-unavailable', 'provider-unavailable', 'provider-not-configured',
+          'provider-response-too-large', 'invalid-provider-response',
+          'provider-unauthorized', 'provider-forbidden', 'provider-rate-limited'
+        )),
+        accepted_at TEXT,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(job_id, book_id),
+        UNIQUE(job_id, rank)
+      ) STRICT;
+      CREATE TABLE metadata_lookup_job_replays (
+        profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+        idempotency_key TEXT NOT NULL,
+        request_hash TEXT NOT NULL,
+        job_id TEXT NOT NULL REFERENCES metadata_lookup_jobs(id) ON DELETE CASCADE,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(profile_id, idempotency_key)
+      ) STRICT;
+      INSERT INTO metadata_lookup_jobs SELECT * FROM metadata_lookup_jobs_v18;
+      INSERT INTO metadata_lookup_entries SELECT * FROM metadata_lookup_entries_v18;
+      INSERT INTO metadata_lookup_job_replays SELECT * FROM metadata_lookup_job_replays_v18;
+      DROP TABLE metadata_lookup_job_replays_v18;
+      DROP TABLE metadata_lookup_entries_v18;
+      DROP TABLE metadata_lookup_jobs_v18;
+      CREATE INDEX metadata_lookup_jobs_profile_updated_idx
+        ON metadata_lookup_jobs(profile_id, updated_at DESC, id);
+      CREATE INDEX metadata_lookup_entries_status_idx
+        ON metadata_lookup_entries(job_id, status, rank, book_id);
     `,
   },
 ];

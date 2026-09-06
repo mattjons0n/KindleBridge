@@ -941,7 +941,7 @@ details.diagnostics > summary { color: var(--muted); font-size: .8rem; font-weig
 .library-empty-state h2 { margin: 0; color: #34453b; font: 600 1.25rem Georgia, serif; }
 .library-empty-state p { margin: 0 0 6px; font-size: .76rem; }
 
-.library-modal-backdrop { position: fixed; z-index: 20; inset: 0; background: rgba(18, 28, 22, .42); backdrop-filter: blur(3px); }
+.library-modal-backdrop { position: fixed; z-index: 20; inset: 0; background: transparent; backdrop-filter: blur(3px); }
 .library-send-sheet {
   position: fixed;
   z-index: 21;

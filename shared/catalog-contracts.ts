@@ -235,13 +235,18 @@ export interface BookMetadataResetInput {
 
 export type CoverProvider = "google-books" | "open-library";
 
+/** Hardcover enriches metadata; it is not a cover-download provider. */
+export type MetadataProvider = CoverProvider | "hardcover";
+
 /** Online cover providers whose credentials can be managed by the service. */
-export type ConfigurableCoverProvider = "google-books";
+export type ConfigurableCoverProvider = "google-books" | "hardcover";
 
 export type CoverProviderCredentialStatus = "not-configured" | "untested" | "working" | "error";
 
 export type CoverProviderCredentialErrorCode =
   | "invalid-or-restricted-key"
+  | "invalid-or-expired-token"
+  | "insufficient-permissions"
   | "quota-exhausted"
   | "timeout"
   | "provider-unavailable";
@@ -295,7 +300,7 @@ export type MetadataCandidateConfidence = "high" | "medium" | "low";
  * part of this contract; a later import resolves this bounded server-side
  * candidate by provider and candidateId. */
 export interface CatalogMetadataCandidate {
-  provider: CoverProvider;
+  provider: MetadataProvider;
   candidateId: string;
   confidence: MetadataCandidateConfidence;
   metadata: Partial<EditableBookMetadata>;
@@ -309,12 +314,12 @@ export interface MetadataCandidateSearchTerms {
 }
 
 export interface MetadataCandidateSearchResult {
-  provider: CoverProvider;
+  provider: MetadataProvider;
   items: CatalogMetadataCandidate[];
 }
 
 export interface MetadataCandidateImportInput {
-  provider: CoverProvider;
+  provider: MetadataProvider;
   candidateId: string;
   /** Present when the reviewed candidate came from a durable bulk lookup. */
   lookupJobId?: string;
@@ -330,11 +335,14 @@ export type MetadataLookupErrorCode =
   | "book-unavailable"
   | "provider-unavailable"
   | "provider-not-configured"
+  | "provider-unauthorized"
+  | "provider-forbidden"
+  | "provider-rate-limited"
   | "provider-response-too-large"
   | "invalid-provider-response";
 
 export interface MetadataLookupJobInput {
-  provider: CoverProvider;
+  provider: MetadataProvider;
   bookIds: string[];
 }
 
@@ -357,7 +365,7 @@ export interface MetadataLookupJobEntry {
 export interface MetadataLookupJob {
   id: string;
   profileId: string;
-  provider: CoverProvider;
+  provider: MetadataProvider;
   status: MetadataLookupJobStatus;
   revision: number;
   /** Collection listings carry counts only; fetch the individual job for its bounded entries. */

@@ -27,6 +27,7 @@ import {
   type ConfigurableCoverProvider,
   type CoverImportInput,
   type CoverProvider,
+  type MetadataProvider,
   type DeliveryInput,
   type DeliveryStatus,
   type EditableMetadataField,
@@ -241,6 +242,7 @@ export class CatalogHttpServer {
       this.options.coverProviderFetch ?? fetch,
       () => this.database.getCoverProviderCredential("google-books")?.apiKey,
       this.options.coverProviderTimeoutMs,
+      () => this.database.getCoverProviderCredential("hardcover")?.apiKey,
     );
     this.metadataLookupWorker = new MetadataLookupWorker(this.database, this.coverProviders);
     this.server = createServer((request, response) => void this.handle(request, response));
@@ -483,7 +485,7 @@ export class CatalogHttpServer {
     }
     if (segments.length === 1 && method === "PUT") {
       this.assertSettingsWritable();
-      const input = validateCoverProviderCredential(await readJson(request, this.options.maxJsonBodyBytes));
+      const input = validateCoverProviderCredential(await readJson(request, this.options.maxJsonBodyBytes), provider);
       const idempotencyKey = requiredIdempotencyKey(request);
       sendJson(
         response,
@@ -509,7 +511,9 @@ export class CatalogHttpServer {
       const input = validateCoverProviderCredentialTest(await readJson(request, this.options.maxJsonBodyBytes));
       const credential = this.database.getCoverProviderCredential(provider);
       if (!credential) {
-        throw new HttpError(409, "provider_not_configured", "Add a Google Books API key in Settings before testing this provider.");
+        throw new HttpError(409, "provider_not_configured", provider === "hardcover"
+          ? "Add a Hardcover API token in Settings before testing this provider."
+          : "Add a Google Books API key in Settings before testing this provider.");
       }
       if (credential.revision !== input.expectedRevision) {
         throw new HttpError(409, "conflict", "Cover-provider settings changed in another browser.");
@@ -517,7 +521,9 @@ export class CatalogHttpServer {
       const errorCode = await this.withProviderRequest(
         request,
         response,
-        (signal) => this.coverProviders.testGoogleBooksCredential(credential.apiKey, signal),
+        (signal) => provider === "hardcover"
+          ? this.coverProviders.testHardcoverCredential(credential.apiKey, signal)
+          : this.coverProviders.testGoogleBooksCredential(credential.apiKey, signal),
       );
       sendJson(
         response,
@@ -1381,7 +1387,7 @@ export class CatalogHttpServer {
         throw new HttpError(400, "invalid_query", `Unsupported or repeated metadata search field: ${key}.`);
       }
     }
-    const provider = coverProvider(url.searchParams.get("provider"));
+    const provider = metadataProvider(url.searchParams.get("provider"));
     const terms: MetadataCandidateSearchTerms = {};
     if (url.searchParams.has("title")) terms.title = normalizedMetadataSearchTerm(url.searchParams.get("title"), "title", 500);
     if (url.searchParams.has("author")) terms.author = normalizedMetadataSearchTerm(url.searchParams.get("author"), "author", 500);
@@ -1434,15 +1440,25 @@ export class CatalogHttpServer {
     if (input.selectedFields.length === 0 && !input.includeCover) {
       throw new HttpError(400, "invalid_request", "Select at least one metadata field or the candidate cover.");
     }
+    if (input.provider === "hardcover") {
+      const current = this.database.getBookMetadataState(profileId, bookId)!;
+      const selectsSeries = input.selectedFields.includes("series");
+      const selectsPosition = input.selectedFields.includes("seriesIndex");
+      if ((selectsSeries && candidate.metadata.series !== current.book.series && !selectsPosition)
+        || (selectsPosition && !selectsSeries && candidate.metadata.series !== current.book.series)) {
+        throw new HttpError(400, "invalid_request", "Review the series name and volume together when changing series.");
+      }
+    }
     let stored: Awaited<ReturnType<MetadataCoverStore["store"]>> | null = null;
     let sourceUrl: string | null = null;
     if (input.includeCover) {
+      const selectedCoverProvider = coverProvider(input.provider);
       const coverCandidateId = candidate.coverCandidateId;
       if (!coverCandidateId) throw new HttpError(400, "invalid_request", "This metadata candidate has no cover.");
       const remote = await this.withProviderRequest(
         request,
         response,
-        (signal) => this.coverProviders.fetchCover(input.provider, coverCandidateId, signal),
+        (signal) => this.coverProviders.fetchCover(selectedCoverProvider, coverCandidateId, signal),
       );
       stored = await this.requireMetadataCoverStore().store(remote.data, remote.mediaType);
       sourceUrl = remote.sourceUrl;
@@ -1459,7 +1475,7 @@ export class CatalogHttpServer {
         stored ? {
           ...stored,
           sourceKind: "provider",
-          provider: input.provider,
+          provider: coverProvider(input.provider),
           providerReference: candidate.coverCandidateId ?? null,
           sourceUrl,
         } : null,
@@ -1529,7 +1545,7 @@ export class CatalogHttpServer {
   private metadataCandidateCacheKey(
     profileId: string,
     bookId: string,
-    provider: CoverProvider,
+    provider: MetadataProvider,
     candidateId: string,
   ): string {
     return JSON.stringify([profileId, bookId, provider, candidateId]);
@@ -2467,7 +2483,7 @@ function validateMetadataCandidateImport(value: unknown): MetadataCandidateImpor
     throw new HttpError(400, "invalid_request", "selectedFields contains duplicates.");
   }
   return {
-    provider: coverProvider(object.provider),
+    provider: metadataProvider(object.provider),
     candidateId: requiredString(object.candidateId, "candidateId", 160),
     ...(object.lookupJobId === undefined ? {} : { lookupJobId: metadataLookupJobId(requiredString(object.lookupJobId, "lookupJobId", 100)) }),
     selectedFields,
@@ -2491,7 +2507,7 @@ function validateMetadataLookupJob(value: unknown): MetadataLookupJobInput {
   if (new Set(bookIds).size !== bookIds.length) {
     throw new HttpError(400, "invalid_request", "bookIds must contain unique books.");
   }
-  return { provider: coverProvider(object.provider), bookIds };
+  return { provider: metadataProvider(object.provider), bookIds };
 }
 
 function validateMetadataLookupJobControl(value: unknown): MetadataLookupJobControlInput {
@@ -2623,16 +2639,22 @@ function coverProvider(value: unknown): CoverProvider {
 }
 
 function configurableCoverProvider(value: unknown): ConfigurableCoverProvider {
-  if (value !== "google-books") {
+  if (value !== "google-books" && value !== "hardcover") {
     throw new HttpError(400, "invalid_request", "Configurable cover provider is invalid.");
   }
   return value;
 }
 
-function validateCoverProviderCredential(value: unknown): { apiKey: string; expectedRevision: number } {
+function metadataProvider(value: unknown): MetadataProvider {
+  if (value === "hardcover") return value;
+  return coverProvider(value);
+}
+
+function validateCoverProviderCredential(value: unknown, provider: ConfigurableCoverProvider): { apiKey: string; expectedRevision: number } {
   const object = objectValue(value);
-  const apiKey = requiredString(object.apiKey, "apiKey", 512);
-  if (/[\u0000-\u0020\u007f]/u.test(apiKey)) {
+  const raw = requiredString(object.apiKey, "apiKey", provider === "hardcover" ? 4103 : 512);
+  const apiKey = provider === "hardcover" ? raw.replace(/^Bearer\s+/iu, "") : raw;
+  if (!apiKey || apiKey.length > (provider === "hardcover" ? 4096 : 512) || /[\u0000-\u0020\u007f]/u.test(apiKey)) {
     throw new HttpError(400, "invalid_request", "apiKey is invalid.");
   }
   return {
@@ -3031,8 +3053,10 @@ function mapError(error: unknown): HttpError {
     return new HttpError(
       error.code === "invalid_provider" || error.code === "invalid_candidate"
         ? 400
-        : error.code === "provider_not_configured"
+        : error.code === "provider_not_configured" || error.code === "provider_invalid_token" || error.code === "provider_insufficient_permissions"
           ? 409
+        : error.code === "provider_rate_limited"
+          ? 429
         : error.code === "provider_timeout"
           ? 504
         : error.code === "provider_response_too_large"

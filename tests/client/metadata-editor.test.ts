@@ -283,6 +283,64 @@ afterEach(() => {
 });
 
 describe("non-destructive metadata and cover editor", () => {
+  it("configures Hardcover through compact Settings without changing the Google Books credential", async () => {
+    const api = testApi();
+    const google: CoverProviderCredentialState = { provider: "google-books", configured: true, maskedKey: "••••••••", revision: 7, status: "working", lastTestedAt: null, errorCode: null };
+    const hardcover: CoverProviderCredentialState = { ...google, provider: "hardcover", configured: false, maskedKey: null, revision: 0, status: "not-configured" };
+    api.listCoverProviderCredentials.mockResolvedValue([google, hardcover]);
+    api.saveCoverProviderCredential = vi.fn(async () => ({ ...hardcover, configured: true, revision: 1, status: "untested" as const }));
+    api.testCoverProviderCredential = vi.fn(async () => ({ ...hardcover, configured: true, revision: 1, status: "working" as const }));
+    api.removeCoverProviderCredential = vi.fn(async () => ({ ...hardcover, revision: 2 }));
+    const root = document.createElement("div");
+    document.body.append(root);
+    new AppView(root, initialAppState(), handlers(), new DebugLog(), { catalogApi: api });
+    await vi.waitFor(() => expect(root.querySelector('[data-book-id="book-one"]')).not.toBeNull());
+    root.querySelector<HTMLButtonElement>('[data-ui-view="settings"]')!.click();
+    await vi.waitFor(() => expect(root.querySelector('[data-provider="hardcover"]')).not.toBeNull());
+    root.querySelector<HTMLButtonElement>('[data-ui-action="edit-hardcover-token"]')!.click();
+    const input = root.querySelector<HTMLInputElement>("#settings-hardcover-token")!;
+    input.value = "hardcover-test-token";
+    root.querySelector<HTMLButtonElement>('[data-ui-action="save-test-hardcover-token"]')!.click();
+    expect(input.value).toBe("");
+    await vi.waitFor(() => expect(root.querySelector('[data-provider="hardcover"]')?.textContent).toContain("Working"));
+    expect(api.saveCoverProviderCredential).toHaveBeenCalledWith("hardcover", { apiKey: "hardcover-test-token", expectedRevision: 0 }, expect.any(AbortSignal));
+    expect(root.querySelector('[data-provider="google-books"]')?.textContent).toContain("Working");
+    expect(root.innerHTML).not.toContain("hardcover-test-token");
+    expect(JSON.stringify(window.localStorage)).not.toContain("hardcover-test-token");
+    vi.spyOn(window, "confirm").mockReturnValueOnce(true);
+    root.querySelector<HTMLButtonElement>('[data-ui-action="remove-hardcover-token"]')!.click();
+    await vi.waitFor(() => expect(root.querySelector('[data-provider="hardcover"]')?.textContent).toContain("Not configured"));
+    expect(root.querySelector('[data-provider="google-books"]')?.textContent).toContain("Working");
+    expect(api.removeCoverProviderCredential).toHaveBeenCalledWith("hardcover", 1, expect.any(AbortSignal));
+  });
+
+  it("shows every Hardcover series, preserves existing metadata by default, and links a reviewed series replacement to its volume", async () => {
+    const api = testApi();
+    api.listCoverProviderCredentials.mockResolvedValue([{ provider: "hardcover", configured: true, revision: 1, status: "working", maskedKey: "••••••••", lastTestedAt: null, errorCode: null }]);
+    api.searchBookMetadata.mockResolvedValue({ provider: "hardcover", items: [
+      { provider: "hardcover", candidateId: "hc:42:7", confidence: "high", metadata: { title: BOOK.title, authors: BOOK.authors, series: "Chronological order", seriesIndex: 1.5 } },
+      { provider: "hardcover", candidateId: "hc:42:9", confidence: "high", metadata: { title: BOOK.title, authors: BOOK.authors, series: "Publication order", seriesIndex: 4 } },
+    ] });
+    const { root } = await openEditor(api);
+    expect([...root.querySelectorAll<HTMLOptionElement>("#metadata-cover-provider option")].map(({ value }) => value)).not.toContain("hardcover");
+    root.querySelector<HTMLSelectElement>("#metadata-candidate-provider")!.value = "hardcover";
+    root.querySelector<HTMLButtonElement>('[data-ui-action="search-metadata-candidates"]')!.click();
+    await vi.waitFor(() => expect(root.querySelectorAll(".metadata-candidate-card")).toHaveLength(2));
+    expect(root.querySelector(".metadata-candidate-list")?.textContent).toContain("Chronological order · Volume 1.5");
+    expect(root.querySelector(".metadata-candidate-list")?.textContent).toContain("Publication order · Volume 4");
+    expect(root.querySelector(".metadata-candidate-review")).toBeNull();
+    root.querySelector<HTMLButtonElement>('[data-candidate-id="hc:42:7"]')!.click();
+    expect(root.querySelectorAll('.metadata-candidate-review input:checked')).toHaveLength(0);
+    root.querySelector<HTMLInputElement>('[data-field="series"][data-ui-action="toggle-metadata-candidate-field"]')!.click();
+    expect(root.querySelector<HTMLInputElement>('[data-field="seriesIndex"][data-ui-action="toggle-metadata-candidate-field"]')!.checked).toBe(true);
+    expect(root.querySelector('.metadata-candidate-review')?.textContent).toContain("Changing the series also selects its volume number");
+    root.querySelector<HTMLButtonElement>('[data-ui-action="select-missing-metadata-fields"]')!.click();
+    expect(root.querySelectorAll('.metadata-candidate-review input:checked')).toHaveLength(0);
+    root.querySelector<HTMLButtonElement>('[data-candidate-id="hc:42:9"]')!.click();
+    expect(root.querySelectorAll('.metadata-candidate-review input:checked')).toHaveLength(0);
+    expect(api.updateBookMetadata).not.toHaveBeenCalled();
+  });
+
   it("keeps provider credentials out of UI state and clears the password field immediately", async () => {
     const api = testApi();
     const root = document.createElement("div");

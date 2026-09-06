@@ -64,7 +64,7 @@ describe("cover-provider Settings", () => {
       maskedKey: "••••••••",
       revision: 1,
       status: "untested",
-    })]);
+    }), expect.objectContaining({ provider: "hardcover", configured: false, revision: 0 })]);
     expect(JSON.stringify(database.listCoverProviderCredentialStates())).not.toContain("legacy-secret");
 
     const replaced = database.setCoverProviderCredential("google-books", "replacement-secret", 1);
@@ -114,7 +114,7 @@ describe("cover-provider Settings", () => {
       provider: "google-books",
       configured: false,
       revision: 0,
-    })] });
+    }), expect.objectContaining({ provider: "hardcover", configured: false, revision: 0 })] });
 
     const saved = await localFetch(`${base}/api/settings/cover-providers/google-books`, {
       method: "PUT",

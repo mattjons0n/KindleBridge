@@ -23,6 +23,8 @@ import {
   type CatalogSeriesSummaryPage,
   type CatalogServiceStatus,
   type CoverProvider,
+  type MetadataProvider,
+  type ConfigurableCoverProvider,
   type CoverProviderCredentialState,
   type CoverSearchCandidate,
   type CatalogMetadataCandidate,
@@ -73,7 +75,7 @@ import {
   readKindleBridgeActivity,
   type KindleBridgeActivityEvent,
 } from "./activity-center";
-import type { MetadataCandidateField } from "./metadata-candidates";
+import { metadataProviderLabel, missingMetadataCandidateFields, reviewedMetadataCandidateFields, type MetadataCandidateField } from "./metadata-candidates";
 import type { KindleMatchEvidence } from "./kindle";
 import type {
   CatalogManagedUpdateRequest,
@@ -181,6 +183,15 @@ export interface CatalogBrowserSnapshot {
   readonly activeMetadataLookupJob?: MetadataLookupJob;
   readonly metadataLookupBusy: boolean;
   readonly metadataLookupError?: string;
+  readonly hardcoverBulkReview?: {
+    readonly jobId: string;
+    readonly selections: ReadonlyMap<string, { readonly candidateId: string; readonly replaceExisting: boolean; readonly reviewedBook: CatalogBook }>;
+    readonly errors: ReadonlyMap<string, string>;
+    readonly busy: boolean;
+    readonly completed?: number;
+    readonly total?: number;
+    readonly summary?: string;
+  };
   readonly activityOpen: boolean;
   readonly activityEvents: readonly KindleBridgeActivityEvent[];
 }
@@ -232,7 +243,9 @@ export interface CatalogMatchReviewState {
 export interface CatalogCoverProviderSettingsState {
   readonly loadState: CatalogLoadState;
   readonly googleBooks?: CoverProviderCredentialState;
+  readonly hardcover?: CoverProviderCredentialState;
   readonly editing: boolean;
+  readonly editingProvider?: ConfigurableCoverProvider;
   readonly busy: boolean;
   readonly error?: string;
 }
@@ -264,7 +277,7 @@ export interface CatalogMetadataEditorState {
     readonly error?: string;
   };
   readonly metadataSearch: {
-    readonly provider: CoverProvider;
+    readonly provider: MetadataProvider;
     readonly terms: MetadataCandidateSearchTerms;
     readonly loadState: CatalogLoadState;
     readonly items: readonly CatalogMetadataCandidate[];
@@ -322,6 +335,8 @@ export interface CatalogKindleInventoryItem {
   readonly filename: string;
   readonly title?: string;
   readonly author?: string;
+  readonly authors?: readonly string[];
+  readonly identifiers?: readonly string[];
   readonly format?: string;
   readonly size: number;
   readonly path?: string;
@@ -675,6 +690,8 @@ export class CatalogBrowser {
   #healthOperation?: CatalogOperationLease;
   #metadataLookupOperation?: CatalogOperationLease;
   #metadataLookupRunEpoch = 0;
+  #hardcoverBulkEpoch = 0;
+  #hardcoverBulkOperation?: CatalogOperationLease;
   #restoredShelfId?: string;
 
   constructor(
@@ -853,6 +870,8 @@ export class CatalogBrowser {
   }
 
   dispose(): void {
+    this.#hardcoverBulkEpoch += 1;
+    this.#hardcoverBulkOperation?.abort();
     this.#onboardingOperation?.abort();
     this.#onboardingOperation = undefined;
     this.#profileEpoch += 1;
@@ -937,6 +956,8 @@ export class CatalogBrowser {
     if (this.#snapshot.settingsSaving || this.#snapshot.settingsRefreshing) return;
     if (this.#snapshot.filters.view === "settings" && !this.#confirmDiscardSettingsChanges()) return;
     this.#persistBrowsingContext();
+    this.#hardcoverBulkEpoch += 1;
+    this.#hardcoverBulkOperation?.abort();
     const epoch = ++this.#profileEpoch;
     this.#bookEpoch += 1;
     this.#profileOperation?.abort();
@@ -987,6 +1008,7 @@ export class CatalogBrowser {
       activeMetadataLookupJob: undefined,
       metadataLookupBusy: false,
       metadataLookupError: undefined,
+      hardcoverBulkReview: undefined,
       seriesDetail: undefined,
       seriesSort: browsingContext.seriesSort ?? "name",
       settingsLibraryId: profile.id,
@@ -1409,6 +1431,7 @@ export class CatalogBrowser {
   }
 
   async loadMetadataLookupJobs(openJobId?: string): Promise<void> {
+    if (this.#snapshot.hardcoverBulkReview?.busy) return;
     const profileId = this.#snapshot.filters.profileId;
     if (!profileId || !this.#api.listMetadataLookupJobs) {
       this.#set({ metadataLookupState: "error", metadataLookupError: "Bulk metadata lookup is unavailable on this server." }, "all");
@@ -1485,19 +1508,19 @@ export class CatalogBrowser {
   }
 
   async createMetadataLookupJob(
-    provider: CoverProvider,
+    provider: MetadataProvider,
     requestedBookIds: readonly string[] = [...this.#snapshot.selectedBookIds],
   ): Promise<void> {
     const profileId = this.#snapshot.filters.profileId;
     const bookIds = [...new Set(requestedBookIds)];
-    if (!profileId || bookIds.length === 0 || !this.#api.createMetadataLookupJob || this.#snapshot.metadataLookupBusy) return;
+    if (!profileId || bookIds.length === 0 || !this.#api.createMetadataLookupJob || this.#snapshot.metadataLookupBusy || this.#snapshot.hardcoverBulkReview?.busy) return;
     if (bookIds.length > 100) {
       const message = `Metadata lookup accepts at most 100 books; ${bookIds.length} are selected. Narrow the selection and try again.`;
       this.#set({ metadataLookupError: message, announcement: message }, "all");
       return;
     }
-    if (provider === "google-books" && !(await this.#googleBooksConfigured())) {
-      this.#set({ metadataLookupError: "Add and test a Google Books API key in Settings, or choose Open Library." }, "all");
+    if (provider !== "open-library" && !(await this.#metadataProviderConfigured(provider))) {
+      this.#set({ metadataLookupError: `Add and test a ${metadataProviderLabel(provider)} ${provider === "hardcover" ? "API token" : "API key"} in Settings, or choose Open Library.` }, "all");
       return;
     }
     if (profileId !== this.#snapshot.filters.profileId || this.#snapshot.metadataLookupBusy) return;
@@ -1533,7 +1556,7 @@ export class CatalogBrowser {
     }
   }
 
-  async createMetadataLookupForIssue(signature: string, provider: CoverProvider): Promise<void> {
+  async createMetadataLookupForIssue(signature: string, provider: MetadataProvider): Promise<void> {
     const issue = this.#snapshot.healthPage?.items.find((candidate) => candidate.signature === signature);
     if (!issue || issue.disposition.ignored) return;
     await this.createMetadataLookupJob(provider, issue.bookIds);
@@ -1545,11 +1568,13 @@ export class CatalogBrowser {
   }
 
   closeMetadataLookupJob(): void {
+    if (this.#snapshot.hardcoverBulkReview?.busy) return;
     this.#metadataLookupRunEpoch += 1;
     this.#set({ activeMetadataLookupJob: undefined, metadataLookupError: undefined }, "all");
   }
 
   async controlMetadataLookupJob(action: "resume" | "pause" | "cancel" | "retry"): Promise<void> {
+    if (this.#snapshot.hardcoverBulkReview?.busy) return;
     const profileId = this.#snapshot.filters.profileId;
     const job = this.#snapshot.activeMetadataLookupJob;
     if (!profileId || !job || !this.#api.controlMetadataLookupJob
@@ -1577,6 +1602,7 @@ export class CatalogBrowser {
   }
 
   async runMetadataLookupJobStep(): Promise<void> {
+    if (this.#snapshot.hardcoverBulkReview?.busy) return;
     const profileId = this.#snapshot.filters.profileId;
     const job = this.#snapshot.activeMetadataLookupJob;
     if (!profileId || !job || !this.#api.runMetadataLookupJobStep || this.#snapshot.metadataLookupBusy) return;
@@ -1864,6 +1890,7 @@ export class CatalogBrowser {
         coverProviderSettings: {
           loadState: "ready",
           googleBooks: states.find((state) => state.provider === "google-books"),
+          hardcover: states.find((state) => state.provider === "hardcover"),
           editing: false,
           busy: false,
         },
@@ -1888,6 +1915,10 @@ export class CatalogBrowser {
   }
 
   async #googleBooksConfigured(): Promise<boolean> {
+    return this.#metadataProviderConfigured("google-books");
+  }
+
+  async #metadataProviderConfigured(provider: ConfigurableCoverProvider): Promise<boolean> {
     const current = this.#snapshot.coverProviderSettings;
     if (current?.loadState !== "ready") {
       // Provider credentials are service-global and intentionally stay out of
@@ -1895,54 +1926,67 @@ export class CatalogBrowser {
       // works after a reload without making the user visit Settings first.
       await this.loadCoverProviderSettings(current?.loadState === "loading");
     }
-    return this.#snapshot.coverProviderSettings?.googleBooks?.configured === true;
+    return this.#snapshot.coverProviderSettings?.[provider === "hardcover" ? "hardcover" : "googleBooks"]?.configured === true;
   }
 
   editGoogleBooksCredential(): void {
+    this.editProviderCredential("google-books");
+  }
+
+  editProviderCredential(provider: ConfigurableCoverProvider): void {
     const current = this.#snapshot.coverProviderSettings;
     if (!current || current.busy || this.#snapshot.serviceStatus?.settingsMode === "read-only") return;
-    this.#set({ coverProviderSettings: { ...current, editing: true, error: undefined } }, "all");
+    this.#set({ coverProviderSettings: { ...current, editing: true, editingProvider: provider, error: undefined } }, "all");
   }
 
   cancelGoogleBooksCredentialEdit(): void {
     const current = this.#snapshot.coverProviderSettings;
     if (!current || current.busy) return;
-    this.#set({ coverProviderSettings: { ...current, editing: false, error: undefined } }, "all");
+    this.#set({ coverProviderSettings: { ...current, editing: false, editingProvider: undefined, error: undefined } }, "all");
   }
 
   async saveAndTestGoogleBooksCredential(apiKey: string): Promise<void> {
+    return this.saveAndTestProviderCredential("google-books", apiKey);
+  }
+
+  async saveAndTestProviderCredential(provider: ConfigurableCoverProvider, apiKey: string): Promise<void> {
     const current = this.#snapshot.coverProviderSettings;
-    const saved = current?.googleBooks;
+    const property = provider === "hardcover" ? "hardcover" : "googleBooks";
+    const label = metadataProviderLabel(provider);
+    const credential = provider === "hardcover" ? "API token" : "API key";
+    const saved = current?.[property];
     if (!current || current.busy || !current.editing || !this.#api.saveCoverProviderCredential || !this.#api.testCoverProviderCredential) return;
     if (this.#snapshot.serviceStatus?.settingsMode === "read-only") return;
     const key = apiKey.trim();
     if (!key) {
-      this.#set({ coverProviderSettings: { ...current, error: "Enter a Google Books API key." } }, "all");
+      this.#set({ coverProviderSettings: { ...current, error: `Enter a ${label} ${credential}.` } }, "all");
       return;
     }
     this.#coverProviderOperation?.abort();
-    const operation = createCatalogOperation("Google Books credential save and test", this.#settingsMutationTimeoutMs);
+    const operation = createCatalogOperation(`${label} credential save and test`, this.#settingsMutationTimeoutMs);
     this.#coverProviderOperation = operation;
     const epoch = ++this.#coverProviderEpoch;
     this.#set({ coverProviderSettings: { ...current, busy: true, error: undefined } }, "all");
     try {
-      const stored = await operation.wait(this.#api.saveCoverProviderCredential("google-books", {
+      const stored = await operation.wait(this.#api.saveCoverProviderCredential(provider, {
         apiKey: key,
         expectedRevision: saved?.revision ?? 0,
       }, operation.signal));
-      const tested = await operation.wait(this.#api.testCoverProviderCredential("google-books", {
+      const tested = await operation.wait(this.#api.testCoverProviderCredential(provider, {
         expectedRevision: stored.revision,
       }, operation.signal));
       if (epoch !== this.#coverProviderEpoch) return;
       this.#set({
         coverProviderSettings: {
+          ...current,
           loadState: "ready",
-          googleBooks: tested,
+          [property]: tested,
           editing: tested.status !== "working",
+          editingProvider: tested.status !== "working" ? provider : undefined,
           busy: false,
-          ...(tested.status === "working" ? {} : { error: "The key was saved, but Google Books did not accept the test request." }),
+          error: tested.status === "working" ? undefined : tested.errorCode === "invalid-or-expired-token" ? "The token is invalid or expired. Create a new token in Hardcover account settings." : tested.errorCode === "insufficient-permissions" ? "This token needs permission to read book and series information. Update its scopes in Hardcover account settings." : `The ${credential} was saved, but ${label} did not accept the test request.`,
         },
-        announcement: tested.status === "working" ? "Google Books cover search is ready." : undefined,
+        announcement: tested.status === "working" ? `${label} ${provider === "hardcover" ? "series lookup" : "cover search"} is ready.` : undefined,
       }, "all");
     } catch (error) {
       if (epoch !== this.#coverProviderEpoch) return;
@@ -1952,7 +1996,7 @@ export class CatalogBrowser {
           loadState: "ready",
           editing: true,
           busy: false,
-          error: errorMessage(error, "The Google Books key could not be saved and tested."),
+          error: errorMessage(error, `The ${label} ${credential} could not be saved and tested.`),
         },
       }, "all");
     } finally {
@@ -1964,26 +2008,32 @@ export class CatalogBrowser {
   }
 
   async removeGoogleBooksCredential(): Promise<void> {
+    return this.removeProviderCredential("google-books");
+  }
+
+  async removeProviderCredential(provider: ConfigurableCoverProvider): Promise<void> {
     const current = this.#snapshot.coverProviderSettings;
-    const saved = current?.googleBooks;
+    const property = provider === "hardcover" ? "hardcover" : "googleBooks";
+    const label = metadataProviderLabel(provider);
+    const saved = current?.[property];
     if (!current || current.busy || !saved?.configured || !this.#api.removeCoverProviderCredential) return;
     if (this.#snapshot.serviceStatus?.settingsMode === "read-only") return;
     this.#coverProviderOperation?.abort();
-    const operation = createCatalogOperation("Google Books credential removal", this.#settingsMutationTimeoutMs);
+    const operation = createCatalogOperation(`${label} credential removal`, this.#settingsMutationTimeoutMs);
     this.#coverProviderOperation = operation;
     const epoch = ++this.#coverProviderEpoch;
     this.#set({ coverProviderSettings: { ...current, busy: true, error: undefined } }, "all");
     try {
-      const state = await operation.wait(this.#api.removeCoverProviderCredential("google-books", saved.revision, operation.signal));
+      const state = await operation.wait(this.#api.removeCoverProviderCredential(provider, saved.revision, operation.signal));
       if (epoch !== this.#coverProviderEpoch) return;
       this.#set({
-        coverProviderSettings: { loadState: "ready", googleBooks: state, editing: false, busy: false },
-        announcement: "Google Books API key removed.",
+        coverProviderSettings: { ...current, loadState: "ready", [property]: state, editing: false, editingProvider: undefined, busy: false, error: undefined },
+        announcement: `${label} credential removed.`,
       }, "all");
     } catch (error) {
       if (epoch !== this.#coverProviderEpoch) return;
       this.#set({
-        coverProviderSettings: { ...current, busy: false, error: errorMessage(error, "The Google Books key could not be removed.") },
+        coverProviderSettings: { ...current, busy: false, error: errorMessage(error, `The ${label} credential could not be removed.`) },
       }, "all");
     } finally {
       if (this.#coverProviderOperation === operation) {
@@ -3526,11 +3576,11 @@ export class CatalogBrowser {
     }, "all");
   }
 
-  async searchBookMetadata(provider: CoverProvider, terms: MetadataCandidateSearchTerms): Promise<void> {
+  async searchBookMetadata(provider: MetadataProvider, terms: MetadataCandidateSearchTerms): Promise<void> {
     const editor = this.#snapshot.metadataEditor;
     const hasTerm = Boolean(terms.title?.trim() || terms.author?.trim() || terms.identifier?.trim());
     if (!editor || editor.busy || !hasTerm || !this.#api.searchBookMetadata) return;
-    if (provider === "google-books" && !(await this.#googleBooksConfigured())) {
+    if (provider !== "open-library" && !(await this.#metadataProviderConfigured(provider))) {
       const current = this.#snapshot.metadataEditor;
       if (!current || current.bookId !== editor.bookId || current.busy) return;
       this.#set({
@@ -3544,7 +3594,7 @@ export class CatalogBrowser {
             items: [],
             selectedFields: new Set(),
             includeCover: false,
-            error: "Google Books is not configured. Add an API key in Settings or use Open Library.",
+            error: `${metadataProviderLabel(provider)} is not configured. Add an ${provider === "hardcover" ? "API token" : "API key"} in Settings or use Open Library.`,
           },
         },
       }, "all");
@@ -3610,7 +3660,7 @@ export class CatalogBrowser {
             items: [],
             selectedFields: new Set(),
             includeCover: false,
-            error: errorMessage(error, `${provider === "google-books" ? "Google Books" : "Open Library"} metadata search failed.`),
+            error: errorMessage(error, `${metadataProviderLabel(provider)} metadata search failed.`),
           },
         },
       }, "all");
@@ -3624,14 +3674,17 @@ export class CatalogBrowser {
 
   selectMetadataCandidate(candidateId: string): void {
     const editor = this.#snapshot.metadataEditor;
-    if (!editor || editor.busy || !editor.metadataSearch.items.some((candidate) => candidate.candidateId === candidateId)) return;
+    const candidate = editor?.metadataSearch.items.find((entry) => entry.candidateId === candidateId);
+    if (!editor || editor.busy || !candidate) return;
     this.#set({
       metadataEditor: {
         ...editor,
         metadataSearch: {
           ...editor.metadataSearch,
           selectedCandidateId: candidateId,
-          selectedFields: new Set(),
+          selectedFields: candidate.provider === "hardcover" && editor.data
+            ? missingMetadataCandidateFields(editor.data.book, { ...editor.data.overrides, ...editor.draftOverrides }, candidate)
+            : new Set(),
           includeCover: false,
           error: undefined,
         },
@@ -3643,10 +3696,16 @@ export class CatalogBrowser {
     const editor = this.#snapshot.metadataEditor;
     const candidate = editor?.metadataSearch.items.find(({ candidateId }) => candidateId === editor.metadataSearch.selectedCandidateId);
     if (!editor || !candidate || !Object.hasOwn(candidate.metadata, field) || editor.busy) return;
-    const selectedFields = new Set(editor.metadataSearch.selectedFields);
-    if (selected) selectedFields.add(field);
-    else selectedFields.delete(field);
+    const selectedFields = reviewedMetadataCandidateFields(editor.data?.book ?? {}, candidate, editor.metadataSearch.selectedFields, field, selected);
     this.#set({ metadataEditor: { ...editor, metadataSearch: { ...editor.metadataSearch, selectedFields } } }, "all");
+  }
+
+  selectMissingMetadataCandidateFields(): void {
+    const editor = this.#snapshot.metadataEditor;
+    const candidate = editor?.metadataSearch.items.find(({ candidateId }) => candidateId === editor.metadataSearch.selectedCandidateId);
+    if (!editor?.data || !candidate || editor.busy) return;
+    const selectedFields = missingMetadataCandidateFields(editor.data.book, { ...editor.data.overrides, ...editor.draftOverrides }, candidate);
+    this.#set({ metadataEditor: { ...editor, metadataSearch: { ...editor.metadataSearch, selectedFields, includeCover: false } } }, "all");
   }
 
   setMetadataCandidateCover(selected: boolean): void {
@@ -3699,7 +3758,7 @@ export class CatalogBrowser {
         kind: "provider-result",
         tone: "success",
         title: "Reviewed metadata imported",
-        detail: `Selected ${candidate.provider === "google-books" ? "Google Books" : "Open Library"} fields were saved for “${editor.title}”.`,
+        detail: `Selected ${metadataProviderLabel(candidate.provider)} fields were saved for “${editor.title}”.`,
         profileId: editor.profileId,
         bookId: editor.bookId,
       });
@@ -3747,7 +3806,9 @@ export class CatalogBrowser {
           terms: editor.metadataSearch.terms,
           loadState: "ready",
           items: entry.candidates,
-          selectedCandidateId: selected.candidateId,
+          // Hardcover may return several series for one book; opening the
+          // bulk review must not silently choose the first one.
+          selectedCandidateId: selected.provider === "hardcover" ? undefined : selected.candidateId,
           selectedFields: new Set(),
           includeCover: false,
           lookupJobId: job.id,
@@ -3763,6 +3824,102 @@ export class CatalogBrowser {
       ...this.#snapshot,
       metadataEditor: { ...editor, draftOverrides: changes, error: undefined },
     };
+  }
+
+  selectHardcoverBulkSeries(bookId: string, candidateId: string, replaceExisting?: boolean): void {
+    const job = this.#snapshot.activeMetadataLookupJob;
+    const previous = this.#snapshot.hardcoverBulkReview;
+    const book = this.#snapshot.healthBooks.get(bookId);
+    const entry = job?.entries.find((item) => item.bookId === bookId);
+    if (previous?.busy || !book || job?.provider !== "hardcover" || entry?.acceptedAt
+      || this.#snapshot.serviceStatus?.settingsMode === "read-only") return;
+    const candidate = entry?.candidates.find((item) => item.candidateId === candidateId && item.provider === "hardcover");
+    if (candidateId && (!candidate?.metadata.series || !Object.hasOwn(candidate.metadata, "seriesIndex"))) return;
+    const selections = new Map(previous?.jobId === job.id ? previous.selections : []);
+    if (candidateId) selections.set(bookId, { candidateId, replaceExisting: replaceExisting ?? false, reviewedBook: book });
+    else selections.delete(bookId);
+    const errors = new Map(previous?.jobId === job.id ? previous.errors : []);
+    errors.delete(bookId);
+    this.#set({ hardcoverBulkReview: { jobId: job.id, selections, errors, busy: false } }, "all");
+  }
+
+  async applyHardcoverBulkSeries(): Promise<void> {
+    const review = this.#snapshot.hardcoverBulkReview;
+    const job = this.#snapshot.activeMetadataLookupJob;
+    const profileId = this.#snapshot.filters.profileId;
+    if (!profileId || !review || review.busy || !review.selections.size || job?.id !== review.jobId
+      || job.provider !== "hardcover" || job.profileId !== profileId || this.#snapshot.metadataLookupBusy
+      || this.#snapshot.serviceStatus?.settingsMode === "read-only" || !this.#api.getBookMetadata || !this.#api.importBookMetadata) return;
+    const epoch = ++this.#hardcoverBulkEpoch;
+    const selections = new Map(review.selections);
+    const errors = new Map<string, string>();
+    const total = selections.size;
+    const observedBooks = new Map<string, CatalogBook>();
+    let applied = 0;
+    let completed = 0;
+    this.#set({ hardcoverBulkReview: { ...review, busy: true, errors, summary: undefined, completed, total } }, "all");
+    for (const [bookId, choice] of [...selections]) {
+      if (epoch !== this.#hardcoverBulkEpoch || profileId !== this.#snapshot.filters.profileId) return;
+      const operation = createCatalogOperation("Apply reviewed Hardcover series", this.#settingsMutationTimeoutMs);
+      this.#hardcoverBulkOperation = operation;
+      try {
+        const entry = job.entries.find((item) => item.bookId === bookId);
+        const candidate = entry?.candidates.find((item) => item.candidateId === choice.candidateId && item.provider === "hardcover");
+        if (!candidate || entry?.acceptedAt) throw new Error("This suggestion is no longer available. Reload the search results.");
+        const data = await operation.wait(this.#api.getBookMetadata(profileId, bookId, operation.signal));
+        if (epoch !== this.#hardcoverBulkEpoch || profileId !== this.#snapshot.filters.profileId) return;
+        const before = choice.reviewedBook;
+        const fresh = data.book;
+        observedBooks.set(bookId, fresh);
+        this.#snapshot = { ...this.#snapshot, healthBooks: new Map([...this.#snapshot.healthBooks, [bookId, fresh]]) };
+        if (!fresh.contentHash || !fresh.available) throw new Error("The original book is currently unavailable. Try again when its folder is available.");
+        if (fresh.contentHash !== before.contentHash || fresh.presentationVersion !== before.presentationVersion
+          || fresh.metadataRevision !== before.metadataRevision || fresh.series !== before.series || fresh.seriesIndex !== before.seriesIndex) {
+          throw new Error("This book changed after you selected it. Review the updated book and choose its series again.");
+        }
+        const selectedFields = choice.replaceExisting
+          ? ["series", "seriesIndex"] as const
+          : [...missingMetadataCandidateFields(fresh, data.overrides, candidate)].filter((field) => field === "series" || field === "seriesIndex");
+        if (!selectedFields.length) throw new Error("No missing series fields to fill. To change existing information or a saved override, select Replace existing series.");
+        const saved = await operation.wait(this.#api.importBookMetadata(profileId, bookId, {
+          provider: "hardcover", candidateId: candidate.candidateId, lookupJobId: job.id,
+          selectedFields: [...selectedFields], includeCover: false,
+          expectedRevision: data.revision, expectedContentHash: fresh.contentHash,
+        }, operation.signal));
+        if (epoch !== this.#hardcoverBulkEpoch || profileId !== this.#snapshot.filters.profileId) return;
+        applied += 1;
+        observedBooks.set(bookId, saved.book);
+        selections.delete(bookId);
+        const kindleStatus = new Map(this.#snapshot.kindleStatus);
+        if (kindleStatus.has(bookId)) kindleStatus.set(bookId, "unknown");
+        const counts = new Map(this.#snapshot.kindleStatusCountsByProfile);
+        counts.delete(profileId);
+        this.#snapshot = {
+          ...this.#snapshot,
+          healthBooks: new Map([...this.#snapshot.healthBooks, [bookId, saved.book]]),
+          ...(this.#snapshot.page ? { page: { ...this.#snapshot.page, items: this.#snapshot.page.items.map((book) => book.id === bookId ? saved.book : book) } } : {}),
+          activeMetadataLookupJob: { ...job, entries: (this.#snapshot.activeMetadataLookupJob?.entries ?? job.entries).map((item) => item.bookId === bookId ? { ...item, acceptedAt: new Date().toISOString() } : item) },
+          kindleStatus, kindleStatusCountsByProfile: counts,
+        };
+      } catch (error) {
+        if (epoch !== this.#hardcoverBulkEpoch || profileId !== this.#snapshot.filters.profileId) return;
+        errors.set(bookId, errorMessage(error, "The series could not be applied. Review this book and try again."));
+      } finally {
+        operation.dispose();
+        if (this.#hardcoverBulkOperation === operation) this.#hardcoverBulkOperation = undefined;
+      }
+      completed += 1;
+      this.#set({ hardcoverBulkReview: { jobId: job.id, selections: new Map(selections), errors: new Map(errors), busy: true, completed, total } }, "all");
+    }
+    const summary = `${applied} of ${total} ${total === 1 ? "book" : "books"} updated${errors.size ? `; ${errors.size} need review and remain selected.` : "."}`;
+    this.#set({ hardcoverBulkReview: { jobId: job.id, selections, errors, busy: false, completed, total, summary }, announcement: summary }, "all");
+    this.#recordActivity({ id: `hardcover-series-${Date.now().toString(36)}`, kind: "provider-result", tone: errors.size ? "warning" : "success", title: "Hardcover series update", detail: summary, profileId });
+    await this.loadMetadataLookupJobs(job.id);
+    if (epoch !== this.#hardcoverBulkEpoch || profileId !== this.#snapshot.filters.profileId) return;
+    // Search-list hydration can reuse the older dashboard page. Keep the
+    // fresh metadata shown above so failed rows can genuinely be reviewed again.
+    this.#set({ healthBooks: new Map([...this.#snapshot.healthBooks, ...observedBooks]) }, "all");
+    if (applied) void this.#refreshMetadataAffectedCatalog(profileId);
   }
 
   async saveBookMetadata(): Promise<void> {
